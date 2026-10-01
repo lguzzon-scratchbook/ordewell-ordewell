@@ -8,9 +8,9 @@ import {
   GREP_DEFAULT_HEAD_LIMIT,
 } from '../interfaces/IFileSystem';
 import { IApproval, DENY_ALL } from '../interfaces/IApproval';
-import { classifyCommand, pathLikeArgs } from './commandPolicy';
+import { classifyCommand, pathRefs, type CommandPolicyOptions } from './commandPolicy';
 import { resolveResearchShell, researchShellWarning, type ResearchShell } from './researchShell';
-import { resolveWithin, grantScopeFor, isInertDevice } from './pathScope';
+import { resolveWithin, resolveRef, grantScopeFor, isInertDevice } from './pathScope';
 import { definitionPattern, referencePattern, languageForId, includeGlobFor } from './symbolPatterns';
 
 export { AUTO_COMMANDS, GIT_READONLY_SUBCOMMANDS, REFUSED_COMMANDS, classifyCommand, pathLikeArgs } from './commandPolicy';
@@ -182,13 +182,17 @@ export abstract class BaseFileSystem implements IFileSystem {
   private outsidePaths(command: string): Array<{ abs: string; scope: string }> {
     const root = this.getWorkspaceRoot();
     const found = new Map<string, string>();
-    for (const p of pathLikeArgs(command, { dialect: this.researchShell.dialect })) {
-      const { abs, inside } = resolveWithin(root, p);
+    for (const ref of pathRefs(command, this.policyOptions())) {
+      const { abs, inside } = resolveRef(root, ref);
       if (inside || isInertDevice(abs)) continue;
       const scope = grantScopeFor(abs, 'file');
       if (!found.has(scope)) found.set(scope, abs);
     }
     return [...found].map(([scope, abs]) => ({ abs, scope }));
+  }
+
+  private policyOptions(): CommandPolicyOptions {
+    return { dialect: this.researchShell.dialect, cdpathSet: !!process.env.CDPATH };
   }
 
   /**
@@ -202,7 +206,7 @@ export abstract class BaseFileSystem implements IFileSystem {
    * directory the next command names.
    */
   async bash(command: string, signal?: AbortSignal): Promise<ToolOutcome> {
-    const { tier, scope, reason } = classifyCommand(command, { dialect: this.researchShell.dialect });
+    const { tier, scope, reason } = classifyCommand(command, this.policyOptions());
 
     if (tier === 'refuse') {
       return { success: false, output: `Command refused: ${reason}`, truncated: false };

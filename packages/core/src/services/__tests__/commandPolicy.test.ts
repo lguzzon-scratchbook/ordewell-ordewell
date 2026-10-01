@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { AUTO_COMMANDS, classifyCommand, pathLikeArgs } from '../commandPolicy';
+import { AUTO_COMMANDS, classifyCommand, pathLikeArgs, pathRefs } from '../commandPolicy';
 
 describe('classifyCommand', () => {
   describe('auto tier — read-only inspection runs with no prompt', () => {
@@ -1136,5 +1136,79 @@ describe('pathLikeArgs under the cmd.exe dialect', () => {
     // A cross-platform prompt can name either spelling; recognizing both is
     // never less safe, and the gate's failure mode must be a prompt, not a pass.
     expect(pathLikeArgs('cat C:\\secrets\\key', { dialect: 'posix' })).toEqual(['C:secretskey']);
+  });
+});
+
+describe('cd — a literal directory change is read-only navigation', () => {
+  it.each([
+    'cd api',
+    'cd ./api',
+    'cd api && git status',
+    'cd api && git log --oneline -3 && cd ../web && git status',
+    'cd api; git status',
+  ])('%s runs with no prompt', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('auto');
+  });
+
+  it.each([
+    ['a bare cd, which goes home', 'cd'],
+    ['cd -, which goes to $OLDPWD', 'cd -'],
+    ['a flag', 'cd -P api'],
+    ['a variable', 'cd $HOME'],
+    ['a substitution', 'cd $(pwd)'],
+    ['two operands', 'cd /d api'],
+    ['a tilde', 'cd ~/api'],
+    ['pushd', 'pushd api'],
+  ])('asks for %s', (_label, cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('ask');
+  });
+
+  it('asks when CDPATH is set, because a relative cd may land elsewhere', () => {
+    expect(classifyCommand('cd api', { cdpathSet: true }).tier).toBe('ask');
+  });
+
+  it('still refuses an assignment in front of it', () => {
+    expect(classifyCommand('CDPATH=/etc cd api').tier).toBe('refuse');
+  });
+});
+
+describe('pathRefs — the directory a path is relative to', () => {
+  const refs = (cmd: string, opts = {}) => pathRefs(cmd, opts).map((r) => [r.path, r.cwd]);
+
+  it('carries the literal cds that led to a command joined by &&', () => {
+    expect(refs('cd api && cat ../x')).toEqual([['../x', ['api']]]);
+    expect(refs('cd api && cd src && cat ../x')).toEqual([['../x', ['api', 'src']]]);
+  });
+
+  it('gives a cd its own target relative to the cds before it', () => {
+    expect(refs('cd api && cd ../web')).toEqual([['../web', ['api']]]);
+  });
+
+  it('keeps the directory across a pipe in the same pipeline', () => {
+    expect(refs('cd api && cat ../x | head ../y')).toEqual([['../x', ['api']], ['../y', ['api']]]);
+  });
+
+  it.each([
+    ['a ;', 'cd api; cat ../x'],
+    ['a ||', 'cd api || cat ../x'],
+    ['a background &', 'cd api & cat ../x'],
+    ['a newline', 'cd api\ncat ../x'],
+    ['a subshell', '(cd api) && cat ../x'],
+    ['a substitution', 'cd api && cat $(echo ../x)'],
+    ['an earlier ||', 'echo x || cd api && cat ../x'],
+    ['a cd ending a pipeline', 'echo x | cd api && cat ../x'],
+    ['a cd starting a pipeline', 'cd api | cat && cat ../x'],
+    ['a cd it cannot read', 'cd "$HOME" && cat ../x'],
+    ['a flag on the cd', 'cd -P api && cat ../x'],
+  ])('tracks nothing after %s', (_label, cmd) => {
+    for (const [, cwd] of refs(cmd)) expect(cwd).toEqual([]);
+  });
+
+  it('tracks nothing when CDPATH is set', () => {
+    expect(refs('cd api && cat ../x', { cdpathSet: true })).toEqual([['../x', []]]);
+  });
+
+  it('is what pathLikeArgs reports, minus the directory', () => {
+    expect(pathLikeArgs('cd api && cat ../x')).toEqual(['../x']);
   });
 });

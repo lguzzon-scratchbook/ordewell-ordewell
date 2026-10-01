@@ -322,6 +322,73 @@ describe('BaseFileSystem — bash tiers', () => {
   });
 });
 
+describe('BaseFileSystem — bash follows a cd chain', () => {
+  const run = async (command: string, grant = false) => {
+    const fs = new TestFileSystem();
+    const request = vi.fn().mockResolvedValue(grant);
+    fs.setApproval({ request });
+    const result = await fs.bash(command);
+    return { fs, request, result };
+  };
+
+  it('runs a sibling-repo status check inside the workspace with no prompt', async () => {
+    const { fs, request } = await run(
+      'cd api && git log --oneline -3 && echo "--- web ---" && cd ../web && git log --oneline -2',
+    );
+
+    expect(request).not.toHaveBeenCalled();
+    expect(fs.bashCalls).toHaveLength(1);
+  });
+
+  it('still asks when the chain climbs out of the workspace', async () => {
+    const { request } = await run('cd api && cat ../../etc/hosts');
+
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'external_path', scope: '/etc/*' }));
+  });
+
+  it('resolves later paths from a directory the chain left the workspace for', async () => {
+    const { request } = await run('cd ../other && cat ../etc/hosts', true);
+
+    expect(request.mock.calls[0][0].scopes).toEqual(['/other/*', '/etc/*']);
+  });
+
+  it('does not let a subshell cd leak into the commands after it', async () => {
+    const { request } = await run('(cd api) && cat ../x');
+
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'external_path' }));
+  });
+
+  it('does not trust a cd that a || may have skipped', async () => {
+    const { request } = await run('echo x || cd api && cat ../x');
+
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'external_path' }));
+  });
+
+  it('does not trust a cd in the middle of a pipeline', async () => {
+    const { request } = await run('echo x | cd api && cat ../x');
+
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'external_path' }));
+  });
+
+  it('asks about a cd it cannot read, as before', async () => {
+    const { request } = await run('cd "$HOME" && ls');
+
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'shell_command', scope: 'cd' }));
+  });
+
+  describe('with CDPATH set', () => {
+    it('falls back to asking, because cd may land somewhere else', async () => {
+      vi.stubEnv('CDPATH', '/etc');
+      try {
+        const { request } = await run('cd api && ls');
+        expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'shell_command', scope: 'cd' }));
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+  });
+});
+
 describe('BaseFileSystem — findSymbol', () => {
   it('reports definitions first, then per-file reference counts', async () => {
     const fs = new TestFileSystem();

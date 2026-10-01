@@ -221,3 +221,35 @@ get past them wears down the prompts that matter.
 
 None of this changes what is reachable. Every path argument is still confined,
 and every grant still covers only its own scope.
+
+## Amendment (2026-10-01) — `cd` is followed where the shell's directory is certain
+
+`cd api && git log && cd ../web && git log` asked to leave the workspace though
+both directories are inside it. `cd` was `ask`, and path confinement resolved
+every argument from the workspace root, so `../web` read as a sibling of the
+workspace.
+
+- **A literal `cd` is `auto`.** One operand the command line spells out: no
+  variable, substitution, glob, flag (`-P`, `-`), `~`, or second operand. Bare
+  `cd`, `cd -` and `pushd` still ask. With `CDPATH` set in the environment a
+  relative `cd` may land somewhere the line never names, so none of this
+  applies.
+- **A chain is followed only where it is certain.** Confinement resolves a
+  path from the `cd` targets that must have run before it, and only when the
+  command is pipelines joined by `&&`: a failed `cd` ends the list, so
+  everything after it ran in the new directory. Any `;`, `||`, `&`, newline,
+  subshell or substitution disables it for the whole command, because the
+  shell's directory then depends on what ran. A `cd` inside a multi-stage
+  pipeline runs in a subshell and is not counted.
+- **The fallback never relaxes.** When nothing is followed, paths are judged
+  from the root, as before. That is never more permissive than the truth while
+  every `cd` stays inside the workspace: a path with no net climb stays inside
+  from any deeper directory, and a `cd` that climbs is itself a path argument
+  and asks. Where the chain is followed and leaves the workspace, later paths
+  are judged from there, so they ask under their own scopes.
+- **Symlinks stay lexical,** as in `pathScope.ts`: `cd link && cat ../x` is
+  judged by name, not by where `link` points.
+
+Research subagents use the same resolution, so a chain that stays inside the
+workspace works for them and one that leaves it is refused. Nothing the planner
+could reach before is newly reachable.

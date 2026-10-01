@@ -1,8 +1,8 @@
 import { executeTool } from './executeTool';
 import { subagentToolSpecs } from './researchTools';
-import { classifyCommand, pathLikeArgs } from './commandPolicy';
+import { classifyCommand, pathRefs } from './commandPolicy';
 import { resolveResearchShell } from './researchShell';
-import { resolveWithin } from './pathScope';
+import { resolveWithin, resolveRef } from './pathScope';
 import { classifyOutcome } from './researchStepSummary';
 import type { IFileSystem, ToolOutcome } from '../interfaces/IFileSystem';
 import type { ResearchChat, ToolResult } from './BaseAiService';
@@ -94,7 +94,8 @@ function nonPromptingFs(fs: IFileSystem): IFileSystem {
       // Same dialect the wrapped filesystem will execute under — a subagent
       // must not classify under different rules than the parent.
       const dialect = resolveResearchShell().dialect;
-      const { tier, reason } = classifyCommand(command, { dialect });
+      const policy = { dialect, cdpathSet: !!process.env.CDPATH };
+      const { tier, reason } = classifyCommand(command, policy);
       if (tier !== 'auto') {
         return refused(
           tier === 'refuse'
@@ -105,8 +106,8 @@ function nonPromptingFs(fs: IFileSystem): IFileSystem {
       // An `auto` binary (cat, find, rg, …) is only auto because reading is
       // read-only — its arguments can still name a path outside the
       // workspace, and a subagent can never prompt to approve one.
-      const escaping = pathLikeArgs(command, { dialect }).find((p) => !withinWorkspace(p));
-      if (escaping) return outsideRefusal(escaping);
+      const escaping = pathRefs(command, policy).find((ref) => !resolveRef(fs.getWorkspaceRoot(), ref).inside);
+      if (escaping) return outsideRefusal(escaping.path);
       return fs.bash(command, signal);
     },
   };

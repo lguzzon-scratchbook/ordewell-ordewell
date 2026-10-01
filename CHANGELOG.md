@@ -18,6 +18,15 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ### Fixed
 
+- **A `cd` into a repo inside the workspace no longer prompts.** Planner
+  research asked for approval on `cd api && git log && cd ../web && git log`
+  although both directories are inside the workspace: `cd` was never read-only
+  navigation, and `../web` was judged from the workspace root instead of from
+  `api`. A `cd` to a literal directory now runs without a prompt, and a chain
+  of them joined by `&&` is followed, so later paths are judged from where the
+  shell will be. Anything the classifier cannot follow — `;`, `||`, subshells,
+  `$(…)`, a variable, `cd -`, or `CDPATH` set — behaves as before.
+
 - **Live logs in VS Code follow new output again.** The task log, the planner
   conversation and a task card's runner output now stay on the newest lines
   while you are at the bottom, and stop following as soon as you scroll up to
