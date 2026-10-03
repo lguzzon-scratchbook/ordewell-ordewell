@@ -46,6 +46,8 @@ export type TaskLogEvent =
 const HEAD_LINES = 60;
 const TAIL_LINES = 40;
 const MAX_LINE_CHARS = 2000;
+const DIGEST_ARGS_CHARS = 120;
+const DIGEST_MESSAGE_CHARS = 1000;
 
 function capLine(line: string): string {
   return line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)}…` : line;
@@ -146,4 +148,36 @@ export function coalesceTaskLog(events: readonly TaskLogEvent[]): TaskLogEvent[]
     }
   }
   return out;
+}
+
+/**
+ * What an attempt did to the world, for the retry of a task whose effects
+ * outlive it (ADR-0020): one line per tool call and how it ended.
+ */
+export function digestTaskLog(events: readonly TaskLogEvent[], maxCalls: number): string {
+  const outcomes = new Map<string, boolean>();
+  let lastText: string | undefined;
+  let lastError: string | undefined;
+  for (const event of events) {
+    if (event.type === 'tool_result') outcomes.set(event.id, event.success);
+    else if (event.type === 'text') lastText = event.text;
+    else if (event.type === 'error') lastError = event.message;
+  }
+  const lines: string[] = [];
+  for (const event of events) {
+    if (event.type !== 'tool_call') continue;
+    const outcome = outcomes.get(event.id);
+    const args = event.args.length > DIGEST_ARGS_CHARS ? `${event.args.slice(0, DIGEST_ARGS_CHARS)}…` : event.args;
+    lines.push(`- ${event.name} ${args} → ${outcome === undefined ? 'no result' : outcome ? 'ok' : 'failed'}`);
+  }
+  const omitted = lines.length - maxCalls;
+  const out = omitted > 0 ? [`… ${omitted} earlier call${omitted === 1 ? '' : 's'} omitted …`, ...lines.slice(omitted)] : lines;
+  const gap = (): string[] => (out.length > 0 ? [''] : []);
+  const said = lastText?.trim();
+  if (said) {
+    const end = said.length > DIGEST_MESSAGE_CHARS ? `…${said.slice(-DIGEST_MESSAGE_CHARS)}` : said;
+    out.push(...gap(), 'Its last message:', ...end.split('\n').map((l) => `  ${l}`));
+  }
+  if (lastError) out.push(...gap(), `It stopped with an error: ${lastError}`);
+  return out.join('\n');
 }

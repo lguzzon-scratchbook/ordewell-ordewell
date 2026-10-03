@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { coalesceTaskLog, toTaskLogEvent, trimToolOutput, type TaskLogEvent } from '../TaskLog';
+import { coalesceTaskLog, digestTaskLog, toTaskLogEvent, trimToolOutput, type TaskLogEvent } from '../TaskLog';
 
 const lines = (n: number) => Array.from({ length: n }, (_, i) => `line ${i + 1}`).join('\n');
 
@@ -83,5 +83,70 @@ describe('coalesceTaskLog', () => {
       { type: 'text', text: 'Hello' },
       { type: 'text', text: ' again' },
     ]);
+  });
+});
+
+describe('digestTaskLog', () => {
+  const call = (id: string, name: string, args: unknown): TaskLogEvent => ({ type: 'tool_call', id, name, args: JSON.stringify(args) });
+  const result = (id: string, success: boolean): TaskLogEvent => ({ type: 'tool_result', id, output: 'ignored', success });
+
+  it('lists each call with how it ended', () => {
+    const digest = digestTaskLog([
+      call('c1', 'Bash', { command: 'az group create -n rg-dev' }),
+      result('c1', true),
+      call('c2', 'Bash', { command: 'az deployment create' }),
+      result('c2', false),
+    ], 20);
+
+    expect(digest).toBe([
+      '- Bash {"command":"az group create -n rg-dev"} → ok',
+      '- Bash {"command":"az deployment create"} → failed',
+    ].join('\n'));
+  });
+
+  it('says so when the attempt ended inside a call, rather than calling it failed', () => {
+    const digest = digestTaskLog([call('c1', 'Bash', { command: 'az pipelines run' })], 20);
+
+    expect(digest).toBe('- Bash {"command":"az pipelines run"} → no result');
+  });
+
+  it('keeps only the last calls and counts the earlier ones it left out', () => {
+    const events = ['a', 'b', 'c', 'd'].flatMap((x) => [call(x, 'Bash', { command: x }), result(x, true)]);
+
+    expect(digestTaskLog(events, 2)).toBe([
+      '… 2 earlier calls omitted …',
+      '- Bash {"command":"c"} → ok',
+      '- Bash {"command":"d"} → ok',
+    ].join('\n'));
+  });
+
+  it('cuts a long call to one line', () => {
+    const digest = digestTaskLog([call('c1', 'Write', { content: 'x'.repeat(500) }), result('c1', true)], 20);
+
+    expect(digest).toBe(`- Write {"content":"${'x'.repeat(108)}… → ok`);
+  });
+
+  it('ends with the agent\'s last words and the error that stopped it', () => {
+    const digest = digestTaskLog([
+      call('c1', 'Bash', { command: 'az deployment create' }),
+      result('c1', false),
+      { type: 'text', text: 'The deployment failed on quota.' },
+      { type: 'error', message: 'rate limited' },
+    ], 20);
+
+    expect(digest).toBe([
+      '- Bash {"command":"az deployment create"} → failed',
+      '',
+      'Its last message:',
+      '  The deployment failed on quota.',
+      '',
+      'It stopped with an error: rate limited',
+    ].join('\n'));
+  });
+
+  it('keeps the end of a long last message, where the agent says how it stopped', () => {
+    const digest = digestTaskLog([{ type: 'text', text: `${'a'.repeat(5000)} then it stopped` }], 20);
+
+    expect(digest).toBe(['Its last message:', `  …${'a'.repeat(984)} then it stopped`].join('\n'));
   });
 });

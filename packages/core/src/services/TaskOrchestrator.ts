@@ -166,6 +166,8 @@ export interface TaskOrchestratorDeps {
   tddEnabled: () => boolean;
   /** Read once as a run opens, never per spawn (ADR-0018, S1). */
   runnerTransport: () => RunnerTransport;
+  /** What the task's last saved attempt did, or null when it left no log (ADR-0020). */
+  previousAttemptFromLog: (taskId: string) => string | null;
 }
 
 /**
@@ -185,6 +187,7 @@ export interface TaskOrchestratorOptions {
   workspaceEnv?: (cwd: string) => Promise<WorkspaceEnv>;
   tddEnabled?: () => boolean;
   runnerTransport?: () => RunnerTransport;
+  previousAttemptFromLog?: (taskId: string) => string | null;
 }
 
 /**
@@ -250,6 +253,7 @@ export class TaskOrchestrator {
   private observers: OrchestratorObserver[] = [];
   private tddEnabled: () => boolean;
   private readRunnerTransport: () => RunnerTransport;
+  private previousAttemptFromLog: (taskId: string) => string | null;
   /**
    * The setting as the latest run copied it when it opened. Every spawn of
    * that run uses this, so flipping the setting mid-run changes the next run
@@ -270,6 +274,7 @@ export class TaskOrchestrator {
     this.workspaceEnv = deps.workspaceEnv;
     this.tddEnabled = deps.tddEnabled;
     this.readRunnerTransport = deps.runnerTransport;
+    this.previousAttemptFromLog = deps.previousAttemptFromLog;
 
     this.store.onMutate = () => this.emit('onTaskChanged');
     this.verifier.onVerdict((taskId, verdict) => this.onVerdict(taskId, verdict));
@@ -328,6 +333,7 @@ export class TaskOrchestrator {
       workspaceEnv: options.workspaceEnv ?? ((cwd) => resolveWorkspaceEnv(cwd)),
       tddEnabled: options.tddEnabled ?? (() => false),
       runnerTransport: options.runnerTransport ?? (() => 'terminal'),
+      previousAttemptFromLog: options.previousAttemptFromLog ?? (() => null),
     });
     return orchestrator;
   }
@@ -335,6 +341,19 @@ export class TaskOrchestrator {
   /** Advisory silence timestamp for a task's live runner, or null if not idle. */
   getIdleSince(taskId: string): string | null {
     return this.verifier.getIdleSince(taskId);
+  }
+
+  /**
+   * What an ops retry is told about the attempt before. The saved log is read
+   * whether or not the session was reloaded, so both behave alike; the terminal
+   * buffer is the fallback for a runner that has no log. A reload clears the
+   * attempt count along with the buffer, so a retry made since is what says
+   * there was an attempt to report on.
+   */
+  private opsPreviousAttempt(taskId: string): string | undefined {
+    const saved = this.previousAttemptFromLog(taskId) ?? this.output.liveTail(taskId, { maxLines: OPS_RETRY_TAIL_LINES })?.text;
+    if (saved !== undefined) return saved;
+    return (this.retryCounts.get(taskId) ?? 0) > 0 ? 'Its output is not available: this session was reloaded since it ran.' : undefined;
   }
 
   /** Recent clean output of a task's latest attempt, running or ended; null if it never ran. */
@@ -1328,7 +1347,7 @@ export class TaskOrchestrator {
           tddEnabled: !attempt.repair && this.tddEnabled(),
           // An ops task's effects outlive a failed attempt and are never rolled
           // back, so the next one is told what the last one did (ADR-0020).
-          previousAttempt: attempt.ops ? this.output.liveTail(task.id, { maxLines: OPS_RETRY_TAIL_LINES })?.text : undefined,
+          previousAttempt: attempt.ops ? this.opsPreviousAttempt(task.id) : undefined,
         });
       this.lingering.close(task.id);
       const env = await this.envForTask(cwd);

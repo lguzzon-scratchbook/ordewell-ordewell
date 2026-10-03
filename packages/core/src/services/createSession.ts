@@ -24,7 +24,7 @@ import { SessionEventRelay } from './SessionEventRelay';
 import { conflictResolverTask } from './Landing';
 import { saveSession } from '../utils/sessionStore';
 import { listTaskLogAttempts, readTaskLog, type TaskLogFile, type TaskLogLocation } from '../utils/taskLogStore';
-import type { TaskLogEvent } from '../models/TaskLog';
+import { digestTaskLog, type TaskLogEvent } from '../models/TaskLog';
 import { TaskLogRecorder } from './TaskLogRecorder';
 import { PlannerUsageLedger } from './PlannerUsage';
 import { mintSessionId } from '../utils/sessionId';
@@ -83,6 +83,18 @@ export interface SessionRuntimeSettings {
  * dropped. `MODE_TOGGLES` holds the mapping now; this adds the one field that
  * is not a toggle.
  */
+
+/** Calls an ops retry is told about; earlier ones are counted, not listed (ADR-0020). */
+const OPS_RETRY_DIGEST_CALLS = 20;
+
+/** What the task's newest saved attempt did, or null when it left nothing to report. */
+function lastAttemptDigest(location: TaskLogLocation, taskId: string): string | null {
+  const attempt = listTaskLogAttempts(location, taskId).pop();
+  if (attempt === undefined) return null;
+  const events = readTaskLog(location, taskId, attempt);
+  return events.length > 0 ? digestTaskLog(events, OPS_RETRY_DIGEST_CALLS) : null;
+}
+
 export function sessionRuntimeSettings(settings: UserSettings): SessionRuntimeSettings {
   return { ...plannerRuntimeToggles(settings), modelAllowlist: settings.modelAllowlist, runnerTransport: settings.runnerTransport };
 }
@@ -311,6 +323,7 @@ export function createSession(deps: SessionDeps): Session {
     workspaceRoot: deps.workspaceRoot,
     tddEnabled: () => deps.settings().tddEnabled,
     runnerTransport: () => deps.settings().runnerTransport ?? 'terminal',
+    previousAttemptFromLog: (taskId) => lastAttemptDigest(session.taskLogLocation, taskId),
   });
   const usage = new PlannerUsageLedger();
   const events = new SessionEventRelay({

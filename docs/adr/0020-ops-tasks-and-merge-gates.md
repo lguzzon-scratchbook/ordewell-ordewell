@@ -127,8 +127,12 @@ that depends on.**
   could isolate.
 - **Retry carries the attempt before.** An ops task's effects are outside
   Ordewell and cannot be rolled back, and a half-done one may have created what
-  it was making. A retry's prompt carries the previous attempt's output and asks
-  the runner to check what already exists before acting.
+  it was making. A retry's prompt carries what the previous attempt did and asks
+  the runner to check what already exists before acting. For a structured task
+  that is read from the attempt's saved log, reloaded or not: a list of its last
+  twenty tool calls and how each ended, then its last message and the error
+  that stopped it. A terminal task has no log, so it gets the tail of the
+  live buffer, or a line saying the output is gone when a reload cleared it.
 - Its verdict is the completion marker, as for any task (ADR-0013). A task that
   watches a pipeline runs until the pipeline ends.
 
@@ -159,6 +163,11 @@ it.
   attribution and ancestry the per-task merge commits keep.
 - **Rejected: at a gate, wait for every running change task, then hand off and
   start a fresh run.** Simpler, but it stalls parallel work no one asked to stop.
+- **Rejected: the terminal tail as the structured retry's context.** Mostly
+  prose, it buries the actions that matter and does not survive a reload.
+- **Rejected: saving a terminal task's output to disk for its retry.** New
+  persisted state, with whatever tokens or URLs a pipeline printed, for a
+  transport the structured one is replacing.
 - **Rejected: retry blocked for ops tasks.** Safer for the rare half-done
   effect, more friction for the common attempt that failed before doing
   anything.
@@ -191,3 +200,4 @@ it.
 ## History
 
 - 2026-10-02 — accepted, and implemented (#67).
+- 2026-10-03 — retry context for structured ops tasks comes from the saved log, so it survives a reload.

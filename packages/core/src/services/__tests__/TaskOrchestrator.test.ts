@@ -55,6 +55,7 @@ function makeOrchestrator(overrides: {
   workspaceRoot?: () => string;
   workspaceEnv?: (cwd: string) => Promise<WorkspaceEnv>;
   tddEnabled?: () => boolean;
+  previousAttemptFromLog?: (taskId: string) => string | null;
 } = {}) {
   const config = fakeConfig(overrides.config);
   const notifications = { ...fakeNotification(), ...overrides.notifications };
@@ -69,6 +70,7 @@ function makeOrchestrator(overrides: {
     workspaceRoot: overrides.workspaceRoot ?? (() => '/repo'),
     workspaceEnv: overrides.workspaceEnv,
     tddEnabled: overrides.tddEnabled,
+    previousAttemptFromLog: overrides.previousAttemptFromLog,
   });
 }
 
@@ -1677,5 +1679,72 @@ describe('TaskOrchestrator task output', () => {
     sessions[0].emitExit(1);
     await settle();
     expect(orchestrator.getLiveOutput('t1', { maxLines: 5 })).toMatchObject({ text: 'compiling\nlinking', running: false });
+  });
+});
+
+describe('TaskOrchestrator — retrying an ops task (ADR-0020)', () => {
+  const opsTask = () => createTask({ id: 'o1', order: 1, title: 'Deploy', prompt: 'deploy it', completionMarker: 'mk-o1', ops: true });
+
+  async function retryAfterFailure(options: { previousAttemptFromLog?: (taskId: string) => string | null; firstAttemptOutput?: string }) {
+    const { sessions, spawn } = sessionRunner();
+    const orchestrator = makeOrchestrator({ terminalRunner: { spawn }, previousAttemptFromLog: options.previousAttemptFromLog });
+    orchestrator.loadPlan([opsTask()]);
+    await orchestrator.approveReview();
+    if (options.firstAttemptOutput) sessions[0].emitOutput(options.firstAttemptOutput);
+    sessions[0].emitExit(1);
+    await vi.waitFor(() => expect(orchestrator.storeInstance.get('o1')!.status).toBe('failed'));
+    await orchestrator.retryTask('o1');
+    await orchestrator.start();
+    return spawn.mock.calls[1][0].prompt;
+  }
+
+  it('tells the retry what the last attempt did, from its saved log', async () => {
+    const prompt = await retryAfterFailure({ previousAttemptFromLog: () => '- Bash {"command":"az group create"} → ok' });
+
+    expect(prompt).toContain('## Previous attempt');
+    expect(prompt).toContain('  - Bash {"command":"az group create"} → ok');
+  });
+
+  it('says the last attempt\'s output is gone when a reload left neither a log nor a buffer', async () => {
+    const { spawn } = sessionRunner();
+    const orchestrator = makeOrchestrator({ terminalRunner: { spawn } });
+    orchestrator.loadPlan([{ ...opsTask(), status: 'failed' }]);
+
+    await orchestrator.retryTask('o1');
+    await orchestrator.forceStartTask('o1');
+
+    const prompt = spawn.mock.calls[0][0].prompt;
+    expect(prompt).toContain('## Previous attempt');
+    expect(prompt).toContain('Its output is not available: this session was reloaded since it ran.');
+  });
+
+  it('adds nothing to the first attempt', async () => {
+    const { spawn } = sessionRunner();
+    const orchestrator = makeOrchestrator({ terminalRunner: { spawn } });
+    orchestrator.loadPlan([opsTask()]);
+
+    await orchestrator.forceStartTask('o1');
+
+    expect(spawn.mock.calls[0][0].prompt).not.toContain('## Previous attempt');
+  });
+
+  it('keeps the live terminal tail when a runner left no log', async () => {
+    const prompt = await retryAfterFailure({ previousAttemptFromLog: () => null, firstAttemptOutput: 'created rg-dev\n' });
+
+    expect(prompt).toContain('  created rg-dev');
+    expect(prompt).not.toContain('not available');
+  });
+
+  it('tells a change task\'s retry nothing about the attempt before', async () => {
+    const { sessions, spawn } = sessionRunner();
+    const orchestrator = makeOrchestrator({ terminalRunner: { spawn }, previousAttemptFromLog: () => '- Bash {} → ok' });
+    orchestrator.loadPlan([createTask({ id: 't1', order: 1, title: 'Change', prompt: 'edit', completionMarker: 'mk-1' })]);
+    await orchestrator.approveReview();
+    sessions[0].emitExit(1);
+    await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('failed'));
+    await orchestrator.retryTask('t1');
+    await orchestrator.start();
+
+    expect(spawn.mock.calls[1][0].prompt).not.toContain('## Previous attempt');
   });
 });
