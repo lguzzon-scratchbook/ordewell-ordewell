@@ -608,6 +608,66 @@ describe('VerdictEngine', () => {
       vi.advanceTimersByTime(60_000);
       expect(engine.getIdleSince('t1')).not.toBeNull();
     });
+
+    it('does not flag a task waiting on a tool approval, and resumes once the last one is answered', () => {
+      const engine = new VerdictEngine();
+      const session = new FakeStructuredSession();
+      engine.watch(buildTask(), session);
+      session.emitOutput('working\n');
+
+      session.requestPermission('p1', 'Bash', { command: 'npm test' });
+      session.requestPermission('p2', 'Edit', { file_path: 'a.ts' });
+      vi.advanceTimersByTime(120_000);
+      expect(engine.getIdleSince('t1')).toBeNull();
+
+      session.answerPermission('p1', { decision: 'allow' });
+      vi.advanceTimersByTime(120_000);
+      expect(engine.getIdleSince('t1')).toBeNull();
+
+      session.withdrawPermission('p2');
+      vi.advanceTimersByTime(60_000);
+      expect(engine.getIdleSince('t1')).not.toBeNull();
+    });
+
+    it('clears an idle flag already raised when a tool approval is asked', () => {
+      const engine = new VerdictEngine();
+      const idleEvents: (string | null)[] = [];
+      engine.onIdleChange((_id, idleSince) => idleEvents.push(idleSince));
+      const session = new FakeStructuredSession();
+      engine.watch(buildTask(), session);
+      session.emitOutput('working\n');
+      vi.advanceTimersByTime(60_000);
+
+      session.requestPermission('p1', 'Bash', { command: 'npm test' });
+
+      expect(engine.getIdleSince('t1')).toBeNull();
+      expect(idleEvents.at(-1)).toBeNull();
+    });
+
+    it('keeps watching through a request the task mode already answered', () => {
+      const engine = new VerdictEngine();
+      const session = new FakeStructuredSession();
+      engine.watch(buildTask(), session);
+      session.emitOutput('working\n');
+
+      session.emitEvent({ type: 'permission_request', id: 'p1', name: 'Read', detail: '{}', decided: { decision: 'allow' } });
+      vi.advanceTimersByTime(60_000);
+
+      expect(engine.getIdleSince('t1')).not.toBeNull();
+    });
+
+    it('stays quiet while a checkpoint still waits, though an approval was answered', () => {
+      const engine = new VerdictEngine();
+      const session = new FakeStructuredSession();
+      engine.watch(buildTask(), session);
+      session.requestPermission('p1', 'Bash', { command: 'npm test' });
+      engine.pauseIdle('t1');
+
+      session.answerPermission('p1', { decision: 'allow' });
+      vi.advanceTimersByTime(120_000);
+
+      expect(engine.getIdleSince('t1')).toBeNull();
+    });
   });
 
   describe('reset', () => {

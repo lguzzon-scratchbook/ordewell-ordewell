@@ -54,6 +54,12 @@ export class VerdictEngine {
   private idleSince = new Map<string, string | null>();
   /** Tasks waiting on the user, whose silence is expected rather than a sign of a stuck runner. */
   private idlePaused = new Set<string>();
+  /**
+   * Open tool approvals per structured task. They arrive mid-turn and leave the
+   * status alone (ADR-0018, W1), but a task waiting on one is waiting on the
+   * user, so it is not idle either.
+   */
+  private openApprovals = new Map<string, Set<string>>();
 
   onVerdict(listener: VerdictListener): void {
     this.listeners.push(listener);
@@ -89,7 +95,7 @@ export class VerdictEngine {
 
   /** Restart the silence timer on fresh output; broadcasts the null transition if it was idle. */
   private touchIdle(taskId: string, gen: number): void {
-    if (this.idlePaused.has(taskId)) return;
+    if (this.idlePaused.has(taskId) || this.openApprovals.get(taskId)?.size) return;
     const existing = this.idleTimers.get(taskId);
     if (existing) clearTimeout(existing);
     if (this.idleSince.get(taskId)) {
@@ -178,7 +184,10 @@ export class VerdictEngine {
     });
     if (isStructuredSession(session)) {
       session.onEvent((event) => {
-        if (event.type === 'turn_start' && this.generations.get(task.id) === gen) this.resumeIdle(task.id);
+        if (this.generations.get(task.id) !== gen) return;
+        if (event.type === 'turn_start') this.resumeIdle(task.id);
+        else if (event.type === 'permission_request' && !event.decided) this.approvalOpened(task.id, event.id);
+        else if (event.type === 'permission_decided' || event.type === 'permission_withdrawn') this.approvalClosed(task.id, event.id, gen);
       });
     }
     session.onExit((exitCode: number) => {
@@ -190,6 +199,20 @@ export class VerdictEngine {
       const verdict = this.decide(task, exitCode);
       for (const l of this.listeners) l(task.id, verdict);
     });
+  }
+
+  private approvalOpened(taskId: string, approvalId: string): void {
+    const open = this.openApprovals.get(taskId) ?? new Set<string>();
+    open.add(approvalId);
+    this.openApprovals.set(taskId, open);
+    this.clearIdle(taskId);
+  }
+
+  private approvalClosed(taskId: string, approvalId: string, gen: number): void {
+    const open = this.openApprovals.get(taskId);
+    if (!open?.delete(approvalId) || open.size) return;
+    this.openApprovals.delete(taskId);
+    this.touchIdle(taskId, gen);
   }
 
   /** Scan only the new text plus the unmatched carry, so a long run stays linear. */
@@ -215,6 +238,7 @@ export class VerdictEngine {
     this.checkpointCarry.delete(taskId);
     this.pausedSessions.delete(taskId);
     this.idlePaused.delete(taskId);
+    this.openApprovals.delete(taskId);
     this.clearIdle(taskId);
   }
 
@@ -255,6 +279,7 @@ export class VerdictEngine {
     this.idleTimers.clear();
     this.idleSince.clear();
     this.idlePaused.clear();
+    this.openApprovals.clear();
     this.generations.clear();
   }
 

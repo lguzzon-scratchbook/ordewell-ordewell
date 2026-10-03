@@ -76,7 +76,9 @@ protocol instead of a screen and a keyboard.
   #28) responds or marks the task complete. Approval requests arrive
   mid-turn and do **not** change task status: "waiting for approval" is derived
   from the task's pending approvals. The idle timer keeps running during a turn
-  and is paused while the task waits. If a queued message is delivered as the
+  and is paused while the task waits, on input, a checkpoint or an open
+  approval (2026-10-03: approvals added, so a long one doesn't also read as
+  idle). If a queued message is delivered as the
   turn ends, the task stays `in_progress` with no flicker.
 - **Talking to a task (M1).** Ordewell owns the message queue. Messages are
   shown as queued, can be removed, and are delivered when the turn ends.

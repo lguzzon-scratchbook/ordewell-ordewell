@@ -8,6 +8,12 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A task waiting on a tool approval no longer also shows as idle once it has
+  been silent for a minute; idle watching resumes when its last open approval
+  is answered or withdrawn.
+
 ## [0.6.1] — 2026-10-02
 
 ### Added
