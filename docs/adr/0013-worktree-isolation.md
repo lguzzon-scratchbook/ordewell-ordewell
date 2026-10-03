@@ -355,3 +355,4 @@ everything below applies per repo of the group.
 - 2026-10-02 — commit subjects name the change, not the plan's task number or run
   id; only change tasks are isolated, isolation is decided at the first change
   task, and Merge all can run mid-run (ADR-0020).
+- 2026-10-03 — a blocked run's execution stream stays open for the ops tasks still running; the choice's stream replaces it.

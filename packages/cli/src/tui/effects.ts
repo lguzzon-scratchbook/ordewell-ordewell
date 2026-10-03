@@ -583,8 +583,8 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       dispatch({ type: 'notice', message: `Removed the run's worktrees and task branches; ${effect.branch} is kept.` });
       return;
 
-    // Spawns runners again, so it needs the stream a run needs — the blocked
-    // one closed itself when nothing started.
+    // Spawns runners again, so it needs the stream a run needs. Opening it ends
+    // the blocked run's, which stayed open to show the ops tasks still running.
     case 'isolationContinue': {
       const { sessionId } = effect;
       await withExecutionStream(deps, sessionId, () => effect.mode === 'stash' ? api.continueWithStash(sessionId) : api.continueWithoutIsolation(sessionId));

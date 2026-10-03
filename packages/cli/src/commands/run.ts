@@ -69,6 +69,8 @@ export async function followExecution(
   }
 
   let pausedAtGate = false;
+  let noteBlocked: () => void = () => {};
+  const blockedSeen = new Promise<void>((resolve) => { noteBlocked = resolve; });
   let settleReady: (error?: Error) => void = () => {};
   const streamReady = new Promise<void>((resolve, reject) => {
     settleReady = (error) => (error ? reject(error) : resolve());
@@ -104,6 +106,7 @@ export async function followExecution(
     if (event.type === 'isolation_blocked') {
       blocked = event.message;
       dirtyRepos = event.repos ?? [];
+      noteBlocked();
     }
     if (event.type === 'isolation_handoff') {
       const n = event.landed.length;
@@ -121,7 +124,9 @@ export async function followExecution(
   void stream.catch(settleReady);
   await streamReady.catch(streamFailed);
   await start();
-  await stream.catch(streamFailed);
+  // The stream outlives a block, which has no completion coming; the choice
+  // below opens the next one, and that ends this.
+  await Promise.race([stream, blockedSeen]).catch(streamFailed);
 
   if (blocked === null) return;
 

@@ -1558,6 +1558,27 @@ describe('worktree isolation', () => {
     expect(h.actions).toContainEqual({ type: 'isolationBlocked', message: 'Tracked files have uncommitted changes', sessionId: 's1' });
   });
 
+  it('keeps showing what still runs while the stash question is open', async () => {
+    let emit: (event: unknown) => void = () => {};
+    let end: () => void = () => {};
+    const h = harness({
+      streamExecution: vi.fn().mockImplementation((_id: string, cb: (e: unknown) => void, onReady?: (error?: Error) => void) => {
+        emit = cb;
+        onReady?.();
+        return new Promise<void>((resolve) => { end = resolve; });
+      }),
+    } as Partial<OrdewellApi>);
+
+    const run = runEffect({ type: 'execute', sessionId: 's1' }, h.deps);
+    await vi.waitFor(() => expect(h.api.executePlan).toHaveBeenCalled());
+    emit({ type: 'isolation_blocked', reason: 'dirty', message: 'Tracked files have uncommitted changes' });
+    emit({ type: 'status_update', tasks: [{ id: 'ops1', status: 'in_progress', verdict: null }] });
+
+    expect(types(h.actions)).toEqual(expect.arrayContaining(['isolationBlocked', 'tasksStatus']));
+    end();
+    await run;
+  });
+
   it('turns isolation_handoff into the handoff, before the run completes', async () => {
     const landed = [{ taskId: 't1', order: 1, title: 'One' }];
     const repos = [{ path: '.', integrationBranch: 'ordewell/r1/integration', baseRef: 'abc', landed }];

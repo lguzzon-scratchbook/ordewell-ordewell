@@ -93,6 +93,8 @@ export class ApiClient {
 
   private port: number;
   private workspace: string;
+  /** A session's open execution stream, so a new one can end it: one run is reported once. */
+  private executionStreams = new Map<string, () => void>();
 
   constructor(port?: number, workspace?: string) {
     this.port = port || DEFAULT_PORT;
@@ -620,10 +622,20 @@ export class ApiClient {
     onReady?: (error?: Error) => void,
   ): Promise<void> {
     return new Promise((resolve, reject) => {
+      this.executionStreams.get(sessionId)?.();
       const socket = this.openSessionSocket(sessionId);
 
       let resolved = false;
       let opened = false;
+      const forget = () => { if (this.executionStreams.get(sessionId) === end) this.executionStreams.delete(sessionId); };
+      const end = () => {
+        forget();
+        if (resolved) return;
+        resolved = true;
+        socket.close();
+        resolve();
+      };
+      this.executionStreams.set(sessionId, end);
 
       socket.on('open', () => {
         opened = true;
@@ -631,28 +643,18 @@ export class ApiClient {
       });
 
       socket.on('message', (data: Buffer) => {
+        if (resolved) return;
         try {
           const event: WsEvent = JSON.parse(data.toString());
           onEvent(event);
-          // A blocked run starts no change task until the user chooses, so
-          // this stream has no completion coming. Ending it here lets the
-          // choice open its own, instead of two streams reporting one run.
-          if (
-            (event.type === 'execution_complete' ||
-              event.type === 'execution_stopped' ||
-              event.type === 'isolation_blocked') &&
-            !resolved
-          ) {
-            resolved = true;
-            socket.close();
-            resolve();
-          }
+          if (event.type === 'execution_complete' || event.type === 'execution_stopped') end();
         } catch {
           // ignore malformed messages
         }
       });
 
       socket.on('error', (err) => {
+        forget();
         if (!opened) onReady?.(err);
         if (!resolved) {
           resolved = true;
@@ -661,6 +663,7 @@ export class ApiClient {
       });
 
       socket.on('close', () => {
+        forget();
         if (!opened) onReady?.(new Error('Execution stream closed before connecting'));
         if (!resolved) {
           resolved = true;

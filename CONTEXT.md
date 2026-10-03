@@ -745,8 +745,8 @@ branch, only in the expanded detail.
 
 **Blocked run** — a run `isolation_blocked` turned away because tracked files are
 modified (in any repo of the group, under ADR-0014, which the notice names). The daemon parks the start until it hears `continueWithStash` or
-`continueWithoutIsolation`, so the run's execution stream ends at the block and
-the choice opens its own. Cancelling is `stopExecution`, not a dismissal: a
+`continueWithoutIsolation`, so the run's execution stream stays open through the block, showing the ops
+tasks still running, and the choice's own stream replaces it. Cancelling is `stopExecution`, not a dismissal: a
 parked start swallows a re-run. The TUI asks with a three-way picker (Stash and
 continue / Run without isolation / Cancel); `ordewell run` takes `--stash` and
 `--without-isolation`, and without either releases the run and says so. The block

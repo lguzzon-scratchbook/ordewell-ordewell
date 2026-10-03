@@ -10,7 +10,7 @@ const landed = [{ taskId: 't1', order: 1, title: 'One' }];
 const handoff: Event = { type: 'isolation_handoff', repos: [{ path: '.', integrationBranch: 'ordewell/r1/integration', baseRef: 'abc', landed }], landed };
 const complete: Event = { type: 'execution_complete', summary: { total: 1, completed: 1, failed: 0 } };
 
-const TERMINAL = new Set(['execution_complete', 'execution_stopped', 'isolation_blocked']);
+const TERMINAL = new Set(['execution_complete', 'execution_stopped']);
 
 /**
  * Like the daemon: an event reaches only a stream already subscribed when it
@@ -18,9 +18,13 @@ const TERMINAL = new Set(['execution_complete', 'execution_stopped', 'isolation_
  */
 function liveDaemon(scripts: { execute?: Event[]; approve?: Event[]; stash?: Event[]; shared?: Event[] }) {
   const subscribers = new Set<(event: Event) => void>();
+  const settlers = new Set<() => void>();
   const broadcast = (events: Event[] = []) => { for (const event of events) for (const s of [...subscribers]) s(event); };
   const api = {
+    // Like ApiClient: a session has one execution stream, and a new one ends the old.
     streamExecution: vi.fn((_id: string, onEvent: (e: Event) => void, onReady?: (error?: Error) => void) => new Promise<void>((resolve) => {
+      for (const settle of [...settlers]) settle();
+      settlers.add(() => { subscribers.delete(subscriber); resolve(); });
       const subscriber = (event: Event) => {
         onEvent(event);
         if (TERMINAL.has(event.type)) { subscribers.delete(subscriber); resolve(); }

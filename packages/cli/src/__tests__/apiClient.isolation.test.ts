@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import http from 'http';
 import { WebSocketServer } from 'ws';
 import { ApiClient } from '../apiClient';
@@ -74,17 +74,47 @@ describe('ApiClient isolation endpoints', () => {
 });
 
 describe('ApiClient.streamExecution and a blocked run', () => {
-  it('settles on isolation_blocked: nothing runs until the user chooses, and the choice opens its own stream', async () => {
+  async function server(onConnection: (ws: import('ws').WebSocket) => void) {
     const wss = new WebSocketServer({ port: 0 });
     await new Promise<void>((resolve) => wss.once('listening', () => resolve()));
-    wss.on('connection', (ws) => {
+    wss.on('connection', onConnection);
+    return { wss, client: new ApiClient((wss.address() as { port: number }).port) };
+  }
+
+  it('stays open past isolation_blocked, so what still runs is shown while the user chooses', async () => {
+    const { wss, client } = await server((ws) => {
       ws.send(JSON.stringify({ type: 'isolation_blocked', reason: 'dirty', message: 'dirty' }));
+      setTimeout(() => {
+        ws.send(JSON.stringify({ type: 'notice', level: 'info', message: 'ops task still running' }));
+        ws.send(JSON.stringify({ type: 'execution_stopped' }));
+      }, 50);
     });
     const events: string[] = [];
 
-    await new ApiClient((wss.address() as { port: number }).port).streamExecution('s1', (e) => events.push(e.type));
+    await client.streamExecution('s1', (e) => events.push(e.type));
 
-    expect(events).toEqual(['isolation_blocked']);
+    expect(events).toEqual(['isolation_blocked', 'notice', 'execution_stopped']);
+    wss.close();
+  });
+
+  it('ends the session\'s earlier stream when the choice opens a new one, so one run is never reported twice', async () => {
+    const sockets: import('ws').WebSocket[] = [];
+    const { wss, client } = await server((ws) => { sockets.push(ws); });
+    const first: string[] = [];
+    const second: string[] = [];
+
+    const firstDone = client.streamExecution('s1', (e) => first.push(e.type));
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    const secondDone = client.streamExecution('s1', (e) => second.push(e.type));
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+
+    await firstDone;
+    for (const ws of sockets) ws.send(JSON.stringify({ type: 'notice', level: 'info', message: 'after' }));
+    sockets[1].send(JSON.stringify({ type: 'execution_complete', summary: { total: 0, completed: 0, failed: 0 } }));
+    await secondDone;
+
+    expect(first).toEqual([]);
+    expect(second).toEqual(['notice', 'execution_complete']);
     wss.close();
   });
 });
