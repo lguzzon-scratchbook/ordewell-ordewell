@@ -8,6 +8,8 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-10-04
+
 ### Security
 
 - **Approving one `cd` no longer approves every later one.** A `cd` the planner

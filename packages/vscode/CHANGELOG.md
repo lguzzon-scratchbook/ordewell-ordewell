@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.4] — 2026-10-04
+
 ### Security
 
 - **Approving one `cd` no longer approves every later one** during planner
