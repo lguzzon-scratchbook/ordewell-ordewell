@@ -355,6 +355,20 @@ describe('runResearchAgent', () => {
     expect(touched).toEqual(['bash']);
   });
 
+  it('follows a cd chain inside the workspace, and still refuses one that leaves it', async () => {
+    const chat = scriptedChat([
+      toolTurn('bash', { command: 'cd api && git log -1 && cd ../web && git log -1' }),
+      toolTurn('bash', { command: 'cd api && cat ../../etc/hosts' }),
+      textTurn('digest'),
+    ]);
+    const { fs, touched } = fakeFs();
+
+    await runResearchAgent('brief', { createChat: () => chat, fs });
+
+    expect(touched).toEqual(['bash']);
+    expect(chat.received[1][0].output).toMatch(/outside the workspace/i);
+  });
+
   it('an aborted signal stops the loop without executing tools', async () => {
     const ac = new AbortController();
     ac.abort();

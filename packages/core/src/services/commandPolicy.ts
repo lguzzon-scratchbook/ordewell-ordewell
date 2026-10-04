@@ -801,6 +801,12 @@ function dialectFor(dialect: ShellDialect | undefined): Dialect {
  */
 export interface CommandPolicyOptions {
   dialect?: ShellDialect;
+  /**
+   * `CDPATH` is set in the environment the command will run in. A relative
+   * `cd` may then land in a directory the command line never names, so `cd`
+   * stops being navigation the classifier can follow.
+   */
+  cdpathSet?: boolean;
 }
 
 export type CommandTier = 'auto' | 'ask' | 'refuse';
@@ -840,6 +846,14 @@ interface Segment {
    * passes them to the command. For path confinement only.
    */
   inputs: string[];
+  /** What joined this segment to the one before it; absent for the first. */
+  joinedBy?: 'and' | 'pipe' | 'other';
+  /**
+   * The literal `cd` targets, in order, that are certain to have run in the
+   * shell executing this segment — see {@link followCd}. Only on top-level
+   * segments of a command simple enough to follow.
+   */
+  cwd?: string[];
 }
 
 /** An output redirect whose target is not provably a no-op (`/dev/null`, an fd duplication). */
@@ -854,6 +868,8 @@ interface Lexed {
   segments: Segment[];
   /** Set for the first output redirect that isn't `/dev/null` or an fd duplication. */
   unsafeRedirect?: UnsafeRedirect;
+  /** An unquoted `(` or `)`: a subshell, whose `cd` does not outlive it. */
+  grouped: boolean;
   /** An unquoted `<(…)`/`>(…)` spawns a process this classifier never tokenizes. */
   processSubstitution: boolean;
   /** Lexing ran off the end inside a quote or a substitution — nothing here is trustworthy. */
@@ -904,6 +920,8 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
   let unsafeRedirect: UnsafeRedirect | undefined;
   let processSubstitution = false;
   let unbalanced = false;
+  let grouped = false;
+  let joinedBy: Segment['joinedBy'];
 
   let tokens: string[] = [];
   let expandable = false;
@@ -946,13 +964,14 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
     current = '';
     started = false;
   };
-  const endSegment = (nextPiped: boolean) => {
+  const endSegment = (nextPiped: boolean, next: Segment['joinedBy'] = 'other') => {
     endToken();
-    if (tokens.length > 0) segments.push({ ...toSegment(tokens, piped, dialect), expandable, inputs });
+    if (tokens.length > 0) segments.push({ ...toSegment(tokens, piped, dialect), expandable, inputs, joinedBy });
     tokens = [];
     inputs = [];
     expandable = false;
     piped = nextPiped;
+    joinedBy = next;
   };
 
   let i = 0;
@@ -1056,17 +1075,17 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
     }
 
     // Subshell grouping is not part of any token: `(rm -rf /)` must lex to `rm`.
-    if (c === '(' || c === ')') { endToken(); i++; continue; }
+    if (c === '(' || c === ')') { endToken(); grouped = true; i++; continue; }
 
     if (c === '|') {
       const double = command[i + 1] === '|';
       // `|&` pipes stderr too — still a pipe, not a `|` and a separate `&`.
-      endSegment(!double);
+      endSegment(!double, double ? 'other' : 'pipe');
       i += double || command[i + 1] === '&' ? 2 : 1;
       continue;
     }
     if (c === '&' || c === ';' || c === '\n') {
-      endSegment(false);
+      endSegment(false, c === '&' && command[i + 1] === '&' ? 'and' : 'other');
       i += command[i + 1] === c ? 2 : 1;
       continue;
     }
@@ -1082,7 +1101,7 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
   if (quote !== '') unbalanced = true;
   endSegment(false);
 
-  return { segments, unsafeRedirect, processSubstitution, unbalanced };
+  return { segments, unsafeRedirect, processSubstitution, unbalanced, grouped };
 }
 
 /**
@@ -1309,10 +1328,11 @@ function unwrap(seg: Segment, dialect: Dialect): Unwrapped {
 }
 
 /** Lex a command line and every substitution body nested inside it. */
-function lexAll(command: string, dialect: Dialect): Lexed {
+function lexAll(command: string, dialect: Dialect, cdpathSet = false): Lexed {
   const queue: string[] = [];
   const top = lex(command, queue, dialect);
   const all: Lexed = { ...top, segments: top.segments.filter((s) => s.binary) };
+  if (!top.grouped && queue.length === 0 && !cdpathSet) followCd(all.segments);
 
   // Bounded: a pathological `$($($(…)))` must not spin here.
   for (let depth = 0; depth < 32 && queue.length > 0; depth++) {
@@ -1323,6 +1343,51 @@ function lexAll(command: string, dialect: Dialect): Lexed {
     all.unbalanced ||= inner.unbalanced;
   }
   return all;
+}
+
+/**
+ * A `cd` whose target is one literal word: no variable, no substitution, no
+ * flag (`-P`, `-`), no `~`, no glob, no second operand. Bare `cd` goes home and `cd -`
+ * goes to `$OLDPWD`, neither named on the command line.
+ */
+function literalCdTarget(seg: Segment): string | undefined {
+  if (seg.binary !== 'cd' || seg.assignments.length > 0 || seg.expandable || seg.inputs.length > 0) return undefined;
+  if (seg.args.length !== 1) return undefined;
+  const [target] = seg.args;
+  // A glob is expanded by the shell to a name this command line does not spell.
+  return target === '' || target.startsWith('-') || target.startsWith('~') || /[*?[]/.test(target) ? undefined : target;
+}
+
+/**
+ * Record on each segment the `cd` targets that are certain to have run before
+ * it, so path confinement resolves a relative path from where the shell will
+ * actually be rather than from the workspace root. `cd api && cat ../web/x`
+ * reads inside the workspace; judged from the root it climbs out of it.
+ *
+ * This is deliberately a small fragment of the shell, because a wrong answer
+ * here is a read outside the workspace judged as inside it. It is followed only
+ * where the command is a list of pipelines joined by `&&`: a failed `cd` then
+ * ends the list, so everything after it ran in the new directory. Any `;`,
+ * `||`, `&`, newline, subshell or substitution makes the shell's directory
+ * depend on what ran, and nothing is followed. A `cd` inside a multi-stage
+ * pipeline runs in a subshell and is skipped, and the directory it sits in
+ * is the one its stages share.
+ */
+function followCd(segments: Segment[]): void {
+  if (segments.some((s) => s.joinedBy === 'other')) return;
+  let chain: string[] = [];
+  segments.forEach((seg, i) => {
+    seg.cwd = chain;
+    const inPipeline = seg.joinedBy === 'pipe' || segments[i + 1]?.joinedBy === 'pipe';
+    const target = inPipeline ? undefined : literalCdTarget(seg);
+    if (target !== undefined) chain = [...chain, target];
+  });
+}
+
+export interface PathRef {
+  path: string;
+  /** The `cd` targets, in order, the path is relative to — empty for the workspace root. */
+  cwd: string[];
 }
 
 /**
@@ -1362,12 +1427,19 @@ function looksLikePath(arg: string): boolean {
  * read-only, but their arguments can still point anywhere on disk, which is
  * exactly the escape path confinement closes for `readFile`/`glob`/`grep`.
  */
-export function pathLikeArgs(command: string, opts: CommandPolicyOptions = {}): string[] {
+export function pathRefs(command: string, opts: CommandPolicyOptions = {}): PathRef[] {
   const dialect = dialectFor(opts.dialect);
-  return lexAll(command, dialect).segments.flatMap((seg) => {
+  return lexAll(command, dialect, opts.cdpathSet).segments.flatMap((seg) => {
     const patterns = patternArgs(seg);
-    return [...seg.args.filter((_, i) => !patterns.has(i)), ...seg.inputs].flatMap(pathIn);
+    const cwd = seg.cwd ?? [];
+    return [...seg.args.filter((_, i) => !patterns.has(i)), ...seg.inputs]
+      .flatMap(pathIn)
+      .map((path) => ({ path, cwd }));
   });
+}
+
+export function pathLikeArgs(command: string, opts: CommandPolicyOptions = {}): string[] {
+  return pathRefs(command, opts).map((r) => r.path);
 }
 
 function pathIn(a: string): string[] {
@@ -1668,7 +1740,12 @@ function scopeFor(seg: Segment): string {
   return [seg.binary, ...lead].join(' ');
 }
 
-function isAuto(seg: Segment): boolean {
+function isAuto(seg: Segment, opts: CommandPolicyOptions): boolean {
+  // Navigation is read-only, but only a target the command line spells out: its
+  // effect on later commands is followed by `followCd`, or ignored in the
+  // fallback, where a path judged from the workspace root is never more
+  // permissive than from a deeper directory the root contains.
+  if (seg.binary === 'cd') return !opts.cdpathSet && literalCdTarget(seg) !== undefined;
   if (!AUTO_COMMANDS.includes(seg.binary)) return false;
   // `x=/etc/passwd; cat $x` gives `cat` the lone argument `$x`, which
   // `pathLikeArgs`/`looksLikePath` cannot see is a path at all — the shell
@@ -1838,7 +1915,7 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
   if (!trimmed) return { tier: 'refuse', scope: '', reason: 'Empty command.' };
 
   const dialect = dialectFor(opts.dialect);
-  const { segments, unsafeRedirect, processSubstitution, unbalanced } = lexAll(trimmed, dialect);
+  const { segments, unsafeRedirect, processSubstitution, unbalanced } = lexAll(trimmed, dialect, opts.cdpathSet);
 
   if (unbalanced) {
     return {
@@ -1890,7 +1967,7 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
 
   // A runner is never auto: the arguments it appends are the ones the flag
   // allowlist and path confinement would have had to check.
-  const nonAuto = unwrapped.filter((u) => u.runner !== undefined || !isAuto(u.seg));
+  const nonAuto = unwrapped.filter((u) => u.runner !== undefined || !isAuto(u.seg, opts));
   if (nonAuto.length === 0) return { tier: 'auto', scope: '' };
 
   // A grant covers only the parts that actually needed one, so

@@ -13,6 +13,14 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 - A task waiting on a tool approval no longer also shows as idle once it has
   been silent for a minute; idle watching resumes when its last open approval
   is answered or withdrawn.
+- **A `cd` into a repo inside the workspace no longer prompts.** Planner
+  research asked for approval on `cd api && git log && cd ../web && git log`
+  although both directories are inside the workspace: `cd` was never read-only
+  navigation, and `../web` was judged from the workspace root instead of from
+  `api`. A `cd` to a literal directory now runs without a prompt, and a chain
+  of them joined by `&&` is followed, so later paths are judged from where the
+  shell will be. Anything the classifier cannot follow — `;`, `||`, subshells,
+  `$(…)`, a variable, `cd -`, or `CDPATH` set — behaves as before.
 
 ## [0.6.1] — 2026-10-02
 

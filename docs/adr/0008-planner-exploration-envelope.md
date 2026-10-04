@@ -212,6 +212,37 @@ get past them wears down the prompts that matter.
 None of this changes what is reachable. Every path argument is still confined,
 and every grant still covers only its own scope.
 
+## `cd` is followed where the shell's directory is certain
+
+`cd api && git log && cd ../web && git log` stays inside the workspace, so it
+must not prompt. Judging every path from the workspace root would read `../web`
+as a sibling of the workspace, so confinement follows the `cd`s it can be sure
+of.
+
+- **A literal `cd` is `auto`.** One operand the command line spells out: no
+  variable, substitution, glob, flag (`-P`, `-`), `~`, or second operand. Bare
+  `cd`, `cd -` and `pushd` still ask. With `CDPATH` set in the environment a
+  relative `cd` may land somewhere the line never names, so none of this
+  applies.
+- **A chain is followed only where it is certain.** Confinement resolves a path
+  from the `cd` targets that must have run before it, and only when the command
+  is pipelines joined by `&&`: a failed `cd` ends the list, so everything after
+  it ran in the new directory. Any `;`, `||`, `&`, newline, subshell or
+  substitution disables following for the whole command, because the shell's
+  directory then depends on what ran. A `cd` inside a multi-stage pipeline runs
+  in a subshell and is not counted.
+- **The fallback never relaxes.** When nothing is followed, paths are judged
+  from the root. That is never more permissive than the truth while every `cd`
+  stays inside the workspace: a path with no net climb stays inside from any
+  deeper directory, and a `cd` that climbs is itself a path argument and asks.
+  Where a followed chain leaves the workspace, later paths are judged from there
+  and ask under their own scopes.
+- **Symlinks stay lexical,** as in `pathScope.ts`: `cd link && cat ../x` is
+  judged by name, not by where `link` points.
+
+Research subagents use the same resolution, so a chain that stays inside the
+workspace works for them and one that leaves it is refused.
+
 ## Considered options
 
 - **Widen the `bash` allowlist (M1).** Rejected: it fixes the too-strict half and leaves the substring matching, the invisible `$(…)`, and the ungated path escape untouched.
@@ -228,3 +259,4 @@ and every grant still covers only its own scope.
 - 2026-09-28 — command runners unwrapped or refused, `xargs` allowlist, sed and awk programs read, `<` targets confined.
 - 2026-09-29 — the seam carries runner tool requests (ADR-0018, #56).
 - 2026-10-01 — patterns are not paths, inert devices, one prompt per command.
+- 2026-10-01 — `cd` followed through `&&` chains where the shell's directory is certain.
