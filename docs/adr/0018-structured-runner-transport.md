@@ -210,3 +210,4 @@ protocol instead of a screen and a keyboard.
 - 2026-09-29 — accepted: structured opt-in, Claude Code only.
 - 2026-10-01 — the Codex connector (#54).
 - 2026-10-02 — the OpenCode connector (#55); structured the default, terminal the fallback, tmux optional (#61).
+- 2026-10-04 — the OpenCode connector speaks the 2.x API as well as 1.x.

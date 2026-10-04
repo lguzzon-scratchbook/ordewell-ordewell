@@ -6,6 +6,7 @@ import { assertWorkspaceExists } from '../../utils/workspace';
 import { killTree } from '../../utils/processTree';
 import { workspaceEnvOf } from '../workspaceEnv';
 import { runnerEnv } from './runnerEnv';
+import { OpenCodeV2 } from './OpenCodeV2';
 import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { AgentEvent, AgentProcessDeps, AgentStartOptions, PlannerStartOptions, TaskModeAgentAdapter, TaskStartOptions } from './AgentAdapter';
@@ -327,6 +328,8 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   private interruptRequested = false;
   /** A task's requests waiting for an answer, by request id, with the session that asked. */
   private readonly openPermissions = new Map<string, string>();
+  /** Set once the server turns out to speak the 2.x API, which then owns the session. */
+  private v2: OpenCodeV2 | null = null;
 
   constructor(private deps: AgentProcessDeps) {}
 
@@ -353,17 +356,17 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     // A task's server edits the worktree, and `serve` without a password
     // takes orders from any local process. The password exists only in this
     // adapter and the server's environment, after the workspace's own
-    // variables so none of them can replace it.
-    const password = opts.kind === 'task' ? randomBytes(24).toString('base64url') : null;
+    // variables so none of them can replace it. A planner's gets one too:
+    // 2.x answers every `/api` request without credentials with a 401, so a
+    // server with no password cannot be spoken to at all.
+    const password = randomBytes(24).toString('base64url');
     this.process = this.deps.spawn(launch.file, launch.args, {
-      env: runnerEnv(PATH, password
-        ? { ...workspaceEnv, OPENCODE_SERVER_USERNAME: SERVER_USERNAME, OPENCODE_SERVER_PASSWORD: password }
-        : workspaceEnv),
+      env: runnerEnv(PATH, { ...workspaceEnv, OPENCODE_SERVER_USERNAME: SERVER_USERNAME, OPENCODE_SERVER_PASSWORD: password }),
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: opts.cwd,
       windowsVerbatimArguments: launch.verbatim,
     });
-    if (password) this.authorization = `Basic ${Buffer.from(`${SERVER_USERNAME}:${password}`).toString('base64')}`;
+    this.authorization = `Basic ${Buffer.from(`${SERVER_USERNAME}:${password}`).toString('base64')}`;
     // Nothing is written here today, but an EPIPE on an unheard pipe crashes
     // the host, and the exit path already reports a dead server.
     this.process.stdin?.on('error', () => {});
@@ -401,6 +404,25 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
       throw new Error(`The OpenCode ${this.role()} server did not start.${this.stderrTail.trim() ? `\n\n${this.stderrTail.trim()}` : ''}`);
     }
 
+    if (await this.speaksV2()) {
+      this.v2 = new OpenCodeV2({
+        request: (method, path, body, signal) => this.request(method, path, body, signal),
+        json: (method, path, body, signal) => this.json(method, path, body, signal),
+        openEvents: (signal) => this.deps.fetch(`${this.baseUrl}/api/event`, { signal, headers: this.headers() }),
+        processEnded: this.processEnded,
+        isExited: () => this.exited,
+        exitMessage: () => this.exitMessage(),
+      }, opts, this.role());
+      try {
+        await this.v2.start();
+      } catch (err) {
+        this.dispose();
+        throw err;
+      }
+      this.sessionId = this.v2.nativeSessionId();
+      return;
+    }
+
     // A resume id names a session on disk, not on this process — so it is
     // checked rather than trusted.
     if (opts.resumeSessionId) {
@@ -432,6 +454,11 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     if (!this.baseUrl || !this.sessionId) throw new Error(`OpenCode ${this.role()} session is not started`);
     if (this.exited) {
       onEvent({ type: 'error', message: this.exitMessage() });
+      return;
+    }
+    if (this.v2) {
+      await this.v2.send(message, onEvent, signal, onActivity);
+      if (signal?.aborted) this.dispose();
       return;
     }
     if (this.task) return this.sendTask(this.task, message, onEvent, signal, onActivity);
@@ -631,6 +658,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
    */
   async interrupt(timeoutMs: number): Promise<boolean> {
     if (!this.process || !this.sessionId || this.exited) return false;
+    if (this.v2) return this.v2.interrupt(timeoutMs);
     const turn = this.taskTurn;
     this.interruptRequested = true;
     const posted = await this.json('POST', `/session/${this.sessionId}/abort`).then(() => true, () => false);
@@ -651,12 +679,23 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   }
 
   answerPermission(id: string, decision: ApprovalDecision): boolean {
+    if (this.v2) return this.process ? this.v2.answerPermission(id, decision) : false;
     const sessionId = this.openPermissions.get(id);
     if (sessionId === undefined || !this.process) return false;
     this.openPermissions.delete(id);
     void this.replyPermission(id, sessionId, permissionReply(decision))
       .catch(() => { /* a server that forgot the request will not hang on it either */ });
     return true;
+  }
+
+  /**
+   * OpenCode 2.x replaced the 1.x HTTP surface rather than extending it, and
+   * only 2.x answers `/api/info` with its version. A 1.x server — or one that
+   * answers with anything else — keeps the 1.x protocol this class speaks.
+   */
+  private async speaksV2(): Promise<boolean> {
+    const info = await this.json<{ version?: unknown }>('GET', '/api/info').catch(() => null);
+    return typeof info === 'object' && info !== null && typeof info.version === 'string';
   }
 
   private role(): 'planner' | 'task' {

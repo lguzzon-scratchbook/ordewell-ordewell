@@ -26,6 +26,14 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   planner grep and symbol lookup failed with `invalid option -- P`. The fallback
   now asks the machine's `grep` which regex mode it has and uses `-E` where
   `-P` is missing.
+- **OpenCode 2.x works as a planner and a structured-transport runner.** OpenCode
+  2.x replaced its server API, so planning with it failed at once with
+  `POST /session failed: 405 Method Not Allowed`. Ordewell now recognises a 2.x
+  server and speaks its API — plans, tasks, permission requests, interrupts,
+  subagents and resumed sessions — and keeps the 1.x protocol for older installs.
+  The terminal transport is not covered yet: 2.x's interactive command takes no
+  `--model` or `--agent`, and its `run` command takes the variant on the model
+  rather than as `--variant`.
 
 ## [0.6.1] — 2026-10-02
 

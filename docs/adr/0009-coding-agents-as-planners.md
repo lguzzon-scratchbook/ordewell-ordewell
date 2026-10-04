@@ -30,7 +30,7 @@ per-agent adapter:
 |---|---|---|
 | Claude Code | `-p --input-format stream-json --output-format stream-json --verbose --include-partial-messages` | `--permission-mode plan` + `--disallowedTools Edit,Write,…` |
 | Codex | `app-server` stdio JSON-RPC: `initialize` → `thread/start` → `turn/start` | `sandbox: read-only`, `approvalPolicy: never` |
-| OpenCode | `serve` (headless HTTP) + `/event` SSE | `agent: plan` |
+| OpenCode | `serve` (headless HTTP) + SSE event stream — 1.x `/event`, 2.x `/api/event` | `agent: plan`, plus rules denying `question` and `edit` on 2.x |
 
 Three details in that table were corrected during implementation, against the
 binaries themselves rather than against memory:
@@ -50,6 +50,16 @@ binaries themselves rather than against memory:
   only their text parts as `planner_text_delta` (with `plan_token` for
   envelopes); a part of any other message is the user's own words. Each
   message's reported `tokens` and `cost` feed the usage ledger (#47–#53).
+- **OpenCode 2.x speaks a different API.** Its server answers every `/api` request
+  without credentials with a 401, so a planner's server is started behind a
+  per-process password like a task's. A session carries its agent, model and
+  permission rules, a prompt is queued and returns at once, and a turn ends on a
+  `session.execution.succeeded`, `failed` or `interrupted` frame, with
+  `/api/session/active` behind the stream for a dropped frame. A prompt has no
+  system field, so the planner prompt is a session instruction entry; the
+  read-only guarantee is the plan agent plus deny rules for `question` and
+  `edit`. The adapter takes a server for 2.x when `/api/info` names a version,
+  and speaks the 1.x protocol otherwise.
   Letting the echo through put the user's goal in the planner's reply — and a
   goal quoting JSON would then have been parsed as the plan.
 
@@ -106,7 +116,7 @@ model's behalf, which is precisely what a coding agent replaces.
   ADR-0008 spent effort establishing.
   The planner prompt is *appended* to the agent's own instructions, never
   substituted for them: `--append-system-prompt` for Claude Code,
-  `developerInstructions` for Codex, `system` for OpenCode. Codex's
+  `developerInstructions` for Codex, `system` for OpenCode 1.x (an instruction entry on 2.x). Codex's
   `baseInstructions` replaces its base prompt, which takes its description of
   its own tools with it — a planner that has forgotten it can read the workspace
   researches the goal with a web search.
@@ -247,3 +257,4 @@ this backend should understand they are trading speed for not holding a key.
 - 2026-07-31 — accepted.
 - 2026-09-27 — OpenCode streams the assistant's reply and reports usage, with the user's echo filtered by message id.
 - 2026-09-29 — adapters gain a task mode for the structured transport (ADR-0018); the planner path stays read-only.
+- 2026-10-04 — OpenCode 2.x supported beside 1.x.

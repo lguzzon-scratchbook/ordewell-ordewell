@@ -942,6 +942,8 @@ describe('CliAgentAiService — OpenCode', () => {
     };
     const fetchImpl = (async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
+      // A 1.x server has no `/api/info`; the adapter's probe for 2.x gets an answer with no version, off the routes.
+      if (url.endsWith('/api/info')) return { ok: true, status: 200, statusText: 'OK', json: async () => ({}) } as unknown as Response;
       const body = routes(url, init);
       if (url.endsWith('/event')) {
         if (!sseFrames) return { ok: true, status: 200, statusText: 'OK', body: null } as unknown as Response;

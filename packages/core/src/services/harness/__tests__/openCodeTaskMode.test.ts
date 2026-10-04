@@ -567,7 +567,10 @@ describe('OpenCodeAdapter planner — still read-only', () => {
     });
     expect(server.requests.find((r) => r.path === '/permission/per_1/reply')?.body).toEqual({ reply: 'reject' });
     expect(server.requests.some((r) => r.path.endsWith('/prompt_async'))).toBe(false);
-    expect(env.OPENCODE_SERVER_PASSWORD).toBeUndefined();
+    // 2.x refuses every /api request without credentials, so a planner's server is secured like a task's.
+    const password = env.OPENCODE_SERVER_PASSWORD;
+    expect(password).toBeTruthy();
+    for (const request of server.requests) expect(request.authorization).toBe(basic(password!));
     expect(events.find((e) => e.type === 'permission_request')).not.toHaveProperty('decided');
     expect(adapter.answerPermission('per_1', { decision: 'allow' })).toBe(false);
     adapter.dispose();

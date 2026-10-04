@@ -1,0 +1,516 @@
+import { describe, it, expect } from 'vitest';
+import { OpenCodeAdapter } from '../OpenCodeAdapter';
+import type { AgentEvent, AgentProcessDeps, AgentStartOptions, TaskStartOptions } from '../AgentAdapter';
+import type { SpawnFn } from '../../HeadlessRunner';
+import { fakeSpawn } from '../../__tests__/harnessTestKit';
+
+/**
+ * OpenCode 2.x (`opencode serve`, the `/api` surface), recorded at v2.0.22: a
+ * session carries its model, agent and rules, a prompt is queued and returns at
+ * once, and a turn ends on `session.execution.*` — read from `/api/event`.
+ */
+
+const BASE = 'http://127.0.0.1:4096';
+const SES = 'ses_v2';
+const CHILD = 'ses_child';
+
+interface Recorded {
+  method: string;
+  path: string;
+  authorization: string | null;
+  body: unknown;
+}
+
+type Reply = unknown | { status: number; body?: unknown };
+
+interface EventStream {
+  push(frame: Record<string, unknown>): void;
+}
+
+function fakeServer(routes: Record<string, (body: unknown) => Reply | Promise<Reply>> = {}) {
+  const requests: Recorded[] = [];
+  const streams: EventStream[] = [];
+
+  const fetchImpl = async (input: unknown, init?: RequestInit) => {
+    const path = String(input).replace(BASE, '');
+    const method = init?.method ?? 'GET';
+    const headers = new Headers(init?.headers);
+    const body = typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined;
+    requests.push({ method, path, authorization: headers.get('authorization'), body });
+
+    if (path === '/api/event') {
+      const queue: Uint8Array[] = [];
+      let wake: (() => void) | null = null;
+      const signal = init?.signal;
+      streams.push({
+        push(frame) {
+          queue.push(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
+          wake?.();
+        },
+      });
+      const reader = {
+        read: async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+          for (;;) {
+            if (signal?.aborted) return { done: true };
+            const next = queue.shift();
+            if (next) return { done: false, value: next };
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+              signal?.addEventListener('abort', () => resolve(), { once: true });
+            });
+            wake = null;
+          }
+        },
+      };
+      return { ok: true, status: 200, statusText: 'OK', body: { getReader: () => reader } } as unknown as Response;
+    }
+
+    const key = `${method} ${path}`;
+    let reply: Reply;
+    if (routes[key]) reply = await routes[key](body);
+    else if (key === 'GET /api/info') reply = { version: '2.0.22' };
+    else if (key === 'POST /api/session') reply = { data: { id: SES } };
+    else if (key === 'GET /api/session/active') reply = { data: {} };
+    else if (key.endsWith('/message') && method === 'GET') reply = { data: [] };
+    else if (key.endsWith('/prompt')) reply = { data: { id: 'msg_user', type: 'user' } };
+    else if (method === 'PUT') reply = { status: 204 };
+    else reply = {};
+    const shaped = typeof reply === 'object' && reply !== null && 'status' in reply && typeof (reply as { status: unknown }).status === 'number'
+      ? reply as { status: number; body?: unknown }
+      : { status: 200, body: reply };
+    return {
+      ok: shaped.status >= 200 && shaped.status < 300,
+      status: shaped.status,
+      statusText: String(shaped.status),
+      json: async () => {
+        if (shaped.body === undefined) throw new SyntaxError('no body');
+        return shaped.body;
+      },
+    } as unknown as Response;
+  };
+
+  return {
+    fetch: fetchImpl as unknown as typeof fetch,
+    requests,
+    async stream(n = 0): Promise<EventStream> {
+      for (let i = 0; i < 200 && streams.length <= n; i++) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (streams.length <= n) throw new Error(`event stream ${n} never opened`);
+      return streams[n];
+    },
+  };
+}
+
+function taskStart(overrides: Partial<TaskStartOptions> = {}): TaskStartOptions {
+  return {
+    kind: 'task',
+    cwd: '/repo/.ordewell/worktrees/run/1-task',
+    mode: 'build',
+    model: 'opencode-go/deepseek-v4.1-flash',
+    flags: { permissionMode: 'build', modeSettings: { approvals: 'auto' } },
+    ...overrides,
+  };
+}
+
+function plannerStart(overrides: Record<string, unknown> = {}): AgentStartOptions {
+  return { kind: 'planner', cwd: '/repo', systemPrompt: 'PLAN', model: 'opencode-go/deepseek-v4.1-flash', ...overrides } as AgentStartOptions;
+}
+
+async function start(server: ReturnType<typeof fakeServer>, opts: AgentStartOptions = taskStart()) {
+  const spawned = fakeSpawn([]);
+  const envs: NodeJS.ProcessEnv[] = [];
+  const spawn: SpawnFn = (cmd, argv, options) => {
+    envs.push(options.env);
+    return spawned.spawn(cmd, argv, options);
+  };
+  const deps: AgentProcessDeps = {
+    spawn,
+    fetch: server.fetch,
+    resolvePath: async () => '/usr/bin',
+    platform: 'linux',
+    isDirectory: () => true,
+    exists: () => true,
+    workspaceEnv: async () => ({}),
+  };
+  const adapter = new OpenCodeAdapter(deps);
+  const started = adapter.start(opts);
+  for (let i = 0; i < 50 && spawned.processes.length === 0; i++) await Promise.resolve();
+  spawned.processes[0].emitStdout(`server listening on ${BASE}\n`);
+  await started;
+  return { adapter, env: envs[0] };
+}
+
+const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+async function until(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !condition(); i++) await tick();
+  if (!condition()) throw new Error('condition never held');
+}
+
+function basic(password: string): string {
+  return `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`;
+}
+
+const frame = (type: string, data: Record<string, unknown>, sessionID = SES) => ({ type, data: { sessionID, ...data } });
+const started = (sessionID = SES) => frame('session.execution.started', {}, sessionID);
+const succeeded = () => frame('session.execution.succeeded', {});
+const MSG = 'msg_a';
+const call = (id: string, input: Record<string, unknown>, name: string, sessionID = SES, message = MSG) => [
+  frame('session.tool.input.started', { assistantMessageID: message, id, name }, sessionID),
+  frame('session.tool.called', { assistantMessageID: message, id, input, executed: false }, sessionID),
+];
+const permissionAsk = (id: string, sessionID = SES) => ({
+  type: 'permission.asked',
+  data: { id, sessionID, action: 'shell', resources: ['echo hi'], save: ['echo *'], source: { type: 'tool', messageID: MSG, id: 'call_1' } },
+});
+
+describe('OpenCode 2.x — start', () => {
+  it('takes a 2.x server by its /api/info, and secures a planner as it does a task', async () => {
+    const server = fakeServer();
+    const { adapter, env } = await start(server, plannerStart());
+
+    const password = env.OPENCODE_SERVER_PASSWORD;
+    expect(password).toBeTruthy();
+    expect(server.requests.some((r) => r.path === '/session')).toBe(false);
+    for (const request of server.requests) expect(request.authorization).toBe(basic(password!));
+    expect(adapter.nativeSessionId()).toBe(SES);
+    adapter.dispose();
+  });
+
+  it('creates the planner session read-only: plan agent, model, and the question and edit rules', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, plannerStart({ effort: 'high' }));
+
+    const created = server.requests.find((r) => r.method === 'POST' && r.path === '/api/session');
+    expect(created?.body).toEqual({
+      agent: 'plan',
+      model: { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', variant: 'high' },
+      permissions: [
+        { action: 'question', resource: '*', effect: 'deny' },
+        { action: 'edit', resource: '*', effect: 'deny' },
+      ],
+    });
+    const prompt = server.requests.find((r) => r.method === 'PUT');
+    expect(prompt?.path).toBe(`/api/experimental/session/${SES}/instructions/entries/ordewell-planner`);
+    expect(prompt?.body).toEqual({ value: 'PLAN' });
+    adapter.dispose();
+  });
+
+  it('creates a task session in its mode, withholding only the question tool', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart({ flags: { permissionMode: 'build', effort: 'max', modeSettings: {} } }));
+
+    const created = server.requests.find((r) => r.method === 'POST' && r.path === '/api/session');
+    expect(created?.body).toEqual({
+      agent: 'build',
+      model: { providerID: 'opencode-go', id: 'deepseek-v4.1-flash', variant: 'max' },
+      permissions: [{ action: 'question', resource: '*', effect: 'deny' }],
+    });
+    expect(server.requests.some((r) => r.method === 'PUT')).toBe(false);
+    adapter.dispose();
+  });
+
+  it('resumes a session the server knows, and re-applies the plan\'s model and agent', async () => {
+    const server = fakeServer({ [`GET /api/session/${SES}`]: () => ({ data: { id: SES } }) });
+    const { adapter } = await start(server, taskStart({ resumeSessionId: SES }));
+
+    expect(server.requests.some((r) => r.method === 'POST' && r.path === '/api/session')).toBe(false);
+    expect(server.requests.find((r) => r.path === `/api/session/${SES}/model`)?.body).toEqual({ model: { providerID: 'opencode-go', id: 'deepseek-v4.1-flash' } });
+    expect(server.requests.find((r) => r.path === `/api/session/${SES}/agent`)?.body).toEqual({ agent: 'build' });
+    adapter.dispose();
+  });
+
+  it('degrades a stale planner session to a fresh one, and fails a task that cannot resume', async () => {
+    const gone = () => ({ status: 404 });
+    const planner = await start(fakeServer({ [`GET /api/session/${SES}`]: gone }), plannerStart({ resumeSessionId: SES }));
+    expect(planner.adapter.nativeSessionId()).toBe(SES);
+    planner.adapter.dispose();
+
+    await expect(start(fakeServer({ [`GET /api/session/${SES}`]: gone }), taskStart({ resumeSessionId: SES })))
+      .rejects.toThrow(/could not resume session/);
+  });
+});
+
+describe('OpenCode 2.x — a turn', () => {
+  it('queues the prompt and reads the reply, tools, reasoning and usage off the stream', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, plannerStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('the goal', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path === `/api/session/${SES}/prompt`));
+
+    stream.push(started());
+    stream.push(frame('session.step.started', { assistantMessageID: MSG, agent: 'plan', model: { providerID: 'opencode-go', id: 'deepseek-v4.1-flash' } }));
+    stream.push(frame('session.reasoning.delta', { assistantMessageID: MSG, ordinal: 0, delta: 'hmm' }));
+    stream.push(frame('session.reasoning.ended', { assistantMessageID: MSG, ordinal: 0, text: 'hmm' }));
+    for (const f of call('call_1', { path: 'README.md' }, 'read')) stream.push(f);
+    stream.push(frame('session.tool.success', { assistantMessageID: MSG, id: 'call_1', content: [{ type: 'text', text: '1: # dummy' }] }));
+    stream.push(frame('session.step.ended', { assistantMessageID: MSG, cost: 0.001, tokens: { input: 207, output: 17, reasoning: 3, cache: { read: 7040, write: 0 } } }));
+    stream.push(frame('session.text.started', { assistantMessageID: 'msg_b', ordinal: 0 }));
+    stream.push(frame('session.text.delta', { assistantMessageID: 'msg_b', ordinal: 0, delta: 'It is ' }));
+    stream.push(frame('session.text.delta', { assistantMessageID: 'msg_b', ordinal: 0, delta: 'dummy.' }));
+    stream.push(frame('session.text.ended', { assistantMessageID: 'msg_b', ordinal: 0, text: 'It is dummy.' }));
+    stream.push(succeeded());
+    await turn;
+
+    expect(server.requests.find((r) => r.path === `/api/session/${SES}/prompt`)?.body).toEqual({ text: 'the goal' });
+    expect(events.map((e) => e.type)).toEqual([
+      'thinking_delta', 'thinking', 'tool_call', 'tool_result', 'usage',
+      'assistant_text_delta', 'assistant_text_delta', 'assistant_text', 'turn_end',
+    ]);
+    expect(events.find((e) => e.type === 'tool_call')).toMatchObject({ id: 'call_1', name: 'read', args: { path: 'README.md' } });
+    expect(events.find((e) => e.type === 'tool_result')).toMatchObject({ id: 'call_1', name: 'read', output: '1: # dummy', success: true });
+    expect(events.find((e) => e.type === 'usage')).toMatchObject({
+      record: { source: 'opencode', model: 'opencode-go/deepseek-v4.1-flash', outputTokens: 20, reportedCost: { amount: 0.001, currency: 'USD' } },
+    });
+    expect(events.find((e) => e.type === 'assistant_text')).toMatchObject({ text: 'It is dummy.' });
+    adapter.dispose();
+  });
+
+  it('opens a paragraph for text that follows a tool call in the same turn', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    stream.push(frame('session.text.ended', { assistantMessageID: 'msg_a', ordinal: 0, text: 'First.' }));
+    stream.push(frame('session.text.ended', { assistantMessageID: 'msg_b', ordinal: 0, text: 'Second.' }));
+    stream.push(succeeded());
+    await turn;
+
+    expect(events.filter((e) => e.type === 'assistant_text').map((e) => (e as { text: string }).text)).toEqual(['First.', '\n\nSecond.']);
+    adapter.dispose();
+  });
+
+  it('reports a failed execution in OpenCode\'s own words', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    stream.push(frame('session.execution.failed', { error: { type: 'provider.no-route', message: 'Model unavailable: opencode-go/no-such-model' } }));
+    await turn;
+
+    expect(events).toEqual([{ type: 'error', message: 'Model unavailable: opencode-go/no-such-model' }]);
+    adapter.dispose();
+  });
+
+  it('ends the turn from /api/session/active when the end frame never arrives', async () => {
+    const server = fakeServer({
+      [`GET /api/session/${SES}/message`]: () => ({ data: [{ id: 'msg_idle', type: 'idle', outcome: 'succeeded' }] }),
+    });
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    await turn;
+
+    expect(events).toEqual([{ type: 'turn_end' }]);
+    adapter.dispose();
+  });
+
+  it('reads back reply text the stream dropped', async () => {
+    const server = fakeServer({
+      [`GET /api/session/${SES}/message`]: () => ({
+        data: [
+          { id: 'msg_idle', type: 'idle', outcome: 'succeeded' },
+          { id: 'msg_b', type: 'assistant', content: [{ type: 'text', text: 'The reply.' }] },
+          { id: 'msg_user', type: 'user', text: 'go' },
+        ],
+      }),
+    });
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    stream.push(succeeded());
+    await turn;
+
+    expect(events.map((e) => e.type)).toEqual(['assistant_text', 'turn_end']);
+    expect(events[0]).toMatchObject({ text: 'The reply.' });
+    adapter.dispose();
+  });
+});
+
+describe('OpenCode 2.x — permission requests', () => {
+  it('answers a task\'s request at once under auto approvals, and shows it decided', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    stream.push(permissionAsk('per_1'));
+    await until(() => server.requests.some((r) => r.path.endsWith('/permission/per_1/reply')));
+    stream.push(succeeded());
+    await turn;
+
+    expect(server.requests.find((r) => r.path === `/api/session/${SES}/permission/per_1/reply`)?.body).toEqual({ decision: 'once' });
+    expect(events.find((e) => e.type === 'permission_request')).toMatchObject({
+      id: 'per_1', name: 'shell', suggestions: ['echo *'], toolUseId: 'call_1', decided: { decision: 'allow' },
+    });
+    adapter.dispose();
+  });
+
+  it('leaves a request open under any other mode until it is answered', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart({ flags: { permissionMode: 'plan', modeSettings: {} } }));
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    stream.push(permissionAsk('per_1'));
+    await until(() => events.some((e) => e.type === 'permission_request'));
+
+    expect(events.find((e) => e.type === 'permission_request')).not.toHaveProperty('decided');
+    expect(server.requests.some((r) => r.path.endsWith('/permission/per_1/reply'))).toBe(false);
+    expect(adapter.answerPermission('per_1', { decision: 'allowForTask' })).toBe(true);
+    await until(() => server.requests.some((r) => r.path.endsWith('/permission/per_1/reply')));
+    expect(server.requests.find((r) => r.path.endsWith('/permission/per_1/reply'))?.body).toEqual({ decision: 'always' });
+    expect(adapter.answerPermission('per_1', { decision: 'allow' })).toBe(false);
+    stream.push(succeeded());
+    await turn;
+    adapter.dispose();
+  });
+
+  it('carries a refusal\'s note to the agent as a correction', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart({ flags: { permissionMode: 'plan', modeSettings: {} } }));
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    stream.push(permissionAsk('per_1'));
+    await until(() => events.some((e) => e.type === 'permission_request'));
+    expect(adapter.answerPermission('per_1', { decision: 'deny', note: 'not that' })).toBe(true);
+    await until(() => server.requests.some((r) => r.path.endsWith('/permission/per_1/reply')));
+
+    expect(server.requests.find((r) => r.path.endsWith('/permission/per_1/reply'))?.body).toEqual({ decision: 'reject', message: 'not that' });
+    stream.push(succeeded());
+    await turn;
+    adapter.dispose();
+  });
+
+  it('withdraws an open request that OpenCode answered itself', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart({ flags: { permissionMode: 'plan', modeSettings: {} } }));
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    stream.push(permissionAsk('per_1'));
+    await until(() => events.some((e) => e.type === 'permission_request'));
+    stream.push({ type: 'permission.replied', data: { sessionID: SES, requestID: 'per_1', reply: 'reject' } });
+    await until(() => events.some((e) => e.type === 'permission_cancelled'));
+
+    expect(adapter.answerPermission('per_1', { decision: 'allow' })).toBe(false);
+    stream.push(succeeded());
+    await turn;
+    adapter.dispose();
+  });
+
+  it('always refuses a planner\'s request, whatever its start carries, and announces it', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, plannerStart({ mode: 'build', flags: { permissionMode: 'build', modeSettings: { approvals: 'auto' } } }));
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    stream.push(permissionAsk('per_1'));
+    await until(() => server.requests.some((r) => r.path.endsWith('/permission/per_1/reply')));
+    stream.push(succeeded());
+    await turn;
+
+    expect(server.requests.find((r) => r.path.endsWith('/permission/per_1/reply'))?.body).toEqual({ decision: 'reject' });
+    expect(events.find((e) => e.type === 'permission_request')).not.toHaveProperty('decided');
+    expect(adapter.answerPermission('per_1', { decision: 'allow' })).toBe(false);
+    adapter.dispose();
+  });
+});
+
+describe('OpenCode 2.x — interrupt', () => {
+  it('posts the interrupt and ends the turn as interrupted once OpenCode acknowledges', async () => {
+    const server = fakeServer({ [`POST /api/session/${SES}/interrupt`]: () => ({ interrupted: true }) });
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+
+    const interrupted = adapter.interrupt(5000);
+    await until(() => server.requests.some((r) => r.path.endsWith('/interrupt')));
+    stream.push(frame('session.execution.interrupted', { reason: 'user' }));
+
+    expect(await interrupted).toBe(true);
+    await turn;
+    expect(events).toEqual([{ type: 'turn_end', interrupted: true }]);
+    adapter.dispose();
+  });
+});
+
+describe('OpenCode 2.x — subagents', () => {
+  it('ties a child session to the call that spawned it, and keeps its report out of the reply', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, plannerStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+
+    stream.push(started());
+    for (const f of call('call_task', { agent: 'explore', description: 'Read README first line', prompt: 'read it' }, 'subagent')) stream.push(f);
+    stream.push({ type: 'session.created', data: { sessionID: CHILD, parentID: SES } });
+    // The child's work can arrive before the call names it.
+    for (const f of call('call_child', { path: 'README.md' }, 'read', CHILD, 'msg_child')) stream.push(f);
+    stream.push(frame('session.text.ended', { assistantMessageID: 'msg_child', ordinal: 0, text: 'its report' }, CHILD));
+    stream.push(frame('session.tool.progress', { assistantMessageID: MSG, id: 'call_task', metadata: { sessionID: CHILD, status: 'running' } }));
+    stream.push(frame('session.tool.success', { assistantMessageID: 'msg_child', id: 'call_child', content: [{ type: 'text', text: '1: # dummy' }] }, CHILD));
+    stream.push(frame('session.execution.succeeded', {}, CHILD));
+    stream.push(frame('session.tool.success', {
+      assistantMessageID: MSG, id: 'call_task',
+      content: [{ type: 'text', text: `<subagent sessionID="${CHILD}" state="completed">\nThe first line is # dummy\n</subagent>` }],
+    }));
+    stream.push(succeeded());
+    await turn;
+
+    expect(events.map((e) => e.type)).toEqual([
+      'tool_call', 'subagent_started', 'tool_call', 'tool_result', 'tool_result', 'subagent_finished', 'turn_end',
+    ]);
+    expect(events.find((e) => e.type === 'subagent_started')).toMatchObject({ subagentId: 'call_task', brief: 'Read README first line' });
+    expect(events.filter((e) => e.type === 'tool_call')[1]).toMatchObject({ id: 'call_child', subagentId: 'call_task' });
+    expect(events.find((e) => e.type === 'subagent_finished')).toMatchObject({ subagentId: 'call_task', outcome: 'done', digest: 'The first line is # dummy' });
+    expect(events.some((e) => e.type === 'assistant_text')).toBe(false);
+    adapter.dispose();
+  });
+
+  it('ignores another client\'s session on the shared stream', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    stream.push(frame('session.text.ended', { assistantMessageID: 'msg_x', ordinal: 0, text: 'someone else' }, 'ses_other'));
+    stream.push(frame('session.execution.succeeded', {}, 'ses_other'));
+    stream.push(succeeded());
+    await turn;
+
+    expect(events).toEqual([{ type: 'turn_end' }]);
+    adapter.dispose();
+  });
+});
