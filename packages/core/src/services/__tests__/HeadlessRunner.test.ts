@@ -24,7 +24,7 @@ function fakeRegistry(m: RunnerPluginManifest): RunnerRegistry {
 class FakeChildProcess extends EventEmitter {
   stdout = new EventEmitter();
   stderr = new EventEmitter();
-  stdin = { write: vi.fn() };
+  stdin = { write: vi.fn(), end: vi.fn() };
   killed = false;
   kill = vi.fn((_signal?: string) => { this.killed = true; this.emit('close', 0); return true; });
 }
@@ -52,6 +52,31 @@ const baseOpts = (m: RunnerPluginManifest) => ({
   prompt: 'do the thing',
   cwd: '/workspace',
   registry: fakeRegistry(m),
+});
+
+describe('HeadlessRunner — stdin', () => {
+  const spawnWith = async (m: RunnerPluginManifest, hasScript = false) => {
+    const child = new FakeChildProcess();
+    const end = child.stdin.end;
+    const spawnImpl = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const runner = new HeadlessRunner({ spawnImpl, hasScriptCmd: () => hasScript, resolvePath: async () => '', launchDeps: { platform: 'linux' } });
+    await runner.spawn(baseOpts(m));
+    return end;
+  };
+
+  it('closes stdin on a plain pipe run whose prompt is in its arguments, so a CLI reading stdin to EOF starts', async () => {
+    expect(await spawnWith(manifest())).toHaveBeenCalled();
+  });
+
+  it('keeps stdin open under a PTY, where it is the terminal', async () => {
+    const m = manifest({ runner: { command: 'test-cli', argsTemplate: ['{{prompt}}'], promptInArgs: true, requiresTty: true } });
+    expect(await spawnWith(m, true)).not.toHaveBeenCalled();
+  });
+
+  it('keeps stdin open when the prompt is not in the arguments', async () => {
+    const m = manifest({ runner: { command: 'test-cli', argsTemplate: [], promptInArgs: false } });
+    expect(await spawnWith(m)).not.toHaveBeenCalled();
+  });
 });
 
 describe('HeadlessRunner — versioned command lines', () => {

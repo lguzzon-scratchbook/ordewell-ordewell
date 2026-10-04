@@ -31,6 +31,10 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   Ordewell called `script` the util-linux way, which macOS's `script` rejects
   (`illegal option -- f`), so OpenCode tasks failed at once without tmux.
   macOS and the BSDs now get their own `script` invocation.
+- **Codex tasks on the terminal transport no longer hang without tmux.**
+  `codex exec` reads a piped stdin to its end before it starts, and Ordewell
+  kept the task's stdin open, so the task never finished. A run with no
+  terminal and its prompt in its arguments now has its stdin closed.
 
 ## [0.6.2] — 2026-10-04
 

@@ -113,6 +113,11 @@ export class HeadlessSession extends AbstractTerminalSession {
     }
   }
 
+  /** Closes the runner's stdin: what it has read so far is all it will get. */
+  endInput(): void {
+    this.process?.stdin?.end();
+  }
+
   /** PTY resize requests from a surface that owns the terminal rendering the wrapper. */
   writeControl(text: string): void {
     if (this.controlStream && !this.controlStream.destroyed) {
@@ -132,6 +137,12 @@ export interface PreparedLaunch {
   pty: boolean;
   /** True when the started process needs an explicit Enter sent to submit its pre-filled prompt. */
   submitPromptKey: boolean;
+  /**
+   * True when nothing can be typed into the run: no TTY, no interactive shape,
+   * and the prompt already in its arguments. Its stdin is then closed, because
+   * a CLI such as `codex exec` reads a piped stdin to its end before starting.
+   */
+  closeStdin: boolean;
 }
 
 export class HeadlessRunner extends AbstractRunner<HeadlessSession> {
@@ -215,6 +226,7 @@ export class HeadlessRunner extends AbstractRunner<HeadlessSession> {
       env: { ...opts.env, ...invocation.env },
       pty,
       submitPromptKey: invocation.submitPromptKey,
+      closeStdin: !pty && !interactive && invocation.promptInArgs,
     };
   }
 
@@ -228,6 +240,7 @@ export class HeadlessRunner extends AbstractRunner<HeadlessSession> {
 
     session.start(prepared.launch, opts.cwd, prepared.resolvedPath, prepared.env);
     if (prepared.submitPromptKey) session.write('\r');
+    if (prepared.closeStdin) session.endInput();
     this.registerSession(id, session);
     return session;
   }
