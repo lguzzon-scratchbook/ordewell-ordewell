@@ -639,6 +639,9 @@ const WRAPPER_FAMILY: Record<string, WrapperSpec> = {
   // name arrives as its first argument.
   busybox: { booleanFlags: ['--list', '--install', ...HELP_FLAGS] },
   command: { booleanFlags: ['-p'], noExecFlags: ['-v', '-V'] },
+  // Runs the named shell builtin, so `builtin eval …` is an `eval`. Classified
+  // on its own name it only asked, and a grant for `builtin echo` covered it.
+  builtin: {},
 };
 
 /**
@@ -1832,6 +1835,12 @@ function refusalFor(seg: Segment): string | undefined {
   // covers every other script sourced in the session.
   if (seg.binary === 'source' || seg.binary === '.') {
     return `"${seg.binary}" runs a file's contents as commands, which this classifier cannot inspect. Use the read-only research tools, or describe it as a task.`;
+  }
+  // `enable -f lib.so name` loads a shared object into the shell, which runs
+  // its code on load — a program from the repository, as `source` would run a
+  // script. Plain `enable` only lists or toggles builtins.
+  if (seg.binary === 'enable' && seg.args.some((a) => /^-[a-zA-Z]*f/.test(a))) {
+    return `"enable -f" loads a shared library into the shell, which runs its code. Use the read-only research tools, or describe it as a task.`;
   }
   // A shell keyword or compound-command opener (`{`, `if`, `time`, `for`, ...)
   // becomes `seg.binary` the same way an ordinary program name would, which

@@ -119,7 +119,7 @@ read is refused, and an argument it cannot see into prompts.
 
 The refusal tier rests on one premise: a destructive verb never reaches `ask`,
 because `ask` is remembered at `scope` granularity and one approval would
-cover every later use. Wrappers (`env`, `nice`, `timeout`, …) are unwrapped for
+cover every later use. Wrappers (`env`, `nice`, `timeout`, `command`, `builtin`, …) are unwrapped for
 that reason, and so are commands that *run* another command and the filters
 that carry a program. Before they were, the premise had four holes, each
 classified as `ask` with a binary-wide scope:
@@ -133,6 +133,8 @@ classified as `ask` with a binary-wide scope:
   `print > file`.
 - `sed '1e rm x'`, `sed 's/x/y/e'`, and the `w`/`W` commands and `w` flag that
   write a file.
+- `enable -f lib.so name`, which loads a shared object into the shell and runs
+  its code, as `source` runs a script. Refused; plain `enable` still asks.
 
 How they are read, under the file's rule: when unsure, refuse.
 
@@ -275,3 +277,4 @@ resolves rather than as written.
 - 2026-10-01 — `cd` followed through `&&` chains where the shell's directory is certain.
 - 2026-10-04 — `cd` following decided by the lexer; a line that can steer `cd` keeps it asking.
 - 2026-10-04 — a `cd` or shell-moving builtin that asks is granted for its exact line.
+- 2026-10-04 — `builtin` unwrapped; `enable -f` refused.

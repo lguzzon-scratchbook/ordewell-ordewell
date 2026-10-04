@@ -16,6 +16,11 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   judged from the workspace root. Once `cd "$HOME"` was approved,
   `cd "$HOME" && cat .ssh/id_rsa` ran without a prompt. Such a command is now
   approved for that exact line only.
+- **`builtin eval`, `builtin source` and `enable -f` are refused** during
+  planner research, like `eval` and `source`. `builtin` hid the command it
+  ran, so these only asked for approval, and one approved `builtin echo`
+  covered them for the session. `enable -f` loads a library file into the
+  shell and runs its code.
 
 ## [0.6.3] — 2026-10-04
 

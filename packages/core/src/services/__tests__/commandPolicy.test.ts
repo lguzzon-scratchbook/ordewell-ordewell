@@ -381,6 +381,35 @@ describe('shell keywords and compound-command openers are refused, not silently 
   it.each(['source ./script.sh', '. ./script.sh'])('%s is refused', (cmd) => {
     expect(classifyCommand(cmd).tier).toBe('refuse');
   });
+
+  // `enable -f` loads a shared object into the shell, which runs its code the
+  // way `source` runs a script — a repository's `.so` would run on approval.
+  it.each(['enable -f ./x.so foo', 'enable -af ./x.so foo', 'enable -n -f ./x.so foo', 'command enable -f ./x.so foo'])(
+    '%s is refused', (cmd) => {
+      expect(classifyCommand(cmd).tier).toBe('refuse');
+    },
+  );
+
+  it.each(['enable', 'enable -n echo'])('%s, which loads nothing, still only asks', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('ask');
+  });
+});
+
+// `builtin` was classified on its own name, so `builtin eval …` only asked, and
+// one approved `builtin echo` covered it for the session.
+describe('builtin is classified by the builtin it runs', () => {
+  it.each([
+    'builtin eval "rm -rf x"',
+    'builtin source ./script.sh',
+    'builtin exec rm x',
+    'builtin enable -f ./x.so foo',
+  ])('%s is refused', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it('runs builtin echo with no prompt, as echo', () => {
+    expect(classifyCommand('builtin echo hi').tier).toBe('auto');
+  });
 });
 
 // A segment used to be classified by the name at the front of it, so a wrapper
