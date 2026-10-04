@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-10-04
+
+### Fixed
+
+- **A `cd` into a repo inside the workspace no longer prompts** during planner
+  research, including a chain of them joined by `&&`.
+- **Planner search works on a Mac without ripgrep.** The `grep` fallback no
+  longer fails on macOS's `grep`, which has no `-P`.
+- **OpenCode 2.x works as a planner and a structured-transport runner.** It
+  replaced its server API, which made planning with it fail at once. The
+  terminal transport is not covered yet.
+
 ## [0.6.1] — 2026-10-02
 
 ### Added
