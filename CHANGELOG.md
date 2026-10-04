@@ -8,6 +8,30 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Security
+
+- **Planner research no longer reads outside the workspace through a `cd`
+  chain.** 0.6.2 followed `cd … &&` chains so research inside the workspace ran
+  without a prompt, but a segment that ran no command — `X=1`, a redirect
+  alone — hid the `||` or `|` that made the `cd` uncertain, and a `CDPATH` set
+  on the same line could send a bare-name `cd` outside. Commands such as
+  `cd nonexist || X=1 && cat ../secret` then read outside the workspace with
+  no prompt. Following is now decided as each operator is read, and on a line
+  that can steer a `cd` it asks again.
+
+### Fixed
+
+- **OpenCode 2.x runs on the terminal transport.** Its interactive command
+  takes no `--model` or `--agent`, and its `run` has no `--variant`, so tasks
+  either exited at once or ran on the wrong model. Ordewell reads the installed
+  version and gives 2.x its own command lines: the TUI gets its agent and model
+  through its config, `run` gets the variant on the model id, and both run on
+  their own server in the task's directory. 1.x installs are unchanged.
+- **The terminal transport runs TTY-needing runners on macOS without tmux.**
+  Ordewell called `script` the util-linux way, which macOS's `script` rejects
+  (`illegal option -- f`), so OpenCode tasks failed at once without tmux.
+  macOS and the BSDs now get their own `script` invocation.
+
 ## [0.6.2] — 2026-10-04
 
 ### Fixed

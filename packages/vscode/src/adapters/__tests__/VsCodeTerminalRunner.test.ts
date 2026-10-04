@@ -44,6 +44,8 @@ function makeRunner(opts: { hasScript?: boolean; manifestOverrides?: Partial<Run
     spawnImpl: spawnImpl as never,
     hasScriptCmd: () => opts.hasScript ?? false,
     resolvePath: async () => '/augmented/bin',
+    // The util-linux `script` these expectations spell; macOS gets its own form (see wrapWithPty).
+    launchDeps: { platform: 'linux' },
   });
   const spawnOpts = {
     taskId: 'task-1234-abcd',

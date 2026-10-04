@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { buildRunnerInvocation } from '../buildRunnerArgs';
+import { majorVersion } from '../../plugins/resolveArgs';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 
 const registry = new RunnerRegistry();
@@ -199,5 +200,54 @@ describe('buildRunnerInvocation — opencode', () => {
     const inv = buildRunnerInvocation({ runner: 'opencode', prompt: 'P', registry });
     expect(inv.args).toContain('build');
     expect(inv.args).not.toContain('plan');
+  });
+});
+
+/**
+ * OpenCode 2.x, recorded at v2.0.22: its TUI takes no `--model`/`--agent`, its
+ * `run` has no `--variant`, and both attach to a background service unless
+ * `--standalone`. Checked against the binary, not memory.
+ */
+describe('buildRunnerInvocation — opencode 2.x', () => {
+  const v2 = { runner: 'opencode', runnerVersion: 'opencode v2.0.22', registry } as const;
+
+  it('reads the major from the version line, however the CLI prints it', () => {
+    expect(majorVersion('opencode v2.0.22')).toBe(2);
+    expect(majorVersion('1.18.34')).toBe(1);
+    expect(majorVersion(undefined)).toBeUndefined();
+    expect(majorVersion('dev build')).toBeUndefined();
+  });
+
+  it('runs headless with the agent, the variant on the model, its own server and auto approvals', () => {
+    const inv = buildRunnerInvocation({ ...v2, prompt: 'P', mode: 'build', modelId: 'opencode-go/m', thinkingEffort: 'high', headless: true, interactive: false });
+    expect(inv.args).toEqual(['run', '--agent', 'build', '--model', 'opencode-go/m#high', '--standalone', '--auto', 'P']);
+    expect(inv.env).toEqual({});
+  });
+
+  it('keeps a plan task headless without auto approvals or a variant it was not given', () => {
+    const inv = buildRunnerInvocation({ ...v2, prompt: 'P', mode: 'plan', modelId: 'opencode-go/m', headless: true, interactive: false });
+    expect(inv.args).toEqual(['run', '--agent', 'plan', '--model', 'opencode-go/m', '--standalone', 'P']);
+  });
+
+  it('opens the TUI with the agent and model on the config, since its flags take neither', () => {
+    const inv = buildRunnerInvocation({ ...v2, prompt: 'P', mode: 'plan', modelId: 'opencode-go/m', headless: true, interactive: true });
+    expect(inv.args).toEqual(['--standalone', '--prompt', 'P']);
+    expect(JSON.parse(inv.env.OPENCODE_CONFIG_CONTENT)).toEqual({ default_agent: 'plan', agent: { plan: { model: 'opencode-go/m' } } });
+    expect(inv.submitPromptKey).toBe(true);
+  });
+
+  it('pins the TUI\'s variant and disables the others, as on 1.x', () => {
+    const inv = buildRunnerInvocation({ ...v2, prompt: 'P', mode: 'build', modelId: 'opencode-go/m', thinkingEffort: 'high', modelVariants: ['low', 'high'], headless: true, interactive: true });
+    expect(inv.args).toEqual(['--standalone', '--auto', '--prompt', 'P']);
+    expect(JSON.parse(inv.env.OPENCODE_CONFIG_CONTENT)).toEqual({
+      default_agent: 'build',
+      agent: { build: { model: 'opencode-go/m', variant: 'high' } },
+      provider: { 'opencode-go': { models: { m: { variants: { low: { disabled: true } } } } } },
+    });
+  });
+
+  it('keeps the 1.x command line when the version cannot be read', () => {
+    const inv = buildRunnerInvocation({ runner: 'opencode', prompt: 'P', mode: 'build', modelId: 'p/m', thinkingEffort: 'high', headless: true, interactive: false, registry });
+    expect(inv.args).toEqual(['run', '--model', 'p/m', '--agent', 'build', '--variant', 'high', '--auto', 'P']);
   });
 });

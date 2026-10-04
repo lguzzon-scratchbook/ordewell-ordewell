@@ -1,4 +1,4 @@
-import type { RunnerPluginManifest, ResolveContext, RunnerInvocation } from './types';
+import type { RunnerPluginManifest, ResolveContext, RunnerInvocation, VersionedInvocation } from './types';
 import type { TaskRunnerFlags } from '../services/harness/AgentAdapter';
 
 export class ResolveError extends Error {
@@ -20,6 +20,7 @@ enum Block {
   IfHeadlessSession,
   IfInteractiveVariant,
   IfProjectTrust,
+  IfHeadlessModel,
 }
 
 /**
@@ -32,12 +33,29 @@ function isInteractive(ctx: ResolveContext): boolean {
   return ctx.interactive ?? !ctx.headless;
 }
 
+/** The leading major number of a `--version` line, wherever the CLI puts it (`opencode v2.0.22`, `2.1.0`). */
+export function majorVersion(version: string | undefined): number | undefined {
+  const match = version?.match(/(\d+)\.\d+/);
+  return match ? Number(match[1]) : undefined;
+}
+
+function versionedInvocation(manifest: RunnerPluginManifest, ctx: ResolveContext): VersionedInvocation | undefined {
+  const major = majorVersion(ctx.runnerVersion);
+  if (major === undefined) return undefined;
+  return (manifest.runner.versioned ?? [])
+    .filter((v) => major >= v.minMajor)
+    .sort((a, b) => b.minMajor - a.minMajor)[0];
+}
+
 export function resolveArgs(manifest: RunnerPluginManifest, ctx: ResolveContext): RunnerInvocation {
   const args: string[] = [];
   const env: Record<string, string> = {};
+  const versioned = versionedInvocation(manifest, ctx);
+  const argsTemplate = versioned?.argsTemplate ?? manifest.runner.argsTemplate;
+  const envTemplate = versioned ? versioned.env : manifest.runner.env;
 
-  if (manifest.runner.env) {
-    for (const [key, value] of Object.entries(manifest.runner.env)) {
+  if (envTemplate) {
+    for (const [key, value] of Object.entries(envTemplate)) {
       const resolved = substituteSimple(value, ctx);
       // An env value that resolves to nothing (e.g. its {{if …}} condition is
       // false) is omitted entirely rather than exported as an empty string.
@@ -48,8 +66,8 @@ export function resolveArgs(manifest: RunnerPluginManifest, ctx: ResolveContext)
   let block = Block.None;
   let include = true;
 
-  for (let i = 0; i < manifest.runner.argsTemplate.length; i++) {
-    const raw = manifest.runner.argsTemplate[i];
+  for (let i = 0; i < argsTemplate.length; i++) {
+    const raw = argsTemplate[i];
 
     const blockOpen = parseBlockOpen(raw);
     if (blockOpen !== null) {
@@ -106,6 +124,7 @@ function parseBlockOpen(raw: string): Block | null {
     case '{{if headlessSession}}': return Block.IfHeadlessSession;
     case '{{if interactiveVariant}}': return Block.IfInteractiveVariant;
     case '{{if projectTrust}}': return Block.IfProjectTrust;
+    case '{{if headlessModel}}': return Block.IfHeadlessModel;
     default: return null;
   }
 }
@@ -136,6 +155,8 @@ function shouldIncludeBlock(block: Block, ctx: ResolveContext): boolean {
     // condition, not the token, is what keeps a bare `-c` out of the args when
     // there is no cwd to name.
     case Block.IfProjectTrust: return isInteractive(ctx) && !!ctx.cwd;
+    // A model flag that only the non-interactive subcommand takes.
+    case Block.IfHeadlessModel: return !!ctx.model && !isInteractive(ctx);
     default: return true;
   }
 }
@@ -208,6 +229,11 @@ function resolveToken(token: string, manifest: RunnerPluginManifest, ctx: Resolv
   if (token === '{{model}}') return ctx.model || '';
   if (token === '{{thinkingEffort}}') return ctx.thinkingEffort || '';
   if (token === '{{mode}}') return ctx.mode || 'build';
+  // OpenCode 2.x's `run` takes the variant on the model id; it has no `--variant`.
+  if (token === '{{modelWithVariant}}') {
+    if (!ctx.model) return '';
+    return ctx.thinkingEffort ? `${ctx.model}#${ctx.thinkingEffort}` : ctx.model;
+  }
 
   /**
    * Codex's TUI opens with a blocking "do you trust this directory?" menu the
@@ -328,6 +354,23 @@ function resolveOpencodeVariantConfig(ctx: ResolveContext): string {
   return JSON.stringify(config);
 }
 
+/**
+ * The OPENCODE_CONFIG_CONTENT payload for an OpenCode 2.x TUI session. Its
+ * interactive command takes no `--model` or `--agent`, so the session's agent
+ * and model ride on the config: the agent as the default, the model scoped to
+ * that agent, with the variant pinned the way {@link resolveOpencodeVariantConfig}
+ * pins it. Read only by a `--standalone` server — the background service the
+ * TUI otherwise attaches to was started with its own environment.
+ */
+function resolveOpencodeSessionConfig(ctx: ResolveContext): string {
+  const mode = ctx.mode || 'build';
+  const pinned = resolveOpencodeVariantConfig(ctx);
+  const config: Record<string, unknown> = pinned ? JSON.parse(pinned) as Record<string, unknown> : {};
+  config.default_agent = mode;
+  if (ctx.model && !pinned) config.agent = { [mode]: { model: ctx.model } };
+  return JSON.stringify(config);
+}
+
 function substituteSimple(value: string, ctx: ResolveContext): string {
   // Env values support the same (non-nested) {{if X}}…{{/if}} conditions as
   // the args template: the wrapped text is kept or dropped as a whole.
@@ -338,6 +381,7 @@ function substituteSimple(value: string, ctx: ResolveContext): string {
   });
   return conditioned
     .replace(/\{\{opencodeVariantConfig\}\}/g, () => resolveOpencodeVariantConfig(ctx))
+    .replace(/\{\{opencodeSessionConfig\}\}/g, () => resolveOpencodeSessionConfig(ctx))
     .replace(/\{\{prompt\}\}/g, ctx.prompt)
     .replace(/\{\{model\}\}/g, ctx.model || '')
     .replace(/\{\{thinkingEffort\}\}/g, ctx.thinkingEffort || '')

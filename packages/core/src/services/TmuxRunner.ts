@@ -1,4 +1,5 @@
 import { execFile } from 'child_process';
+import { probeRunnerVersion, type RunnerVersionProbe } from './runnerVersion';
 import { promisify } from 'util';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -34,6 +35,8 @@ export interface TmuxRunnerDeps {
   pollIntervalMs?: number;
   logDir?: string;
   clipboardCommand?: () => string | null;
+  /** Reads the runner's version, for a manifest whose command line differs by major version. */
+  runnerVersion?: RunnerVersionProbe;
 }
 
 class TmuxSession extends AbstractTerminalSession {
@@ -206,6 +209,7 @@ export class TmuxRunner extends AbstractRunner<TmuxSession> {
   private pollIntervalMs: number;
   private logDir: string;
   private clipboardCommand: () => string | null;
+  private runnerVersion: RunnerVersionProbe;
   /** Retries get a freshly named window so a failed attempt's output stays inspectable. */
   private attempts = new Map<string, number>();
   private ready: Promise<void> | null = null;
@@ -219,6 +223,7 @@ export class TmuxRunner extends AbstractRunner<TmuxSession> {
     this.pollIntervalMs = deps.pollIntervalMs ?? 500;
     this.logDir = deps.logDir ?? tmpdir();
     this.clipboardCommand = deps.clipboardCommand ?? (() => clipboardCopyCommand());
+    this.runnerVersion = deps.runnerVersion ?? probeRunnerVersion;
   }
 
   /**
@@ -328,6 +333,10 @@ export class TmuxRunner extends AbstractRunner<TmuxSession> {
     planSessionId?: string;
     env?: Record<string, string>;
   }): Promise<ITerminalSession> {
+    const manifest = opts.registry?.get(opts.runner)?.manifest;
+    const runnerVersion = manifest?.runner.versioned?.length
+      ? await this.runnerVersion(manifest.runner.command, await this.resolvePath())
+      : undefined;
     const invocation = buildRunnerInvocation({
       runner: opts.runner,
       prompt: opts.prompt,
@@ -343,6 +352,7 @@ export class TmuxRunner extends AbstractRunner<TmuxSession> {
       headless: opts.headless ?? true,
       interactive: true,
       cwd: opts.cwd,
+      runnerVersion,
       registry: opts.registry!,
     });
 

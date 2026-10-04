@@ -32,6 +32,26 @@ export const OPENCODE_MANIFEST: RunnerPluginManifest = {
     env: {
       OPENCODE_CONFIG_CONTENT: '{{if interactiveVariant}}{{opencodeVariantConfig}}{{/if}}',
     },
+    // OpenCode 2.x changed both shapes. Its TUI takes no `--model`/`--agent`,
+    // so they ride on OPENCODE_CONFIG_CONTENT instead, and its `run` has no
+    // `--variant` — the variant is a `#suffix` on the model id. Both run
+    // `--standalone`: without it the TUI and `run` attach to the user's
+    // background service, which neither reads this process's config nor
+    // starts in the task's directory and environment.
+    versioned: [{
+      minMajor: 2,
+      argsTemplate: [
+        '{{if headlessSession}}', 'run', '--agent', '{{mode}}', '{{/if}}',
+        '{{if headlessModel}}', '--model', '{{modelWithVariant}}', '{{/if}}',
+        '--standalone',
+        '{{if buildMode}}', '--auto', '{{/if}}',
+        '{{if interactive}}', '--prompt', '{{/if}}',
+        '{{prompt}}',
+      ],
+      env: {
+        OPENCODE_CONFIG_CONTENT: '{{if interactive}}{{opencodeSessionConfig}}{{/if}}',
+      },
+    }],
     promptInArgs: true,
     requiresTty: true,
     // `--prompt` only pre-fills the TUI's composer; it does not submit it.

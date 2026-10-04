@@ -46,7 +46,26 @@ export interface PtySize {
 export interface PtyWrapOptions {
   size?: PtySize;
   controlChannel?: boolean;
+  /** Decides which `script` is on the host; defaults to this process's platform. */
+  platform?: NodeJS.Platform;
 }
+
+/** The BSDs and macOS ship BSD `script`, which takes the command after the file and has no `-c` or `-f`. */
+const BSD_SCRIPT_PLATFORMS: ReadonlySet<NodeJS.Platform> = new Set(['darwin', 'freebsd', 'openbsd', 'netbsd']);
+
+/**
+ * BSD `script` reads its stdin's terminal attributes and gives up on anything
+ * but a terminal or a pipe — and the stdin Node hands a child is a socket. So
+ * its stdin is fed through `cat`, which the shell pipes to it, and `cat` is
+ * stopped once `script` exits, or the shell would wait on it until the caller
+ * closes stdin. `cat` reads the saved fd 5 because a background command's
+ * stdin is `/dev/null`. The line to run arrives as `$0`; `-F` is util-linux's
+ * `-f`, and BSD's exit status is always the child's.
+ */
+const BSD_SCRIPT_FEED =
+  'exec 5<&0; p=$(mktemp) || exit 1; ' +
+  '{ cat <&5 & echo $! >"$p"; wait; } 2>/dev/null | ' +
+  '{ script -q -e -F /dev/null /bin/sh -c "$0"; s=$?; kill "$(cat "$p")" 2>/dev/null; rm -f "$p"; exit $s; }';
 
 /**
  * Wrap a command in `script` to allocate the PTY some runners require when
@@ -73,5 +92,9 @@ export function wrapWithPty(command: string, args: string[], opts: PtyWrapOption
     ? 'exec 4<&0; ( while read -r C R <&3; do stty cols "$C" rows "$R" <&4; done ) & '
     : '';
   const setup = opts.size ? `stty cols ${opts.size.cols} rows ${opts.size.rows}; ` : '';
-  return { command: 'script', args: ['-q', '-e', '-f', '-c', `${watcher}${setup}${inner}`, '/dev/null'] };
+  const line = `${watcher}${setup}${inner}`;
+  if (BSD_SCRIPT_PLATFORMS.has(opts.platform ?? process.platform)) {
+    return { command: '/bin/sh', args: ['-c', BSD_SCRIPT_FEED, line] };
+  }
+  return { command: 'script', args: ['-q', '-e', '-f', '-c', line, '/dev/null'] };
 }

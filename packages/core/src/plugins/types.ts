@@ -36,6 +36,19 @@ export interface PluginRunnerDef {
    * answers one; seeing it, the task's user is told where to.
    */
   blockingPrompts?: BlockingPrompt[];
+  /**
+   * The command lines a later major version of the runner takes instead of
+   * `argsTemplate`/`env`, for a runner whose CLI changed shape between majors.
+   * The one with the highest `minMajor` the installed version reaches wins; an
+   * install whose version cannot be read keeps the base template.
+   */
+  versioned?: VersionedInvocation[];
+}
+
+export interface VersionedInvocation {
+  minMajor: number;
+  argsTemplate: string[];
+  env?: Record<string, string>;
 }
 
 export interface BlockingPrompt {
@@ -174,6 +187,8 @@ export interface ResolveContext {
   interactive?: boolean;
   /** The task's working directory — needed by runners whose autonomy flags name a path. */
   cwd?: string;
+  /** The installed runner's `--version`, read only for a manifest with `versioned` invocations. */
+  runnerVersion?: string;
 }
 
 export interface RunnerInvocation {

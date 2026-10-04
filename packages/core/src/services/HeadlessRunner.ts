@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn, execSync, ChildProcess } from 'child_process';
+import { probeRunnerVersion, type RunnerVersionProbe } from './runnerVersion';
 import type { Writable } from 'stream';
 import { ITerminalSession } from '../interfaces/ITerminalRunner';
 import { buildRunnerInvocation } from './buildRunnerArgs';
@@ -30,6 +31,8 @@ export interface HeadlessRunnerDeps {
    * Windows branch consults them, so a POSIX test never needs to pass anything.
    */
   launchDeps?: LaunchDeps;
+  /** Reads the runner's version, for a manifest whose command line differs by major version. */
+  runnerVersion?: RunnerVersionProbe;
 }
 
 /**
@@ -136,6 +139,7 @@ export class HeadlessRunner extends AbstractRunner<HeadlessSession> {
   private hasScriptCmd: () => boolean;
   private resolvePath: () => Promise<string>;
   private launchDeps: LaunchDeps;
+  private runnerVersion: RunnerVersionProbe;
   private spawnCount = 0;
 
   /**
@@ -153,6 +157,7 @@ export class HeadlessRunner extends AbstractRunner<HeadlessSession> {
     this.hasScriptCmd = deps.hasScriptCmd ?? defaultHasScriptCmd;
     this.resolvePath = deps.resolvePath ?? augmentedPath;
     this.launchDeps = { resolvePath: this.resolvePath, ...deps.launchDeps };
+    this.runnerVersion = deps.runnerVersion ?? probeRunnerVersion;
   }
 
   /**
@@ -173,6 +178,13 @@ export class HeadlessRunner extends AbstractRunner<HeadlessSession> {
   /** Everything up to, but not including, spawning — so a surface that owns its own child reaches the same decisions. */
   protected async prepareLaunch(opts: RunnerSpawnOptions, ptyOptions?: PtyWrapOptions): Promise<PreparedLaunch> {
     const interactive = this.defaultInteractive;
+    // Same PATH treatment as model discovery: the runner binary must resolve
+    // wherever the user installed it, even under a GUI-minimal PATH.
+    const resolvedPath = await this.resolvePath();
+    const manifest = opts.registry?.get(opts.runner)?.manifest;
+    const runnerVersion = manifest?.runner.versioned?.length
+      ? await this.runnerVersion(manifest.runner.command, resolvedPath)
+      : undefined;
 
     const invocation = buildRunnerInvocation({
       runner: opts.runner,
@@ -184,21 +196,17 @@ export class HeadlessRunner extends AbstractRunner<HeadlessSession> {
       headless: opts.headless ?? true,
       interactive,
       cwd: opts.cwd,
+      runnerVersion,
       registry: opts.registry!,
     });
 
     // Manifest `requiresTty` means "needs one even when piped"; an interactive
     // session is the agent's TUI, so it needs one without declaring it. Both
     // gated on `script`, which does not exist on Windows.
-    const manifest = opts.registry?.get(opts.runner)?.manifest;
     const pty = (manifest?.runner.requiresTty === true || interactive) && this.hasScriptCmd();
 
-    // Same PATH treatment as model discovery: the runner binary must resolve
-    // wherever the user installed it, even under a GUI-minimal PATH.
-    const resolvedPath = await this.resolvePath();
-
     const { command, args } = pty
-      ? wrapWithPty(invocation.command, invocation.args, ptyOptions)
+      ? wrapWithPty(invocation.command, invocation.args, { platform: this.launchDeps.platform, ...ptyOptions })
       : { command: invocation.command, args: invocation.args };
 
     return {

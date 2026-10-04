@@ -54,6 +54,48 @@ const baseOpts = (m: RunnerPluginManifest) => ({
   registry: fakeRegistry(m),
 });
 
+describe('HeadlessRunner — versioned command lines', () => {
+  const versioned = (): RunnerPluginManifest => manifest({
+    runner: {
+      command: 'test-cli', argsTemplate: ['old', '{{prompt}}'], promptInArgs: true,
+      versioned: [{ minMajor: 2, argsTemplate: ['new', '{{prompt}}'] }],
+    },
+  });
+
+  it('asks the installed runner its version on the resolved PATH, and launches the shape it takes', async () => {
+    const child = new FakeChildProcess();
+    const spawnImpl = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const runnerVersion = vi.fn().mockResolvedValue('test-cli v2.3.0');
+    const runner = new HeadlessRunner({ spawnImpl, hasScriptCmd: () => false, resolvePath: async () => '/augmented/bin', runnerVersion });
+
+    await runner.spawn(baseOpts(versioned()));
+
+    expect(runnerVersion).toHaveBeenCalledWith('test-cli', '/augmented/bin');
+    expect((spawnImpl as ReturnType<typeof vi.fn>).mock.calls[0][1]).toEqual(['new', 'do the thing']);
+  });
+
+  it('keeps the base shape when the version cannot be read', async () => {
+    const child = new FakeChildProcess();
+    const spawnImpl = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const runner = new HeadlessRunner({ spawnImpl, hasScriptCmd: () => false, resolvePath: async () => '', runnerVersion: async () => undefined });
+
+    await runner.spawn(baseOpts(versioned()));
+
+    expect((spawnImpl as ReturnType<typeof vi.fn>).mock.calls[0][1]).toEqual(['old', 'do the thing']);
+  });
+
+  it('never asks a runner whose manifest has one shape', async () => {
+    const child = new FakeChildProcess();
+    const spawnImpl = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const runnerVersion = vi.fn();
+    const runner = new HeadlessRunner({ spawnImpl, hasScriptCmd: () => false, resolvePath: async () => '', runnerVersion });
+
+    await runner.spawn(baseOpts(manifest()));
+
+    expect(runnerVersion).not.toHaveBeenCalled();
+  });
+});
+
 describe('HeadlessRunner', () => {
   it('spawns the resolved invocation with cwd and augmented PATH', async () => {
     const m = manifest();
@@ -82,11 +124,13 @@ describe('HeadlessRunner', () => {
 
   it('wraps in a PTY via script when the manifest requires a TTY and script exists', async () => {
     const m = manifest({ runner: { command: 'test-cli', argsTemplate: ['{{prompt}}'], promptInArgs: true, requiresTty: true } });
-    const { runner, spawnImpl } = makeRunner({ hasScript: true });
+    const child = new FakeChildProcess();
+    const spawnImpl = vi.fn().mockReturnValue(child) as unknown as SpawnFn;
+    const runner = new HeadlessRunner({ spawnImpl, hasScriptCmd: () => true, resolvePath: async () => '', launchDeps: { platform: 'linux' } });
 
     await runner.spawn(baseOpts(m));
 
-    const [command, args] = spawnImpl.mock.calls[0];
+    const [command, args] = (spawnImpl as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(command).toBe('script');
     expect(args).toEqual(['-q', '-e', '-f', '-c', `'test-cli' 'do the thing'`, '/dev/null']);
   });

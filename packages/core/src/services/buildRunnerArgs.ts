@@ -16,6 +16,8 @@ export function buildRunnerInvocation(opts: {
   headless?: boolean;
   interactive?: boolean;
   cwd?: string;
+  /** The installed runner's `--version`, for a manifest whose command line differs by major version. */
+  runnerVersion?: string;
   registry: RunnerRegistry;
 }): RunnerInvocation {
   const entry = opts.registry.get(opts.runner);
@@ -34,5 +36,6 @@ export function buildRunnerInvocation(opts: {
     headless: opts.headless,
     interactive: opts.interactive,
     cwd: opts.cwd,
+    runnerVersion: opts.runnerVersion,
   });
 }
