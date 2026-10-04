@@ -9,7 +9,7 @@ import {
 } from '../interfaces/IFileSystem';
 import { IApproval, DENY_ALL } from '../interfaces/IApproval';
 import { classifyCommand, pathRefs, type CommandPolicyOptions } from './commandPolicy';
-import { resolveResearchShell, researchShellWarning, type ResearchShell } from './researchShell';
+import { resolveResearchShell, researchShellWarning, researchPolicyOptions, type ResearchShell } from './researchShell';
 import { resolveWithin, resolveRef, grantScopeFor, isInertDevice } from './pathScope';
 import { definitionPattern, referencePattern, languageForId, includeGlobFor } from './symbolPatterns';
 
@@ -192,7 +192,7 @@ export abstract class BaseFileSystem implements IFileSystem {
   }
 
   private policyOptions(): CommandPolicyOptions {
-    return { dialect: this.researchShell.dialect, cdpathSet: !!process.env.CDPATH };
+    return researchPolicyOptions(this.researchShell);
   }
 
   /**

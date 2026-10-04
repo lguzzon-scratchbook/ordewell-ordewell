@@ -854,6 +854,8 @@ interface Segment {
    * segments of a command simple enough to follow.
    */
   cwd?: string[];
+  /** Something else on the line can change where this `cd` lands — see {@link markShellState}. */
+  cdSteered?: boolean;
 }
 
 /** An output redirect whose target is not provably a no-op (`/dev/null`, an fd duplication). */
@@ -874,6 +876,16 @@ interface Lexed {
   processSubstitution: boolean;
   /** Lexing ran off the end inside a quote or a substitution — nothing here is trustworthy. */
   unbalanced: boolean;
+  /**
+   * The line is commands joined only by `&&` and `|`, each with a command
+   * name — the one shape {@link followCd} can follow. Decided here, where every
+   * operator is seen, because a segment that never becomes a {@link Segment} (a
+   * bare `X=1`, a redirect alone) can still carry the `||` or `;` that makes the
+   * shell's directory depend on what ran.
+   */
+  followable: boolean;
+  /** A segment that ran no command, only an assignment or a redirect: it may have set `CDPATH`. */
+  bareSegment: boolean;
 }
 
 /**
@@ -922,6 +934,8 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
   let unbalanced = false;
   let grouped = false;
   let joinedBy: Segment['joinedBy'];
+  let followable = true;
+  let bareSegment = false;
 
   let tokens: string[] = [];
   let expandable = false;
@@ -964,9 +978,18 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
     current = '';
     started = false;
   };
-  const endSegment = (nextPiped: boolean, next: Segment['joinedBy'] = 'other') => {
+  const endSegment = (nextPiped: boolean, next: Segment['joinedBy'] = 'other', last = false) => {
     endToken();
-    if (tokens.length > 0) segments.push({ ...toSegment(tokens, piped, dialect), expandable, inputs, joinedBy });
+    if (!last && next === 'other') followable = false;
+    if (tokens.length > 0) {
+      const seg = toSegment(tokens, piped, dialect);
+      if (!seg.binary) { followable = false; bareSegment = true; }
+      segments.push({ ...seg, expandable, inputs, joinedBy });
+    } else if (!last || segments.length > 0 || joinedBy !== undefined) {
+      // Nothing ran here, or only a redirect did, yet an operator still joined it.
+      followable = false;
+      bareSegment = true;
+    }
     tokens = [];
     inputs = [];
     expandable = false;
@@ -1099,9 +1122,9 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
   }
 
   if (quote !== '') unbalanced = true;
-  endSegment(false);
+  endSegment(false, 'other', true);
 
-  return { segments, unsafeRedirect, processSubstitution, unbalanced, grouped };
+  return { segments, unsafeRedirect, processSubstitution, unbalanced, grouped, followable, bareSegment };
 }
 
 /**
@@ -1332,7 +1355,8 @@ function lexAll(command: string, dialect: Dialect, cdpathSet = false): Lexed {
   const queue: string[] = [];
   const top = lex(command, queue, dialect);
   const all: Lexed = { ...top, segments: top.segments.filter((s) => s.binary) };
-  if (!top.grouped && queue.length === 0 && !cdpathSet) followCd(all.segments);
+  markShellState(all.segments, top.bareSegment);
+  if (top.followable && !top.grouped && queue.length === 0 && !cdpathSet) followCd(all.segments);
 
   // Bounded: a pathological `$($($(…)))` must not spin here.
   for (let depth = 0; depth < 32 && queue.length > 0; depth++) {
@@ -1374,15 +1398,38 @@ function literalCdTarget(seg: Segment): string | undefined {
  * is the one its stages share.
  */
 function followCd(segments: Segment[]): void {
-  if (segments.some((s) => s.joinedBy === 'other')) return;
+  if (segments.some((s) => s.joinedBy === 'other' || SHELL_STATE_COMMANDS.has(s.binary))) return;
+  const inPipeline = (i: number) => segments[i].joinedBy === 'pipe' || segments[i + 1]?.joinedBy === 'pipe';
+  // A `cd` it cannot read leaves the shell somewhere unknown for the rest of the line.
+  if (segments.some((s, i) => s.binary === 'cd' && !inPipeline(i) && literalCdTarget(s) === undefined)) return;
   let chain: string[] = [];
   segments.forEach((seg, i) => {
     seg.cwd = chain;
-    const inPipeline = seg.joinedBy === 'pipe' || segments[i + 1]?.joinedBy === 'pipe';
-    const target = inPipeline ? undefined : literalCdTarget(seg);
+    const target = inPipeline(i) ? undefined : literalCdTarget(seg);
     if (target !== undefined) chain = [...chain, target];
   });
 }
+
+/**
+ * A `cd` stays navigation only while nothing else on the line can redirect it.
+ * A bare `CDPATH=…` or a state-changing builtin can send a bare-name `cd`
+ * somewhere no argument names, which the root-judged fallback cannot see —
+ * so on such a line `cd` is no longer `auto`.
+ */
+function markShellState(segments: Segment[], bareSegment: boolean): void {
+  if (!bareSegment && !segments.some((s) => SHELL_STATE_COMMANDS.has(s.binary))) return;
+  for (const seg of segments) if (seg.binary === 'cd') seg.cdSteered = true;
+}
+
+/**
+ * Builtins that change what a later `cd` or path means in the same shell:
+ * `CDPATH` and `cdable_vars` redirect a bare-name `cd`, and the directory
+ * stack, `eval` and `source` move the shell where the line does not say.
+ */
+const SHELL_STATE_COMMANDS = new Set([
+  'export', 'set', 'shopt', 'declare', 'typeset', 'readonly', 'local', 'unset', 'let',
+  'source', '.', 'eval', 'exec', 'pushd', 'popd', 'alias', 'unalias', 'builtin', 'command', 'enable', 'hash', 'trap',
+]);
 
 export interface PathRef {
   path: string;
@@ -1429,7 +1476,8 @@ function looksLikePath(arg: string): boolean {
  */
 export function pathRefs(command: string, opts: CommandPolicyOptions = {}): PathRef[] {
   const dialect = dialectFor(opts.dialect);
-  return lexAll(command, dialect, opts.cdpathSet).segments.flatMap((seg) => {
+  // Lexed exactly as `classifyCommand` lexes it, so a leading newline cannot change what is followed.
+  return lexAll(command.trim(), dialect, opts.cdpathSet).segments.flatMap((seg) => {
     const patterns = patternArgs(seg);
     const cwd = seg.cwd ?? [];
     return [...seg.args.filter((_, i) => !patterns.has(i)), ...seg.inputs]
@@ -1741,11 +1789,12 @@ function scopeFor(seg: Segment): string {
 }
 
 function isAuto(seg: Segment, opts: CommandPolicyOptions): boolean {
-  // Navigation is read-only, but only a target the command line spells out: its
-  // effect on later commands is followed by `followCd`, or ignored in the
-  // fallback, where a path judged from the workspace root is never more
-  // permissive than from a deeper directory the root contains.
-  if (seg.binary === 'cd') return !opts.cdpathSet && literalCdTarget(seg) !== undefined;
+  // Navigation is read-only, but only a target the command line spells out, on
+  // a line where nothing else can steer it. Its effect on later commands is
+  // followed by `followCd`, or ignored in the fallback, where a path judged
+  // from the workspace root is never more permissive than from a deeper
+  // directory the root contains.
+  if (seg.binary === 'cd') return !opts.cdpathSet && !seg.cdSteered && literalCdTarget(seg) !== undefined;
   if (!AUTO_COMMANDS.includes(seg.binary)) return false;
   // `x=/etc/passwd; cat $x` gives `cat` the lone argument `$x`, which
   // `pathLikeArgs`/`looksLikePath` cannot see is a path at all — the shell

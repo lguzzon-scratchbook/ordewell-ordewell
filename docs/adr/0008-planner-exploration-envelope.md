@@ -219,18 +219,24 @@ must not prompt. Judging every path from the workspace root would read `../web`
 as a sibling of the workspace, so confinement follows the `cd`s it can be sure
 of.
 
-- **A literal `cd` is `auto`.** One operand the command line spells out: no
-  variable, substitution, glob, flag (`-P`, `-`), `~`, or second operand. Bare
-  `cd`, `cd -` and `pushd` still ask. With `CDPATH` set in the environment a
-  relative `cd` may land somewhere the line never names, so none of this
-  applies.
+- **A literal `cd` is `auto`** where nothing else on the line can steer it.
+  One operand the command line spells out: no variable, substitution, glob,
+  flag (`-P`, `-`), `~`, or second operand. Bare `cd`, `cd -` and `pushd` still
+  ask. A line with a segment that runs no command — a bare `CDPATH=…`, a
+  redirect alone — or a builtin that changes shell state (`export`, `set`,
+  `shopt`, `source`, `eval`, the directory stack) can send a bare-name `cd`
+  somewhere no argument names, so on such a line `cd` asks. With `CDPATH` set
+  in the environment none of this applies.
 - **A chain is followed only where it is certain.** Confinement resolves a path
   from the `cd` targets that must have run before it, and only when the command
-  is pipelines joined by `&&`: a failed `cd` ends the list, so everything after
-  it ran in the new directory. Any `;`, `||`, `&`, newline, subshell or
-  substitution disables following for the whole command, because the shell's
-  directory then depends on what ran. A `cd` inside a multi-stage pipeline runs
-  in a subshell and is not counted.
+  is commands joined by `&&` and `|`, each with a command name: a failed `cd`
+  ends the list, so everything after it ran in the new directory. The lexer
+  decides this as it reads each operator, not from the segments it keeps — a
+  segment that never becomes a command can still carry the `||` or `;` that
+  makes the shell's directory depend on what ran. Any `;`, `||`, `&`, newline,
+  subshell, substitution, state-changing builtin or `cd` it cannot read stops
+  following for the whole command. A `cd` inside a multi-stage pipeline runs in
+  a subshell and is not counted.
 - **The fallback never relaxes.** When nothing is followed, paths are judged
   from the root. That is never more permissive than the truth while every `cd`
   stays inside the workspace: a path with no net climb stays inside from any
@@ -241,7 +247,8 @@ of.
   judged by name, not by where `link` points.
 
 Research subagents use the same resolution, so a chain that stays inside the
-workspace works for them and one that leaves it is refused.
+workspace works for them and one that leaves it is refused, named by where it
+resolves rather than as written.
 
 ## Considered options
 
@@ -260,3 +267,4 @@ workspace works for them and one that leaves it is refused.
 - 2026-09-29 — the seam carries runner tool requests (ADR-0018, #56).
 - 2026-10-01 — patterns are not paths, inert devices, one prompt per command.
 - 2026-10-01 — `cd` followed through `&&` chains where the shell's directory is certain.
+- 2026-10-04 — `cd` following decided by the lexer; a line that can steer `cd` keeps it asking.

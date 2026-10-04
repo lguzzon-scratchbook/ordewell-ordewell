@@ -1,7 +1,7 @@
 import { executeTool } from './executeTool';
 import { subagentToolSpecs } from './researchTools';
 import { classifyCommand, pathRefs } from './commandPolicy';
-import { resolveResearchShell } from './researchShell';
+import { resolveResearchShell, researchPolicyOptions } from './researchShell';
 import { resolveWithin, resolveRef } from './pathScope';
 import { classifyOutcome } from './researchStepSummary';
 import type { IFileSystem, ToolOutcome } from '../interfaces/IFileSystem';
@@ -91,10 +91,7 @@ function nonPromptingFs(fs: IFileSystem): IFileSystem {
     findSymbol: (symbol, opts) => (withinWorkspace(opts?.path) ? fs.findSymbol(symbol, opts) : Promise.resolve(outsideRefusal(opts!.path!))),
     listDir: (p, depth) => (withinWorkspace(p) ? fs.listDir(p, depth) : Promise.resolve(outsideRefusal(p))),
     bash: async (command, signal) => {
-      // Same dialect the wrapped filesystem will execute under — a subagent
-      // must not classify under different rules than the parent.
-      const dialect = resolveResearchShell().dialect;
-      const policy = { dialect, cdpathSet: !!process.env.CDPATH };
+      const policy = researchPolicyOptions(resolveResearchShell());
       const { tier, reason } = classifyCommand(command, policy);
       if (tier !== 'auto') {
         return refused(
@@ -106,8 +103,9 @@ function nonPromptingFs(fs: IFileSystem): IFileSystem {
       // An `auto` binary (cat, find, rg, …) is only auto because reading is
       // read-only — its arguments can still name a path outside the
       // workspace, and a subagent can never prompt to approve one.
-      const escaping = pathRefs(command, policy).find((ref) => !resolveRef(fs.getWorkspaceRoot(), ref).inside);
-      if (escaping) return outsideRefusal(escaping.path);
+      // Named as resolved: after a `cd`, the path as written says nothing about where it points.
+      const escaping = pathRefs(command, policy).map((ref) => resolveRef(fs.getWorkspaceRoot(), ref)).find((r) => !r.inside);
+      if (escaping) return outsideRefusal(escaping.abs);
       return fs.bash(command, signal);
     },
   };

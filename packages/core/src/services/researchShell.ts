@@ -1,5 +1,6 @@
 import * as fsSync from 'fs';
 import * as path from 'path';
+import type { CommandPolicyOptions } from './commandPolicy';
 
 /**
  * Which interpreter runs the planner's `bash` tool, and in which language.
@@ -156,4 +157,14 @@ export function researchShellWarning(shell: ResearchShell): string | null {
   return 'No POSIX shell was found on this machine, so research commands run through cmd.exe, '
     + 'where most read-only tools (ls, cat, wc, head, grep, find) do not exist. '
     + 'Installing Git for Windows provides one and restores the full research toolset.';
+}
+
+/**
+ * What a research-shell command is classified under. One function, because a
+ * subagent must never classify under different rules than its parent: the
+ * shell's dialect, and whether a `CDPATH` in the environment can send a
+ * relative `cd` somewhere the line never names.
+ */
+export function researchPolicyOptions(shell: ResearchShell): CommandPolicyOptions {
+  return { dialect: shell.dialect, cdpathSet: !!process.env.CDPATH };
 }

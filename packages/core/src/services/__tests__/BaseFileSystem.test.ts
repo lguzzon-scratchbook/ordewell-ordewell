@@ -376,6 +376,54 @@ describe('BaseFileSystem — bash follows a cd chain', () => {
     expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'shell_command', scope: 'cd' }));
   });
 
+  // Each of these read outside the workspace with no prompt before the lexer
+  // decided followability: a segment that never became a command carried the
+  // `||` or `|`, or the CDPATH assignment that moved the shell.
+  const scopesAsked = (request: ReturnType<typeof vi.fn>): string[] =>
+    request.mock.calls.flatMap((call: unknown[]) => {
+      const req = call[0] as { scope: string; scopes?: string[] };
+      return req.scopes ?? [req.scope];
+    });
+
+  it.each([
+    ['an assignment hiding a ||', 'cd nonexist || X=1 && cat ../secret'],
+    ['an assignment hiding a pipe', 'cd a | X=1 && cat ../secret'],
+    ['a bare redirect hiding a ||', 'cd nonexist || >/dev/null && cat ../secret'],
+    ['a bare redirect hiding a pipe', 'cd a | >/dev/null && cat ../secret'],
+  ])('does not follow a chain with %s, and asks about the path outside', async (_label, command) => {
+    const { request } = await run(command);
+
+    expect(scopesAsked(request).some((scope) => scope !== 'cd' && scope.startsWith('/'))).toBe(true);
+  });
+
+  it.each([
+    ['assigned on the line', 'CDPATH=/home/u && cd .ssh && cat id_rsa'],
+    ['assigned before a ;', 'CDPATH=/etc; cd ssl; cat ./openssl.cnf'],
+  ])('asks about a cd once CDPATH is %s', async (_label, command) => {
+    const { request } = await run(command);
+
+    expect(scopesAsked(request)).toContain('cd');
+  });
+
+  it('never runs a line that exports a CDPATH', async () => {
+    const { request, result } = await run('export CDPATH=/home/u && cd .ssh && cat id_rsa');
+
+    expect(request).not.toHaveBeenCalled();
+    expect(result.success).toBe(false);
+  });
+
+  it('stops following at a cd it cannot read', async () => {
+    const { request } = await run('cd "$HOME" && cd api && cat ../x', true);
+
+    expect(scopesAsked(request).some((scope) => scope !== 'cd' && scope.startsWith('/'))).toBe(true);
+  });
+
+  it('follows the same chain whatever whitespace surrounds it', async () => {
+    const { request } = await run('\ncd api && cat ../web/x\n');
+
+    expect(request).not.toHaveBeenCalled();
+  });
+
   describe('with CDPATH set', () => {
     it('falls back to asking, because cd may land somewhere else', async () => {
       vi.stubEnv('CDPATH', '/etc');
