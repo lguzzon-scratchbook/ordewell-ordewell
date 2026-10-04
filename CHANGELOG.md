@@ -21,6 +21,11 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   of them joined by `&&` is followed, so later paths are judged from where the
   shell will be. Anything the classifier cannot follow — `;`, `||`, subshells,
   `$(…)`, a variable, `cd -`, or `CDPATH` set — behaves as before.
+- **Planner search works on a Mac without ripgrep.** Without `rg` the search
+  falls back to the system `grep`, and macOS's `grep` has no `-P`, so every
+  planner grep and symbol lookup failed with `invalid option -- P`. The fallback
+  now asks the machine's `grep` which regex mode it has and uses `-E` where
+  `-P` is missing.
 
 ## [0.6.1] — 2026-10-02
 

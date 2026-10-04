@@ -7,6 +7,9 @@ import {
   buildGrepArgs,
   buildGlobArgs,
   buildFallbackGrepArgs,
+  GREP_PCRE_PROBE_ARGS,
+  grepRegexFromProbe,
+  type GrepRegex,
   filterFallbackByAnchoredInclude,
   applyHeadLimit,
   formatSearchOutput,
@@ -89,6 +92,14 @@ export class VsCodeFileSystem extends BaseFileSystem {
     // `withPath`, not a `PATH:` spread: on Windows the spread of `process.env`
     // carries `Path`, so adding `PATH` hands the child two and lets the OS pick.
     return resolved === (process.env.PATH ?? '') ? undefined : withPath(process.env, resolved);
+  }
+
+  private grepRegex: Promise<GrepRegex> | null = null;
+  private fallbackGrepRegex(): Promise<GrepRegex> {
+    this.grepRegex ??= run('grep', GREP_PCRE_PROBE_ARGS, { timeout: 5_000, env: this.searchEnv() })
+      .then((r) => grepRegexFromProbe(r.code))
+      .catch(() => 'ere' as const);
+    return this.grepRegex;
   }
 
   private rgAvailable: Promise<boolean> | null = null;
@@ -215,7 +226,7 @@ export class VsCodeFileSystem extends BaseFileSystem {
     const anchoredInclude = !useRg && opts.include?.includes('/') ? opts.include : undefined;
     const result = useRg
       ? await run('rg', buildGrepArgs(pattern, opts, absRoot).args, { timeout: SEARCH_TIMEOUT_MS, cwd: anchor, env: this.searchEnv() })
-      : await run('grep', buildFallbackGrepArgs(pattern, anchoredInclude ? { ...opts, include: undefined } : opts, absRoot), { timeout: SEARCH_TIMEOUT_MS, cwd: anchor, env: this.searchEnv() });
+      : await run('grep', buildFallbackGrepArgs(pattern, anchoredInclude ? { ...opts, include: undefined } : opts, absRoot, await this.fallbackGrepRegex()), { timeout: SEARCH_TIMEOUT_MS, cwd: anchor, env: this.searchEnv() });
 
     // Exit 1 means "no matches" for both tools — an empty success, not an error.
     if (result.code !== 0 && result.code !== 1 && !result.stdout) {

@@ -319,7 +319,8 @@ describe('PoolFileSystem', () => {
         const approving = new PoolFileSystem(tmpDir);
         approving.setApproval({ request: async () => true });
 
-        const result = await approving.bash('cat /etc/hostname');
+        // /etc/hosts exists on every OS this runs on; /etc/hostname is Linux-only.
+        const result = await approving.bash('cat /etc/hosts');
         expect(result.success).toBe(true);
       });
 

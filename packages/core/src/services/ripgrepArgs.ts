@@ -75,21 +75,106 @@ export function buildGlobArgs(pattern: string, root: string): string[] {
 }
 
 /**
+ * Which regex dialect the machine's `grep` can run: GNU grep has `-P` (PCRE);
+ * BSD grep (macOS) rejects it, but its `-E` is the enhanced regex library and
+ * reads the same non-capturing groups, `\b`, `\s` and `\d`.
+ */
+export type GrepRegex = 'pcre' | 'ere';
+
+/** Run `grep` with these args: it exits 1 ("no match") when `-P` exists and 2 when it does not. */
+export const GREP_PCRE_PROBE_ARGS = ['-P', '-e', 'x', '/dev/null'];
+
+export function grepRegexFromProbe(exitCode: number | null): GrepRegex {
+  return exitCode === 0 || exitCode === 1 ? 'pcre' : 'ere';
+}
+
+/**
+ * Rewrite the escapes inside bracket classes into POSIX form. Rust and PCRE read
+ * `[\s(,;]` as whitespace plus three characters; POSIX ERE reads a backslash
+ * in a class literally, so the same pattern matches `\` and `s` instead and
+ * the search comes back confidently empty. Outside a class the enhanced
+ * `-E` already reads `\s`, `\w`, `\d` and `\b`, so only classes are touched.
+ */
+export function toPosixClasses(pattern: string): string {
+  const CLASS_ESCAPES: Record<string, string> = { s: '[:space:]', w: '[:alnum:]_', d: '[:digit:]', t: '\t' };
+  let out = '';
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i];
+    if (c === '\\') {
+      out += pattern.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    if (c !== '[') {
+      out += c;
+      i++;
+      continue;
+    }
+    const start = i;
+    i++;
+    let negate = false;
+    if (pattern[i] === '^') {
+      negate = true;
+      i++;
+    }
+    let body = '';
+    let closeBracket = false;
+    let openBracket = false;
+    let dash = false;
+    let closed = false;
+    while (i < pattern.length) {
+      const ch = pattern[i];
+      if (ch === ']') {
+        closed = true;
+        i++;
+        break;
+      }
+      if (ch === '[' && pattern[i + 1] === ':') {
+        const end = pattern.indexOf(':]', i + 2);
+        if (end !== -1) {
+          body += pattern.slice(i, end + 2);
+          i = end + 2;
+          continue;
+        }
+      }
+      if (ch === '\\' && i + 1 < pattern.length) {
+        const e = pattern[i + 1];
+        i += 2;
+        if (e in CLASS_ESCAPES) body += CLASS_ESCAPES[e];
+        else if (e === ']') closeBracket = true;
+        else if (e === '[') openBracket = true;
+        else if (e === '-') dash = true;
+        else body += e;
+        continue;
+      }
+      body += ch;
+      i++;
+    }
+    if (!closed) {
+      out += pattern.slice(start);
+      break;
+    }
+    out += `[${negate ? '^' : ''}${closeBracket ? ']' : ''}${body}${openBracket ? '[' : ''}${dash ? '-' : ''}]`;
+  }
+  return out;
+}
+
+/**
  * The POSIX-grep fallback for machines without ripgrep. Ordering and `--sort`
  * are unavailable.
  *
- * `-P` (PCRE) is required, not optional: patterns built in core — most
+ * A regex mode is required, not optional: patterns built in core — most
  * notably `find_symbol`'s `definitionPattern` — use non-capturing groups and
- * `\b`, which BRE has no syntax for and ERE (`-E`) still cannot express
- * ((?:...) is a PCRE construct). Without `-P`, GNU grep either errors
- * ("Unmatched \{") or, worse, silently treats `(`/`)`/`|` as literal
- * characters and reports a confident empty result. `-P` and `-F` are
- * mutually exclusive, so literal mode skips it.
+ * `\b`, which BRE has no syntax for. Without `-P` or an enhanced `-E`, grep
+ * either errors ("Unmatched \{") or, worse, silently treats `(`/`)`/`|` as
+ * literal characters and reports a confident empty result. The regex flags and
+ * `-F` are mutually exclusive, so literal mode skips them.
  */
-export function buildFallbackGrepArgs(pattern: string, opts: GrepOptions, root: string): string[] {
+export function buildFallbackGrepArgs(pattern: string, opts: GrepOptions, root: string, regex: GrepRegex = 'pcre'): string[] {
   const args = ['-r', '-n'];
   if (opts.literal) args.push('-F');
-  else args.push('-P');
+  else args.push(regex === 'pcre' ? '-P' : '-E');
   if (opts.caseInsensitive) args.push('-i');
   if (opts.outputMode === 'files') args.push('-l');
   if (opts.outputMode === 'count') args.push('-c');
@@ -99,7 +184,7 @@ export function buildFallbackGrepArgs(pattern: string, opts: GrepOptions, root: 
   }
   if (opts.include) args.push(`--include=${opts.include}`);
   for (const dir of SEARCH_EXCLUSIONS) args.push(`--exclude-dir=${dir}`);
-  args.push('-e', pattern, root);
+  args.push('-e', !opts.literal && regex === 'ere' ? toPosixClasses(pattern) : pattern, root);
   return args;
 }
 

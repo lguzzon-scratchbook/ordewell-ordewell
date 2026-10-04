@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildGrepArgs, buildGlobArgs, buildFallbackGrepArgs, filterFallbackByAnchoredInclude, applyHeadLimit, formatSearchOutput } from '../ripgrepArgs';
+import { buildGrepArgs, buildGlobArgs, buildFallbackGrepArgs, grepRegexFromProbe, toPosixClasses, filterFallbackByAnchoredInclude, applyHeadLimit, formatSearchOutput } from '../ripgrepArgs';
 import { SEARCH_EXCLUSIONS } from '../../interfaces/IFileSystem';
 
 describe('buildGrepArgs', () => {
@@ -159,10 +159,40 @@ describe('buildFallbackGrepArgs', () => {
     expect(buildFallbackGrepArgs('(?:foo|bar)', {}, '/repo')).toContain('-P');
   });
 
+  it('requests enhanced ERE where grep has no -P, so macOS keeps the same patterns', () => {
+    const args = buildFallbackGrepArgs('(?:foo|bar)', {}, '/repo', 'ere');
+    expect(args).toContain('-E');
+    expect(args).not.toContain('-P');
+  });
+
+  it('reads -P support from the probe: exit 0 or 1 means it exists, anything else does not', () => {
+    expect(grepRegexFromProbe(1)).toBe('pcre');
+    expect(grepRegexFromProbe(0)).toBe('pcre');
+    expect(grepRegexFromProbe(2)).toBe('ere');
+    expect(grepRegexFromProbe(null)).toBe('ere');
+  });
+
   it('does not request -P in literal mode, since -P and -F are mutually exclusive', () => {
     const args = buildFallbackGrepArgs('literal(text)', { literal: true }, '/repo');
     expect(args).toContain('-F');
     expect(args).not.toContain('-P');
+  });
+});
+
+describe('toPosixClasses', () => {
+  it('turns class escapes into POSIX classes', () => {
+    expect(toPosixClasses('(?:^|[\\s(,;])x')).toBe('(?:^|[[:space:](,;])x');
+    expect(toPosixClasses('[\\w<>\\[\\]*&:.~]+')).toBe('[][:alnum:]_<>*&:.~[]+');
+  });
+
+  it('leaves escapes outside a class, and an unterminated class, alone', () => {
+    expect(toPosixClasses('\\bfoo\\s+bar\\b')).toBe('\\bfoo\\s+bar\\b');
+    expect(toPosixClasses('a[\\s')).toBe('a[\\s');
+  });
+
+  it('is applied to the ERE fallback only', () => {
+    expect(buildFallbackGrepArgs('[\\s]x', {}, '/r', 'ere')).toContain('[[:space:]]x');
+    expect(buildFallbackGrepArgs('[\\s]x', {}, '/r', 'pcre')).toContain('[\\s]x');
   });
 });
 
