@@ -2019,6 +2019,16 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
   const nonAuto = unwrapped.filter((u) => u.runner !== undefined || !isAuto(u.seg, opts));
   if (nonAuto.length === 0) return { tier: 'auto', scope: '' };
 
+  // A `cd` that asks, or a builtin that can move the shell, is one confinement
+  // could not follow, so every path after it on the line was judged from the
+  // root, not from wherever the shell went. Under the binary-name scope,
+  // approving `cd "$HOME"` once would wave through `cd "$HOME" && cat
+  // .ssh/id_rsa` later. Its grant is the line the human read. `command` is
+  // left out: `command cd` is unwrapped to `cd`, so what remains is a lookup.
+  if (nonAuto.some((u) => u.seg.binary === 'cd' || (u.seg.binary !== 'command' && SHELL_STATE_COMMANDS.has(u.seg.binary)))) {
+    return { tier: 'ask', scope: trimmed };
+  }
+
   // A grant covers only the parts that actually needed one, so
   // `az group list | head` is remembered as `az group`, not the whole line —
   // and under a runner it names the command run, so approving `xargs grep`

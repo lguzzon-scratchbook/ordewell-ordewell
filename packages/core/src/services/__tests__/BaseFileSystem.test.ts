@@ -373,7 +373,7 @@ describe('BaseFileSystem — bash follows a cd chain', () => {
   it('asks about a cd it cannot read, as before', async () => {
     const { request } = await run('cd "$HOME" && ls');
 
-    expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'shell_command', scope: 'cd' }));
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'shell_command', scope: 'cd "$HOME" && ls' }));
   });
 
   // Each of these read outside the workspace with no prompt before the lexer
@@ -393,7 +393,7 @@ describe('BaseFileSystem — bash follows a cd chain', () => {
   ])('does not follow a chain with %s, and asks about the path outside', async (_label, command) => {
     const { request } = await run(command);
 
-    expect(scopesAsked(request).some((scope) => scope !== 'cd' && scope.startsWith('/'))).toBe(true);
+    expect(scopesAsked(request).some((scope) => scope.startsWith('/'))).toBe(true);
   });
 
   it.each([
@@ -402,7 +402,7 @@ describe('BaseFileSystem — bash follows a cd chain', () => {
   ])('asks about a cd once CDPATH is %s', async (_label, command) => {
     const { request } = await run(command);
 
-    expect(scopesAsked(request)).toContain('cd');
+    expect(scopesAsked(request)).toContain(command);
   });
 
   it('never runs a line that exports a CDPATH', async () => {
@@ -415,7 +415,36 @@ describe('BaseFileSystem — bash follows a cd chain', () => {
   it('stops following at a cd it cannot read', async () => {
     const { request } = await run('cd "$HOME" && cd api && cat ../x', true);
 
-    expect(scopesAsked(request).some((scope) => scope !== 'cd' && scope.startsWith('/'))).toBe(true);
+    expect(scopesAsked(request).some((scope) => scope.startsWith('/'))).toBe(true);
+  });
+
+  // Grants were keyed on the binary name, so one approved `cd "$HOME"` (or
+  // `pushd`, or `builtin cd`) let a later line read from wherever it went —
+  // its paths are judged from the root, where `.ssh/id_rsa` looks inside.
+  it.each([
+    ['cd "$HOME"', 'cd "$HOME" && cat .ssh/id_rsa'],
+    ['pushd ~', 'pushd ~ && cat .ssh/id_rsa'],
+    ['builtin cd ~', 'builtin cd ~ && cat .ssh/id_rsa'],
+  ])('asks again after %s was approved, when the next line reads from there', async (first, second) => {
+    const fs = new TestFileSystem();
+    const asked: string[] = [];
+    fs.setApproval(new ApprovalPolicy({ ask: async (req) => { asked.push(req.subject); return true; } }));
+
+    await fs.bash(first);
+    await fs.bash(second);
+
+    expect(asked).toEqual([first, second]);
+  });
+
+  it('does not ask twice for the same line', async () => {
+    const fs = new TestFileSystem();
+    let asked = 0;
+    fs.setApproval(new ApprovalPolicy({ ask: async () => { asked++; return true; } }));
+
+    await fs.bash('cd "$HOME" && ls');
+    await fs.bash('cd "$HOME" && ls');
+
+    expect(asked).toBe(1);
   });
 
   it('follows the same chain whatever whitespace surrounds it', async () => {
@@ -429,7 +458,7 @@ describe('BaseFileSystem — bash follows a cd chain', () => {
       vi.stubEnv('CDPATH', '/etc');
       try {
         const { request } = await run('cd api && ls');
-        expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'shell_command', scope: 'cd' }));
+        expect(request).toHaveBeenCalledWith(expect.objectContaining({ kind: 'shell_command', scope: 'cd api && ls' }));
       } finally {
         vi.unstubAllEnvs();
       }

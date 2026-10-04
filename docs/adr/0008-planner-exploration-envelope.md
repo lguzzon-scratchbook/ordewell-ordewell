@@ -243,6 +243,12 @@ of.
   deeper directory, and a `cd` that climbs is itself a path argument and asks.
   Where a followed chain leaves the workspace, later paths are judged from there
   and ask under their own scopes.
+- **A `cd` that asks is granted for its line only.** Its grant is the exact
+  command, not `cd`, and so is the grant of a builtin that can move the shell
+  (`pushd`, `popd`, `builtin`, the other state-changing builtins). Confinement
+  did not follow it, so the paths after it were judged from the root; under a
+  binary-name grant, approving `cd "$HOME"` would have approved
+  `cd "$HOME" && cat .ssh/id_rsa`.
 - **Symlinks stay lexical,** as in `pathScope.ts`: `cd link && cat ../x` is
   judged by name, not by where `link` points.
 
@@ -268,3 +274,4 @@ resolves rather than as written.
 - 2026-10-01 — patterns are not paths, inert devices, one prompt per command.
 - 2026-10-01 — `cd` followed through `&&` chains where the shell's directory is certain.
 - 2026-10-04 — `cd` following decided by the lexer; a line that can steer `cd` keeps it asking.
+- 2026-10-04 — a `cd` or shell-moving builtin that asks is granted for its exact line.

@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Security
+
+- **Approving one `cd` no longer approves every later one** during planner
+  research. Once `cd "$HOME"` was approved, `cd "$HOME" && cat .ssh/id_rsa`
+  ran without a prompt. Such a command is now approved for that exact line only.
+
 ## [0.6.3] — 2026-10-04
 
 ### Security

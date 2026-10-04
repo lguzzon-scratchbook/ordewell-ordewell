@@ -8,6 +8,15 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Security
+
+- **Approving one `cd` no longer approves every later one.** A `cd` the planner
+  could not follow — `cd "$HOME"`, `cd ~`, `pushd`, `builtin cd` — was
+  remembered as approved for the whole session, and the paths after it are
+  judged from the workspace root. Once `cd "$HOME"` was approved,
+  `cd "$HOME" && cat .ssh/id_rsa` ran without a prompt. Such a command is now
+  approved for that exact line only.
+
 ## [0.6.3] — 2026-10-04
 
 ### Security
