@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.6.3] — 2026-10-04
+
+### Security
+
+- **Planner research no longer reads outside the workspace through a `cd`
+  chain.** A command such as `cd nonexist || X=1 && cat ../secret` read
+  outside the workspace with no prompt in 0.6.2. It now asks.
+
+### Fixed
+
+- **OpenCode 2.x runs on the terminal transport**, with the plan's agent,
+  model and variant.
+- **The terminal transport works on macOS without tmux**: OpenCode tasks no
+  longer fail at once on macOS's `script`, and Codex tasks no longer hang.
+
 ## [0.6.2] — 2026-10-04
 
 ### Fixed
