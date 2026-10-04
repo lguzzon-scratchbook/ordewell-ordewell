@@ -39,9 +39,13 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          v="${GITHUB_REF_NAME#v}"
           npm publish -w packages/core
+          node .github/workflows/wait-for-npm.mjs @ordewell/core "$v"
           npm publish -w packages/web
+          node .github/workflows/wait-for-npm.mjs @ordewell/web "$v"
           npm publish -w packages/cli
+          node .github/workflows/wait-for-npm.mjs @ordewell/cli "$v"
           cd packages/cli-alias && npm publish
 
   vscode-publish:
