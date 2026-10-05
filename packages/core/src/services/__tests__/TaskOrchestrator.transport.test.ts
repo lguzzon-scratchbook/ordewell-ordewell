@@ -205,3 +205,69 @@ describe('ending a structured attempt', () => {
     expect(runner.stop).not.toHaveBeenCalled();
   });
 });
+
+describe('completing through task_complete (ADR-0022)', () => {
+  it('teaches the tool only to a structured task whose runner is given it', async () => {
+    const { runner, requests } = routingRunner();
+    const orchestrator = orchestratorWith({ value: 'structured' }, runner);
+    orchestrator.loadPlan([
+      createTask({ id: 't1', order: 1, title: 'Claude', prompt: 'one' }),
+      createTask({ id: 't2', order: 2, title: 'Codex', prompt: 'two', assignedRunner: 'codex' }),
+    ], ['claude-code', 'codex']);
+    await orchestrator.forceStartTask('t1');
+    await orchestrator.forceStartTask('t2');
+
+    expect(requests[0].prompt).toContain('`task_complete`');
+    expect(requests[1].prompt).not.toContain('task_complete');
+
+    const terminal = routingRunner();
+    const onTerminal = orchestratorWith({ value: 'terminal' }, terminal.runner);
+    onTerminal.loadPlan([createTask({ id: 't1', order: 1, title: 'Claude', prompt: 'one' })]);
+    await onTerminal.forceStartTask('t1');
+    expect(terminal.requests[0].prompt).not.toContain('task_complete');
+  });
+
+  it('numbers each attempt it spawns', async () => {
+    const { runner, sessions, requests } = routingRunner();
+    const orchestrator = orchestratorWith({ value: 'structured' }, runner);
+    orchestrator.loadPlan([createTask({ id: 't1', order: 1, title: 'Only', prompt: 'do it' })]);
+    await orchestrator.forceStartTask('t1');
+    sessions[0].emitExit(1);
+    await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('failed'));
+
+    await orchestrator.retryTask('t1');
+    await orchestrator.runTask('t1');
+    await settle();
+
+    expect(requests.map((r) => r.attempt)).toEqual([1, 2]);
+  });
+
+  it('passes a task on a done call, and hands its summary to dependents', async () => {
+    const { runner, sessions } = routingRunner();
+    const orchestrator = orchestratorWith({ value: 'structured' }, runner);
+    orchestrator.loadPlan([createTask({ id: 't1', order: 1, title: 'Only', prompt: 'do it', completionMarker: 'mk-1' })]);
+    await orchestrator.forceStartTask('t1');
+    const session = sessions[0] as FakeStructuredSession;
+    session.emitOutput('a screen of work\n');
+
+    session.reportComplete({ status: 'done', summary: 'Added the parser and its tests.' });
+    await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('completed'));
+
+    const task = orchestrator.storeInstance.get('t1')!;
+    expect(task.verdict?.checks[0].name).toBe('task_complete');
+    expect(task.outputSummary?.logTail).toBe('Added the parser and its tests.');
+    expect(runner.stop).toHaveBeenCalledWith('s1');
+  });
+
+  it('fails a task on a blocked call, saying why', async () => {
+    const { runner, sessions } = routingRunner();
+    const orchestrator = orchestratorWith({ value: 'structured' }, runner);
+    orchestrator.loadPlan([createTask({ id: 't1', order: 1, title: 'Only', prompt: 'do it', completionMarker: 'mk-1' })]);
+    await orchestrator.forceStartTask('t1');
+
+    (sessions[0] as FakeStructuredSession).reportComplete({ status: 'blocked', summary: 'Nothing changed.', reason: 'the schema file is missing' });
+    await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('failed'));
+
+    expect(orchestrator.storeInstance.get('t1')!.verdict?.reason).toContain('the schema file is missing');
+  });
+});

@@ -1,6 +1,3 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
 import type { SubagentOutcome } from '../../models/Task';
 import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
@@ -8,7 +5,7 @@ import { claudeThinkingArgs } from '../../plugins/resolveArgs';
 import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter, TaskStartOptions } from './AgentAdapter';
 import { StdioAgentAdapter, type SpawnSpec } from './StdioAgentAdapter';
 import { markedLines, structuredPatchText } from './fileDiff';
-import { ORDEWELL_MCP_SERVER_NAME, PLANNER_TOOLS, type McpClientConfig } from '../mcp';
+import { ORDEWELL_MCP_SERVER_NAME, PLANNER_TOOLS, ownerOnlyConfigFile, type McpClientConfig, type OwnerOnlyFile } from '../mcp';
 
 /**
  * Tools a planning Claude Code session may use. `--permission-mode plan`
@@ -132,6 +129,9 @@ interface ClaudeLine {
   summary?: string;
 }
 
+/** The Ordewell tools a task calls (ADR-0022), without the `mcp__<server>__` prefix Claude Code names them by. */
+const ORDEWELL_TASK_TOOLS = ['task_complete', 'checkpoint'];
+
 /** The tool Claude Code delegates to a subagent with — `Task` before it was renamed `Agent`. */
 const SUBAGENT_TOOLS = new Set(['Agent', 'Task']);
 
@@ -206,8 +206,6 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
   private controlCount = 0;
   /** Control requests sent and not yet answered, by request id. */
   private readonly pendingControl = new Map<string, (response: ControlResponse | null) => void>();
-  /** Holds the planner's MCP configuration, which carries its token; removed with the process. */
-  private mcpConfigDir: string | null = null;
   /** An interrupt was sent during the current turn, so an aborted result is that interrupt, not a failure. */
   private interruptRequested = false;
   /** A task's tool requests still waiting for an answer, by request id, with what the answer echoes back. */
@@ -246,6 +244,10 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
   private requestedMode: string | null = null;
   /** The session `--resume` asked for, until the CLI's `init` shows it was taken up. */
   private pendingResume: string | null = null;
+  /** The `--mcp-config` file of the running process, which holds its token; removed with the process. */
+  private mcpConfig: OwnerOnlyFile | null = null;
+  /** `mcp__ordewell__`, once this process was given the server. */
+  private ordewellToolPrefix: string | null = null;
 
   protected spawnSpec(opts: AgentStartOptions): SpawnSpec {
     if (opts.kind === 'task') return this.taskSpawnSpec(opts);
@@ -256,12 +258,7 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
       '--disallowedTools', DISALLOWED_TOOLS.join(','),
       '--append-system-prompt', opts.systemPrompt,
     ];
-    if (opts.mcp) {
-      args.push(
-        '--mcp-config', this.writeMcpConfig(opts.mcp),
-        '--allowedTools', PLANNER_TOOLS.map((t) => `mcp__${ORDEWELL_MCP_SERVER_NAME}__${t.name}`).join(','),
-      );
-    }
+    if (opts.mcp) args.push(...this.ordewellServerArgs(opts.mcp, PLANNER_TOOLS.map((t) => t.name)));
     if (opts.model) args.push('--model', opts.model);
     // `adaptive` is a thinking *type*, not an effort rung: `--effort adaptive`
     // is warned about and ignored, and adaptive is the default for every model
@@ -299,24 +296,46 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
       this.reportedCostUsd = undefined;
       this.pendingResume = opts.resumeSessionId;
     }
+    if (opts.mcp) args.push(...this.ordewellServerArgs(opts.mcp, ORDEWELL_TASK_TOOLS));
     return { command: 'claude', args };
   }
 
   /**
-   * The token goes in a file only this user can read, never on the command
-   * line, where `ps` shows it to everyone on the host (ADR-0022, A5).
+   * `--mcp-config` takes a path as well as inline JSON; the path keeps the
+   * token out of the argv every local user can list (ADR-0022, A5). The file
+   * lives exactly as long as the process that reads it. `alwaysLoad` because
+   * the CLI otherwise defers MCP tools behind its tool search, and a model
+   * that has to look an Ordewell tool up first tends to go on without it.
    */
-  private writeMcpConfig(mcp: McpClientConfig): string {
-    this.mcpConfigDir = mkdtempSync(join(tmpdir(), 'ordewell-mcp-'));
-    const path = join(this.mcpConfigDir, 'mcp.json');
-    const config = { mcpServers: { [mcp.name]: { type: 'http', url: mcp.url, headers: mcp.headers } } };
-    writeFileSync(path, JSON.stringify(config), { mode: 0o600 });
-    return path;
+  private ordewellServerArgs(mcp: McpClientConfig, tools: string[]): string[] {
+    this.removeMcpConfig();
+    const config = { mcpServers: { [mcp.name]: { type: 'http', url: mcp.url, headers: mcp.headers, alwaysLoad: true } } };
+    const file = ownerOnlyConfigFile('mcp.json', JSON.stringify(config));
+    this.mcpConfig = file;
+    void this.processEnded.then(() => file.remove());
+    const prefix = `mcp__${mcp.name}__`;
+    this.ordewellToolPrefix = prefix;
+    return ['--mcp-config', file.path, '--allowedTools', tools.map((tool) => `${prefix}${tool}`).join(',')];
+  }
+
+  private removeMcpConfig(): void {
+    this.mcpConfig?.remove();
+    this.mcpConfig = null;
+  }
+
+  async start(opts: AgentStartOptions): Promise<void> {
+    try {
+      await super.start(opts);
+    } catch (err) {
+      // No process was spawned, so none will end and take the file with it.
+      this.removeMcpConfig();
+      throw err;
+    }
   }
 
   /** Asks the CLI itself, which reports `pending` until its connection attempt settles. */
   async mcpAttached(): Promise<boolean> {
-    if (!this.mcpConfigDir) return false;
+    if (!this.mcpConfig) return false;
     const deadline = Date.now() + MCP_ATTACH_TIMEOUT_MS;
     while (Date.now() < deadline) {
       const answer = await this.control({ subtype: 'mcp_status' }, deadline - Date.now());
@@ -395,9 +414,8 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
 
   dispose(): void {
     this.clearFollowOnTimer();
+    this.removeMcpConfig();
     super.dispose();
-    if (this.mcpConfigDir) rmSync(this.mcpConfigDir, { recursive: true, force: true });
-    this.mcpConfigDir = null;
   }
 
   private clearFollowOnTimer(): void {
@@ -457,12 +475,20 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
           emit({ type: 'permission_request', id, name: msg.request.tool_name ?? 'unknown', detail: JSON.stringify(input) });
           return;
         }
+        const name = msg.request.tool_name ?? 'unknown';
+        if (this.ordewellToolPrefix && name.startsWith(this.ordewellToolPrefix)) {
+          // `--allowedTools` should have settled it already. A completion that
+          // waited on a person would hold the verdict hostage (ADR-0022, S3).
+          this.writeLine({ type: 'control_response', response: { subtype: 'success', request_id: id, response: { behavior: 'allow', updatedInput: input } } });
+          emit({ type: 'permission_request', id, name, detail: JSON.stringify(input), input, decided: { decision: 'allow' } });
+          return;
+        }
         const suggestions = msg.request.permission_suggestions ?? [];
         this.openPermissions.set(id, { input, suggestions });
         emit({
           type: 'permission_request',
           id,
-          name: msg.request.tool_name ?? 'unknown',
+          name,
           detail: JSON.stringify(input),
           input,
           suggestions,
