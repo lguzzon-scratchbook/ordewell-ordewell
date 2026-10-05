@@ -214,14 +214,17 @@ describe('completing through task_complete (ADR-0022)', () => {
       createTask({ id: 't1', order: 1, title: 'Claude', prompt: 'one' }),
       createTask({ id: 't2', order: 2, title: 'Codex', prompt: 'two', assignedRunner: 'codex' }),
       createTask({ id: 't3', order: 3, title: 'OpenCode', prompt: 'three', assignedRunner: 'opencode' }),
-    ], ['claude-code', 'codex', 'opencode']);
+      createTask({ id: 't4', order: 4, title: 'Other', prompt: 'four', assignedRunner: 'other-runner' }),
+    ], ['claude-code', 'codex', 'opencode', 'other-runner']);
     await orchestrator.forceStartTask('t1');
     await orchestrator.forceStartTask('t2');
     await orchestrator.forceStartTask('t3');
+    await orchestrator.forceStartTask('t4');
 
     expect(requests[0].prompt).toContain('`task_complete`');
     expect(requests[1].prompt).toContain('`task_complete`');
-    expect(requests[2].prompt).not.toContain('task_complete');
+    expect(requests[2].prompt).toContain('`task_complete`');
+    expect(requests[3].prompt).not.toContain('task_complete');
 
     const terminal = routingRunner();
     const onTerminal = orchestratorWith({ value: 'terminal' }, terminal.runner);
