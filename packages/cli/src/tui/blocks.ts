@@ -106,6 +106,22 @@ function commandMark(block: ToolBlock): string {
   return (unsettledOutcome(block)?.paint ?? style.green)('●');
 }
 
+// One word with a slash and no scheme: a file path, whose last part is the
+// part worth keeping. A URL keeps its host instead.
+const PATH_LIKE = /^(?![a-z][a-z0-9+.-]*:\/\/)\S*\/\S*$/i;
+
+/** Cut a path from the left to `max` columns, starting at a directory boundary when one fits. */
+function truncatePath(path: string, max: number): string {
+  if (width(path) <= max) return path;
+  let tail = '';
+  for (const char of Array.from(path).reverse()) {
+    if (width(char + tail) > max - 1) break;
+    tail = char + tail;
+  }
+  const slash = tail.indexOf('/');
+  return `…${slash > 0 ? tail.slice(slash) : tail}`;
+}
+
 /**
  * `● Name(keyArg)` on one row. The argument gives way first, so the row still
  * names the tool and still closes its parenthesis. In full detail the header
@@ -119,7 +135,8 @@ function commandHeader(block: ToolBlock, cols: number, detailAll: boolean): stri
   }
   const open = `● ${name}(`;
   const room = cols - width(open) - 1;
-  const text = room > 1 ? `${open}${truncate(keyArg, room)})` : truncate(`${open}${keyArg})`, cols);
+  const cut = PATH_LIKE.test(keyArg) ? truncatePath(keyArg, room) : truncate(keyArg, room);
+  const text = room > 1 ? `${open}${cut})` : truncate(`${open}${keyArg})`, cols);
   return [`${commandMark(block)}${text.slice(1)}`];
 }
 

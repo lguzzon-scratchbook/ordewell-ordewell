@@ -167,6 +167,9 @@ async function startedTask(mode = 'agent') {
 
 const turnStarted = (id: string) => line({ method: 'turn/started', params: { threadId: 'thr-task-1', turn: { id, status: 'inProgress', items: [] } } });
 const turnCompleted = (id: string, status = 'completed') => line({ method: 'turn/completed', params: { threadId: 'thr-task-1', turn: { id, status, items: [] } } });
+type Change = { path: string; kind: { type: string; move_path?: string | null }; diff: string };
+const fileChangeStarted = (id: string, changes: Change[]) => line({ method: 'item/started', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { id, type: 'fileChange', status: 'inProgress', changes } } });
+const fileChangeDone = (id: string, status: string, changes: Change[]) => line({ method: 'item/completed', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { id, type: 'fileChange', status, changes } } });
 const threadIdle = (threadId = 'thr-task-1') => line({ method: 'thread/status/changed', params: { threadId, status: { type: 'idle' } } });
 
 describe('CodexAdapter task sandbox', () => {
@@ -498,7 +501,7 @@ describe('CodexAdapter task approvals', () => {
 });
 
 describe('CodexAdapter task channels', () => {
-  it('reports commands, file changes, usage and reply text as the planner does, with a file change as an ordinary result', async () => {
+  it('reports commands, file changes, usage and reply text as the planner does, a changed file as a row named for its change', async () => {
     const { adapter, proc } = await startedTask();
     const events: AgentEvent[] = [];
     const turn = adapter.send('fix sum', (e) => events.push(e));
@@ -508,8 +511,8 @@ describe('CodexAdapter task channels', () => {
     expect(events).toEqual([
       { type: 'tool_call', id: 'item_c1', name: 'shell', args: { command: 'npm test', cwd: '/repo' } },
       { type: 'tool_result', id: 'item_c1', name: 'shell', output: '1 failing\n', success: false },
-      { type: 'tool_call', id: 'item_f1', name: 'file_change', args: { path: '/repo/src/sum.ts' } },
-      { type: 'tool_result', id: 'item_f1', name: 'file_change', output: '-return a - b;\n+return a + b;\n', success: true },
+      { type: 'tool_call', id: 'item_f1', name: 'Update', args: { path: 'src/sum.ts' } },
+      { type: 'tool_result', id: 'item_f1', name: 'Update', output: '-return a - b;\n+return a + b;\n', success: true },
       { type: 'usage', record: { source: 'codex', model: 'gpt-5.5', inputTokens: 9000, outputTokens: 100, cachedInputTokens: 4000, contextWindow: 258400 } },
       { type: 'assistant_text_delta', text: 'Fixed the sign in sum.ts.\n<<<ORDE' },
       { type: 'assistant_text_delta', text: 'WELL_DONE>>>' },
@@ -520,14 +523,62 @@ describe('CodexAdapter task channels', () => {
     adapter.dispose();
   });
 
-  it('reports a declined file change as a failed result', async () => {
+  it('reports a declined file change as a failed row, announcing a change it never saw start', async () => {
     const { adapter, proc } = await startedTask();
     const events: AgentEvent[] = [];
     void adapter.send('fix sum', (e) => events.push(e));
-    proc.emitStdout(turnStarted('turn-a') + line({ method: 'item/completed', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { id: 'item_f2', type: 'fileChange', status: 'declined', changes: [{ path: '/repo/x.ts', kind: { type: 'add' }, diff: '+x' }] } } }));
+    proc.emitStdout(turnStarted('turn-a') + fileChangeDone('item_f2', 'declined', [{ path: '/repo/x.ts', kind: { type: 'add' }, diff: 'x\n' }]));
     await tick();
 
-    expect(events).toEqual([{ type: 'tool_result', id: 'item_f2', name: 'file_change', output: '+x', success: false }]);
+    expect(events).toEqual([
+      { type: 'tool_call', id: 'item_f2', name: 'Add', args: { path: 'x.ts' } },
+      { type: 'tool_result', id: 'item_f2', name: 'Add', output: '+x\n', success: false },
+    ]);
+    adapter.dispose();
+  });
+
+  it('gives each file of a patch its own row, the first under the item\'s id so its approval still points at it', async () => {
+    const changes = [
+      { path: '/repo/src/new.ts', kind: { type: 'add' }, diff: 'export const a = 1;\n' },
+      { path: '/repo/src/sum.ts', kind: { type: 'update', move_path: null }, diff: '@@ -1 +1 @@\n-a - b\n+a + b\n' },
+      { path: '/repo/old.ts', kind: { type: 'delete' }, diff: 'gone\nfor good\n' },
+    ];
+    const { adapter, events } = await openTurn([fileChangeStarted('item_f1', changes), fileChangeDone('item_f1', 'completed', changes)]);
+
+    expect(events).toEqual([
+      { type: 'tool_call', id: 'item_f1', name: 'Add', args: { path: 'src/new.ts' } },
+      { type: 'tool_call', id: 'item_f1:src/sum.ts', name: 'Update', args: { path: 'src/sum.ts' } },
+      { type: 'tool_call', id: 'item_f1:old.ts', name: 'Delete', args: { path: 'old.ts' } },
+      { type: 'tool_result', id: 'item_f1', name: 'Add', output: '+export const a = 1;\n', success: true },
+      { type: 'tool_result', id: 'item_f1:src/sum.ts', name: 'Update', output: '@@ -1 +1 @@\n-a - b\n+a + b\n', success: true },
+      { type: 'tool_result', id: 'item_f1:old.ts', name: 'Delete', output: '-gone\n-for good\n', success: true },
+    ]);
+    adapter.dispose();
+  });
+
+  it('settles each file by its path, whatever order the completed item lists them in', async () => {
+    const a = { path: '/repo/a.ts', kind: { type: 'update', move_path: null }, diff: '-a\n+A\n' };
+    const b = { path: '/repo/b.ts', kind: { type: 'update', move_path: null }, diff: '-b\n+B\n' };
+    const { adapter, events } = await openTurn([fileChangeStarted('item_f1', [a, b]), fileChangeDone('item_f1', 'completed', [b, a])]);
+
+    expect(events.filter((e) => e.type === 'tool_result')).toEqual([
+      { type: 'tool_result', id: 'item_f1:b.ts', name: 'Update', output: '-b\n+B\n', success: true },
+      { type: 'tool_result', id: 'item_f1', name: 'Update', output: '-a\n+A\n', success: true },
+    ]);
+    adapter.dispose();
+  });
+
+  it('names a move by both paths, and keeps a path outside the worktree whole', async () => {
+    const changes = [
+      { path: '/repo/src/a.ts', kind: { type: 'update', move_path: '/repo/lib/a.ts' }, diff: '' },
+      { path: '/etc/hosts', kind: { type: 'update', move_path: null }, diff: '+127.0.0.1 x\n' },
+    ];
+    const { adapter, events } = await openTurn([fileChangeStarted('item_f1', changes)]);
+
+    expect(events).toEqual([
+      { type: 'tool_call', id: 'item_f1', name: 'Update', args: { path: 'src/a.ts → lib/a.ts' } },
+      { type: 'tool_call', id: 'item_f1:/etc/hosts', name: 'Update', args: { path: '/etc/hosts' } },
+    ]);
     adapter.dispose();
   });
 });
@@ -601,7 +652,7 @@ describe('a Codex task on the structured transport', () => {
 
     const [turnStart] = sentNamed(spawned.processes[0].written, 'turn/start');
     expect(turnStart.params).toEqual({ threadId: 'thr-task-1', input: [{ type: 'text', text: 'Fix sum' }], effort: 'high' });
-    expect(session.getOutput()).toBe('› shell(npm test)\n› file_change(/repo/src/sum.ts)\nFixed the sign in sum.ts.\n<<<ORDEWELL_DONE>>>\n');
+    expect(session.getOutput()).toBe('› shell(npm test)\n› Update(src/sum.ts)\nFixed the sign in sum.ts.\n<<<ORDEWELL_DONE>>>\n');
     expect(chunks.some((chunk) => chunk.includes('<<<ORDEWELL_DONE>>>'))).toBe(true);
     expect(session.nativeSessionId()).toBe('thr-task-1');
     session.kill();
