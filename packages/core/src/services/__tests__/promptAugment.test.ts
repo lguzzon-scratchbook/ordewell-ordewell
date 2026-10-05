@@ -404,6 +404,33 @@ describe('composeAugmentedPrompt', () => {
   });
 });
 
+describe('the completion instruction where the task_complete tool is given (ADR-0022)', () => {
+  const a = createTask({ id: 'a', order: 1, title: 'A', prompt: 'do work', completionMarker: 'mk-tool' });
+  const b = createTask({ id: 'b', order: 2, title: 'B', prompt: 'pb' });
+
+  it('asks for the tool call first, and for the marker in two halves as the fallback', () => {
+    const out = composeAugmentedPrompt(a, [a, b], { completionTool: true });
+
+    expect(out).toContain('call the `task_complete` tool with status `done`');
+    expect(out).toContain('`blocked` or `failed`');
+    expect(out.indexOf('task_complete')).toBeLessThan(out.indexOf('DONE_mk-tool>>>'));
+    expect(out).toContain('`<<<ORDEWELL_` immediately followed by `DONE_mk-tool>>>`');
+    expect(out).not.toContain('<<<ORDEWELL_DONE_mk-tool>>>');
+  });
+
+  it('names no tool where none is given', () => {
+    expect(composeAugmentedPrompt(a, [a, b])).not.toContain('task_complete');
+    expect(composeContinuationPrompt(a, 'go on')).not.toContain('task_complete');
+  });
+
+  it('asks a continued task for the tool call too', () => {
+    const out = composeContinuationPrompt(a, 'go on', { completionTool: true });
+
+    expect(out).toContain('call the `task_complete` tool with status `done`');
+    expect(out).toContain('`<<<ORDEWELL_` immediately followed by `DONE_mk-tool>>>`');
+  });
+});
+
 describe('composeContinuationPrompt (ADR-0018, K1)', () => {
   const task = createTask({ id: 't1', order: 1, title: 'Parse JSON', prompt: 'ORIGINAL PROMPT BODY', completionMarker: 'mk-1' });
 

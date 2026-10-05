@@ -158,7 +158,7 @@ describe('StructuredRunner spawn', () => {
     session.kill();
   });
 
-  it('builds the full command line: protocol, mode, effort from the manifest, model and resume', async () => {
+  it('builds the full command line: protocol, mode, effort from the manifest, model, resume and the Ordewell server', async () => {
     const { runner, spawned } = harness([]);
     const session = await runner.spawn(options({ thinkingEffort: 'high', resumeSessionId: 'sess-prev' }));
     expect(spawned.lastArgs()).toEqual([
@@ -173,6 +173,8 @@ describe('StructuredRunner spawn', () => {
       '--thinking', 'enabled', '--effort', 'high',
       '--model', 'sonnet',
       '--resume', 'sess-prev',
+      '--mcp-config', expect.stringMatching(/mcp\.json$/),
+      '--allowedTools', 'mcp__ordewell__task_complete,mcp__ordewell__checkpoint',
     ]);
     session.kill();
   });
@@ -187,7 +189,7 @@ describe('StructuredRunner spawn', () => {
     const session = await runner.spawn(options({ thinkingEffort, modelId }));
     const args = spawned.lastArgs();
     const from = args.indexOf('--disallowedTools') + 2;
-    const to = modelId ? args.indexOf('--model') : args.length;
+    const to = args.indexOf(modelId ? '--model' : '--mcp-config');
     expect(args.slice(from, to)).toEqual(expected);
     session.kill();
   });

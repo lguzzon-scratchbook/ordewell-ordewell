@@ -2,6 +2,7 @@ import type { SpawnFn } from '../HeadlessRunner';
 import type { SubagentOutcome } from '../../models/Task';
 import type { UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
+import type { McpClientConfig } from '../mcp/clientConfig';
 
 
 /**
@@ -122,6 +123,12 @@ export interface TaskStartOptions extends AgentStartCommon {
   /** The task's runner mode id, as the plan names it. */
   mode: string;
   flags: TaskRunnerFlags;
+  /**
+   * The Ordewell MCP server and this attempt's token (ADR-0022). An adapter
+   * that can inject it does, with its tools pre-approved; one that cannot
+   * ignores it, and the task completes by its marker.
+   */
+  mcp?: McpClientConfig;
 }
 
 /**

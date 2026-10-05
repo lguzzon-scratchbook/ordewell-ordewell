@@ -5,6 +5,7 @@ import { claudeThinkingArgs } from '../../plugins/resolveArgs';
 import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter, TaskStartOptions } from './AgentAdapter';
 import { StdioAgentAdapter, type SpawnSpec } from './StdioAgentAdapter';
 import { markedLines, structuredPatchText } from './fileDiff';
+import { ownerOnlyConfigFile, type McpClientConfig, type OwnerOnlyFile } from '../mcp/clientConfig';
 
 /**
  * Tools a planning Claude Code session may use. `--permission-mode plan`
@@ -111,6 +112,9 @@ interface ClaudeLine {
   status?: string;
   summary?: string;
 }
+
+/** The Ordewell tools a task calls (ADR-0022), without the `mcp__<server>__` prefix Claude Code names them by. */
+const ORDEWELL_TASK_TOOLS = ['task_complete', 'checkpoint'];
 
 /** The tool Claude Code delegates to a subagent with — `Task` before it was renamed `Agent`. */
 const SUBAGENT_TOOLS = new Set(['Agent', 'Task']);
@@ -224,6 +228,10 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
   private requestedMode: string | null = null;
   /** The session `--resume` asked for, until the CLI's `init` shows it was taken up. */
   private pendingResume: string | null = null;
+  /** The `--mcp-config` file of the running process, which holds its token. */
+  private mcpConfig: OwnerOnlyFile | null = null;
+  /** `mcp__ordewell__`, once this task's process was given the server. */
+  private ordewellToolPrefix: string | null = null;
 
   protected spawnSpec(opts: AgentStartOptions): SpawnSpec {
     if (opts.kind === 'task') return this.taskSpawnSpec(opts);
@@ -271,7 +279,41 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
       this.reportedCostUsd = undefined;
       this.pendingResume = opts.resumeSessionId;
     }
+    if (opts.mcp) args.push(...this.ordewellServerArgs(opts.mcp));
     return { command: 'claude', args };
+  }
+
+  /**
+   * `--mcp-config` takes a path as well as inline JSON; the path keeps the
+   * token out of the argv every local user can list (ADR-0022, A5). The file
+   * lives exactly as long as the process that reads it. `alwaysLoad` because
+   * the CLI otherwise defers MCP tools behind its tool search, and a model
+   * that has to look task_complete up first tends to finish without it.
+   */
+  private ordewellServerArgs(mcp: McpClientConfig): string[] {
+    this.removeMcpConfig();
+    const config = { mcpServers: { [mcp.name]: { type: 'http', url: mcp.url, headers: mcp.headers, alwaysLoad: true } } };
+    const file = ownerOnlyConfigFile('mcp.json', JSON.stringify(config));
+    this.mcpConfig = file;
+    void this.processEnded.then(() => file.remove());
+    const prefix = `mcp__${mcp.name}__`;
+    this.ordewellToolPrefix = prefix;
+    return ['--mcp-config', file.path, '--allowedTools', ORDEWELL_TASK_TOOLS.map((tool) => `${prefix}${tool}`).join(',')];
+  }
+
+  private removeMcpConfig(): void {
+    this.mcpConfig?.remove();
+    this.mcpConfig = null;
+  }
+
+  async start(opts: AgentStartOptions): Promise<void> {
+    try {
+      await super.start(opts);
+    } catch (err) {
+      // No process was spawned, so none will end and take the file with it.
+      this.removeMcpConfig();
+      throw err;
+    }
   }
 
   /**
@@ -335,6 +377,7 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
 
   dispose(): void {
     this.clearFollowOnTimer();
+    this.removeMcpConfig();
     super.dispose();
   }
 
@@ -395,12 +438,20 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
           emit({ type: 'permission_request', id, name: msg.request.tool_name ?? 'unknown', detail: JSON.stringify(input) });
           return;
         }
+        const name = msg.request.tool_name ?? 'unknown';
+        if (this.ordewellToolPrefix && name.startsWith(this.ordewellToolPrefix)) {
+          // `--allowedTools` should have settled it already. A completion that
+          // waited on a person would hold the verdict hostage (ADR-0022, S3).
+          this.writeLine({ type: 'control_response', response: { subtype: 'success', request_id: id, response: { behavior: 'allow', updatedInput: input } } });
+          emit({ type: 'permission_request', id, name, detail: JSON.stringify(input), input, decided: { decision: 'allow' } });
+          return;
+        }
         const suggestions = msg.request.permission_suggestions ?? [];
         this.openPermissions.set(id, { input, suggestions });
         emit({
           type: 'permission_request',
           id,
-          name: msg.request.tool_name ?? 'unknown',
+          name,
           detail: JSON.stringify(input),
           input,
           suggestions,

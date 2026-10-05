@@ -1,7 +1,7 @@
 import type { ITerminalRunner, ITerminalSession, RunnerTransport } from '../interfaces/ITerminalRunner';
 import type { RunnerRegistry } from '../plugins/RunnerRegistry';
 import type { RunnerSpawnOptions } from './AbstractRunner';
-import { supportsTaskMode } from './harness/taskAdapters';
+import { supportsTaskMode, takesOrdewellTools } from './harness/taskAdapters';
 
 export interface TransportRoute {
   transport: RunnerTransport;
@@ -19,6 +19,14 @@ export function routeTransport(requested: RunnerTransport | undefined, runner: s
   if (supportsTaskMode(runner)) return { transport: 'structured' };
   const name = registry?.get(runner)?.manifest.displayName ?? runner;
   return { transport: 'terminal', fallback: `no structured connector for ${name} yet` };
+}
+
+/**
+ * Whether a task routed this way is given the `task_complete` tool (ADR-0022):
+ * on the structured transport, by a connector that injects the server.
+ */
+export function givesCompletionTool(requested: RunnerTransport | undefined, runner: string, registry?: RunnerRegistry | null): boolean {
+  return routeTransport(requested, runner, registry).transport === 'structured' && takesOrdewellTools(runner);
 }
 
 /**

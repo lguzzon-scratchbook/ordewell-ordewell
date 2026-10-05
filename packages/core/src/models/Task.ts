@@ -11,7 +11,7 @@ export interface UserStep {
 
 /** One deterministic signal gathered while verifying a completed task. */
 export interface VerificationCheck {
-  name: 'exit_code' | 'completion_marker' | 'manual';
+  name: 'exit_code' | 'completion_marker' | 'task_complete' | 'manual';
   passed: boolean;
   /** A check that did not apply. Skipped checks don't affect the verdict. */
   skipped: boolean;

@@ -1,6 +1,7 @@
 import type { Task, Verdict, VerificationCheck } from '../models/Task';
 import { isStructuredSession, type ITerminalSession } from '../interfaces/ITerminalRunner';
 import { flattenTerminalOutput, renderTerminalOutput } from './terminalRender';
+import type { TaskCompleteArgs } from './mcp/tools';
 
 export type VerdictListener = (taskId: string, verdict: Verdict) => void;
 export type CheckpointListener = (taskId: string, summary: string) => void;
@@ -155,9 +156,12 @@ export class VerdictEngine {
    * Attach to a spawned session: scan the output tail for the task's completion
    * marker (delivering a verdict immediately while leaving interactive sessions
    * open), scan for checkpoint markers, and on exit produce a failed verdict
-   * when the marker was never observed.
+   * when the marker was never observed. A structured session's `task_complete`
+   * call is evidence too (ADR-0022, V2): whichever signal comes first decides.
+   *
+   * Returns the attempt's generation, what {@link signalComplete} is checked against.
    */
-  watch(task: Task, session: ITerminalSession): void {
+  watch(task: Task, session: ITerminalSession): number {
     const doneToken = `<<<ORDEWELL_DONE_${task.completionMarker}>>>`;
     const gen = this.bumpGeneration(task.id);
     this.markerTails.set(task.id, '');
@@ -189,6 +193,7 @@ export class VerdictEngine {
         else if (event.type === 'permission_request' && !event.decided) this.approvalOpened(task.id, event.id);
         else if (event.type === 'permission_decided' || event.type === 'permission_withdrawn') this.approvalClosed(task.id, event.id, gen);
       });
+      session.onTaskComplete((report) => this.signalComplete(task.id, gen, report));
     }
     session.onExit((exitCode: number) => {
       if (this.generations.get(task.id) !== gen) return;
@@ -199,6 +204,20 @@ export class VerdictEngine {
       const verdict = this.decide(task, exitCode);
       for (const l of this.listeners) l(task.id, verdict);
     });
+    return gen;
+  }
+
+  /**
+   * The runner's own `task_complete` call (ADR-0022, V1/V3): settles the
+   * attempt exactly as the marker does, unless that attempt is no longer the
+   * task's current one or another signal already settled it.
+   */
+  signalComplete(taskId: string, generation: number, report: TaskCompleteArgs): void {
+    if (this.generations.get(taskId) !== generation) return;
+    this.forget(taskId);
+    this.bumpGeneration(taskId);
+    const verdict = reportedVerdict(report);
+    for (const l of this.listeners) l(taskId, verdict);
   }
 
   private approvalOpened(taskId: string, approvalId: string): void {
@@ -333,4 +352,27 @@ export class VerdictEngine {
       decidedAt: new Date().toISOString(),
     };
   }
+}
+
+function reportedVerdict(report: TaskCompleteArgs): Verdict {
+  const checks: VerificationCheck[] = [
+    {
+      name: 'task_complete',
+      passed: report.status === 'done',
+      skipped: false,
+      detail: `the runner called task_complete with status "${report.status}"`,
+    },
+    {
+      name: 'completion_marker',
+      passed: report.status === 'done',
+      skipped: true,
+      detail: 'bypassed — the runner reported through task_complete',
+    },
+  ];
+  const decidedAt = new Date().toISOString();
+  if (report.status === 'done') {
+    return { outcome: 'pass', reason: 'Verified: the runner reported completion through task_complete. Task completed successfully.', checks, decidedAt };
+  }
+  const why = report.reason?.trim() || 'no reason given';
+  return { outcome: 'fail', reason: `The runner reported the task ${report.status}: ${why}`, checks, decidedAt };
 }

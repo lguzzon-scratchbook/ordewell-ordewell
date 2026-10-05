@@ -2,6 +2,7 @@ import type { IConfig } from './interfaces/IConfig';
 import type { IFileSystem, ToolOutcome } from './interfaces/IFileSystem';
 import type { ITerminalSession, QueuedTaskMessage, StructuredEvent, StructuredSessionCapability, StructuredTurnEnd } from './interfaces/ITerminalRunner';
 import type { ApprovalDecision } from './interfaces/IApproval';
+import type { TaskCompleteArgs } from './services/mcp/tools';
 import type {
   IsolationAvailability,
   IsolationHandoff,
@@ -125,6 +126,7 @@ export class FakeStructuredSession extends FakeTerminalSession implements Struct
   private messageCount = 0;
   private turnEndCbs: Array<(reason: StructuredTurnEnd) => void> = [];
   private eventCbs: Array<(event: StructuredEvent) => void> = [];
+  private completeCbs: Array<(report: TaskCompleteArgs) => void> = [];
 
   constructor(id = 's1', taskId = 't1', public sessionId: string | null = 'native-1') {
     super(id, taskId);
@@ -139,6 +141,11 @@ export class FakeStructuredSession extends FakeTerminalSession implements Struct
   turnState(): 'working' | 'idle' { return this.state; }
   onTurnEnd(cb: (reason: StructuredTurnEnd) => void): void { this.turnEndCbs.push(cb); }
   onEvent(cb: (event: StructuredEvent) => void): void { this.eventCbs.push(cb); }
+  onTaskComplete(cb: (report: TaskCompleteArgs) => void): void { this.completeCbs.push(cb); }
+  /** The runner calls `task_complete`, as `StructuredSession` relays it. */
+  reportComplete(report: TaskCompleteArgs): void {
+    for (const cb of this.completeCbs) cb(report);
+  }
   sendMessage(text: string): string {
     this.messageCount += 1;
     const id = `msg-${this.messageCount}`;

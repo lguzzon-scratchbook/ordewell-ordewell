@@ -1,4 +1,5 @@
 import type { AgentEvent } from '../services/harness/AgentAdapter';
+import type { TaskCompleteArgs } from '../services/mcp/tools';
 import type { ApprovalDecision } from './IApproval';
 
 export interface ITerminalSession {
@@ -94,6 +95,11 @@ export interface StructuredSessionCapability {
    * when it is no longer open — answered, withdrawn, or never asked.
    */
   answerPermission(id: string, decision: ApprovalDecision): boolean;
+  /**
+   * The runner's `task_complete` calls on this attempt's token (ADR-0022):
+   * completion evidence beside the marker, for `VerdictEngine` to weigh.
+   */
+  onTaskComplete(listener: (report: TaskCompleteArgs) => void): void;
 }
 
 export function isStructuredSession(session: ITerminalSession): session is ITerminalSession & StructuredSessionCapability {
@@ -139,6 +145,11 @@ export interface ITerminalRunner {
      * which is why a continue refuses one.
      */
     resumeSessionId?: string;
+    /**
+     * Which run of the task this is, from 1. A structured runner binds the
+     * attempt's MCP token to it (ADR-0022, A2).
+     */
+    attempt?: number;
   }): Promise<ITerminalSession>;
 
   stop(sessionId: string): void;

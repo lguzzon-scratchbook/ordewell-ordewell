@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { existsSync, readFileSync, statSync } from 'fs';
 import { ClaudeCodeAdapter } from '../harness/ClaudeCodeAdapter';
 import { CodexAdapter } from '../harness/CodexAdapter';
 import { OpenCodeAdapter } from '../harness/OpenCodeAdapter';
@@ -6,6 +7,7 @@ import { TaskModeUnsupportedError, type AgentEvent, type AgentProcessDeps, type 
 import { supportsTaskMode, createTaskAdapter } from '../harness/taskAdapters';
 import { resolveArgs, resolveTaskRunnerFlags } from '../../plugins/resolveArgs';
 import { CLAUDE_CODE_MANIFEST } from '../../plugins/builtin/claude-code.manifest';
+import { mcpClientConfig } from '../mcp';
 import { fakeSpawn, fixture, type ScriptedReply } from './harnessTestKit';
 
 /**
@@ -577,5 +579,97 @@ describe('ClaudeCodeAdapter in task mode', () => {
     spawned.processes[0].exit(3);
     await tick();
     expect(codes).toEqual([3]);
+  });
+});
+
+describe('ClaudeCodeAdapter with the Ordewell MCP server (ADR-0022)', () => {
+  const mcp = mcpClientConfig({ url: 'http://127.0.0.1:4555/mcp', token: 'tok-secret' });
+
+  function configPath(args: string[]): string {
+    expect(args.filter((arg) => arg === '--mcp-config')).toHaveLength(1);
+    return args[args.indexOf('--mcp-config') + 1];
+  }
+
+  it('hands the server to the CLI in an owner-only file, its tools loaded up front and pre-approved', async () => {
+    const { spawned, processDeps } = deps([]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskStart({ mcp }));
+    const args = spawned.lastArgs();
+
+    const path = configPath(args);
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({
+      mcpServers: { ordewell: { type: 'http', url: 'http://127.0.0.1:4555/mcp', headers: { Authorization: 'Bearer tok-secret' }, alwaysLoad: true } },
+    });
+    if (process.platform !== 'win32') expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(args.some((arg) => arg.includes('tok-secret'))).toBe(false);
+    expect(args.flatMap((arg, i) => (arg === '--allowedTools' ? [args[i + 1]] : []))).toEqual(['mcp__ordewell__task_complete,mcp__ordewell__checkpoint']);
+    adapter.dispose();
+  });
+
+  it('removes the file once the process is gone', async () => {
+    const { spawned, processDeps } = deps([]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskStart({ mcp }));
+    const path = configPath(spawned.lastArgs());
+
+    spawned.processes[0].exit(0);
+
+    await until(() => !existsSync(path));
+    adapter.dispose();
+  });
+
+  it('removes the file when disposed', async () => {
+    const { spawned, processDeps } = deps([]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskStart({ mcp }));
+    const path = configPath(spawned.lastArgs());
+
+    adapter.dispose();
+
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it('allows a request for an Ordewell tool itself, so it never waits on a person', async () => {
+    const request = {
+      type: 'control_request',
+      request_id: 'req-1',
+      request: { subtype: 'can_use_tool', tool_name: 'mcp__ordewell__task_complete', input: { status: 'done', summary: 'ok' }, tool_use_id: 'tu-1' },
+    };
+    const { spawned, processDeps } = deps([`${JSON.stringify(request)}\n`]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskStart({ mcp, flags: { permissionMode: 'default', modeSettings: {} }, mode: 'default' }));
+    const events: AgentEvent[] = [];
+    void adapter.send('Do it', (e) => events.push(e));
+    await until(() => spawned.processes[0].written.length === 2);
+
+    expect(JSON.parse(spawned.processes[0].written[1])).toEqual({
+      type: 'control_response',
+      response: { subtype: 'success', request_id: 'req-1', response: { behavior: 'allow', updatedInput: { status: 'done', summary: 'ok' } } },
+    });
+    expect(events.find((e) => e.type === 'permission_request')).toMatchObject({
+      id: 'req-1',
+      name: 'mcp__ordewell__task_complete',
+      decided: { decision: 'allow' },
+    });
+    expect(adapter.answerPermission('req-1', { decision: 'deny' })).toBe(false);
+    adapter.dispose();
+  });
+
+  it('still asks about another server\'s tool', async () => {
+    const request = {
+      type: 'control_request',
+      request_id: 'req-2',
+      request: { subtype: 'can_use_tool', tool_name: 'mcp__ordewellx__task_complete', input: {} },
+    };
+    const { spawned, processDeps } = deps([`${JSON.stringify(request)}\n`]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskStart({ mcp, flags: { permissionMode: 'default', modeSettings: {} }, mode: 'default' }));
+    const events: AgentEvent[] = [];
+    void adapter.send('Do it', (e) => events.push(e));
+    await until(() => events.some((e) => e.type === 'permission_request'));
+
+    expect(events.find((e) => e.type === 'permission_request')).not.toHaveProperty('decided');
+    expect(spawned.processes[0].written).toHaveLength(1);
+    adapter.dispose();
   });
 });

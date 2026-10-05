@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { VerdictEngine } from '../VerdictEngine';
 import { composeAugmentedPrompt } from '../promptAugment';
-import { createTask, type Task } from '../../models/Task';
+import { createTask, type Task, type Verdict } from '../../models/Task';
 import { FakeStructuredSession, flushMicrotasks } from '../../testing';
 
 const buildTask = (extra: Partial<Task> = {}): Task =>
@@ -381,6 +381,86 @@ describe('VerdictEngine', () => {
       engine.approveCheckpoint('t1');
       const log = (session as unknown as { _writeLog: string[] })._writeLog;
       expect(log.some((s: string) => s.includes('ORDEWELL_CONTINUE'))).toBe(false);
+    });
+  });
+
+  describe('task_complete (ADR-0022)', () => {
+    function watched() {
+      const engine = new VerdictEngine();
+      const verdicts: Array<{ taskId: string; verdict: Verdict }> = [];
+      engine.onVerdict((taskId, verdict) => verdicts.push({ taskId, verdict }));
+      const session = new FakeStructuredSession();
+      const attempt = engine.watch(buildTask(), session);
+      return { engine, verdicts, session, attempt };
+    }
+
+    it('passes on a done call, with the call named as the evidence', () => {
+      const { verdicts, session } = watched();
+
+      session.reportComplete({ status: 'done', summary: 'Added the endpoint.' });
+
+      expect(verdicts).toHaveLength(1);
+      expect(verdicts[0].taskId).toBe('t1');
+      expect(verdicts[0].verdict.outcome).toBe('pass');
+      expect(verdicts[0].verdict.checks.map((c) => [c.name, c.passed, c.skipped])).toEqual([
+        ['task_complete', true, false],
+        ['completion_marker', true, true],
+      ]);
+    });
+
+    it('fails a blocked or failed call with the runner\'s reason', () => {
+      for (const status of ['blocked', 'failed'] as const) {
+        const { verdicts, session } = watched();
+
+        session.reportComplete({ status, summary: 'Stopped early.', reason: 'the API key is missing' });
+
+        expect(verdicts).toHaveLength(1);
+        expect(verdicts[0].verdict.outcome).toBe('fail');
+        expect(verdicts[0].verdict.reason).toContain(status);
+        expect(verdicts[0].verdict.reason).toContain('the API key is missing');
+      }
+    });
+
+    it('ignores a call for an attempt that is no longer the task\'s current one', () => {
+      const { engine, verdicts, attempt } = watched();
+      const next = engine.watch(buildTask(), new FakeStructuredSession('s2'));
+
+      engine.signalComplete('t1', attempt, { status: 'done', summary: 'old' });
+      expect(verdicts).toEqual([]);
+
+      engine.signalComplete('t1', next, { status: 'done', summary: 'new' });
+      expect(verdicts).toHaveLength(1);
+    });
+
+    it('ignores a call after the attempt was cleared', () => {
+      const { engine, verdicts, session } = watched();
+      engine.clear(buildTask());
+
+      session.reportComplete({ status: 'done', summary: 'late' });
+
+      expect(verdicts).toEqual([]);
+    });
+
+    it('gives one verdict when the marker comes first and the call after it', () => {
+      const { verdicts, session } = watched();
+
+      session.emitOutput('<<<ORDEWELL_DONE_mk-1>>>\n');
+      session.reportComplete({ status: 'failed', summary: 'x', reason: 'second thoughts' });
+      session.emitExit(1);
+
+      expect(verdicts.map((v) => v.verdict.outcome)).toEqual(['pass']);
+      expect(verdicts[0].verdict.checks[0].name).toBe('completion_marker');
+    });
+
+    it('gives one verdict when the call comes first and the marker after it', () => {
+      const { verdicts, session } = watched();
+
+      session.reportComplete({ status: 'blocked', summary: 'x', reason: 'needs a decision' });
+      session.emitOutput('<<<ORDEWELL_DONE_mk-1>>>\n');
+      session.emitExit(0);
+
+      expect(verdicts.map((v) => v.verdict.outcome)).toEqual(['fail']);
+      expect(verdicts[0].verdict.checks[0].name).toBe('task_complete');
     });
   });
 
