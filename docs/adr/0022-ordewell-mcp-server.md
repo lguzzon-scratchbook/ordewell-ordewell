@@ -271,3 +271,4 @@ planner tools are recorded here as an explicit entry against both:
 
 - 2026-10-05 — proposed.
 - 2026-10-05 — V5 amended: checked against Claude Code 2.1.289, its hard cap on a tool call is 1e8 ms, but an HTTP call silent for 300s is aborted. Progress notifications reset that, so the server heartbeats instead of the configuration raising a timeout.
+- 2026-10-05 — Codex checked against 0.160.0: the server is injected per thread (`mcp_servers.ordewell` in the thread config, token read from the environment), pre-authorized with `default_tools_approval_mode = "approve"`; a 200s `checkpoint` call survives on the heartbeat with no timeout raised. Codex keeps MCP tools out of the model's tool list, so a task thread's instructions say where to find them.

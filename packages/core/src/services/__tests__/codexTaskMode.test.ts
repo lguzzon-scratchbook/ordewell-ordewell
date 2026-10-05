@@ -6,6 +6,8 @@ import { CODEX_MANIFEST } from '../../plugins/builtin/codex.manifest';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { StructuredRunner } from '../StructuredRunner';
 import { isStructuredSession, type StructuredEvent } from '../../interfaces/ITerminalRunner';
+import { mcpClientConfig } from '../mcp';
+import { takesOrdewellTools } from '../harness/taskAdapters';
 import { fakeSpawn, fixture, type FakeSpawnOptions, type ScriptedReply } from './harnessTestKit';
 
 /**
@@ -675,5 +677,177 @@ describe('a Codex task on the structured transport', () => {
     expect(session.answerPermission(id, { decision: 'allowForTask' })).toBe(true);
     expect(answerTo(proc, 0)).toEqual({ jsonrpc: '2.0', id: 0, result: { decision: 'acceptForSession' } });
     session.kill();
+  });
+});
+
+describe('CodexAdapter with the Ordewell MCP server (ADR-0022)', () => {
+  const mcp = mcpClientConfig({ url: 'http://127.0.0.1:4555/mcp', token: 'tok-secret' });
+  const plannerHandshake = (): ScriptedReply[] => [fixture('codex', 'handshake'), fixture('codex', 'new-conversation')];
+  const ordewellServer = {
+    url: 'http://127.0.0.1:4555/mcp',
+    env_http_headers: { Authorization: 'ORDEWELL_MCP_TOKEN_0' },
+    default_tools_approval_mode: 'approve',
+  };
+  const startup = (status: string) => line({ method: 'mcpServer/startupStatus/updated', params: { name: 'ordewell', status, threadId: 'thr-task-1' } });
+
+  it('gives a task thread the server, pre-approved, with the token in the environment and nowhere else', async () => {
+    const { spawned, processDeps } = deps(handshake());
+    const adapter = new CodexAdapter(processDeps);
+    await adapter.start(taskStart('agent', { mcp }));
+
+    const [threadStart] = sentNamed(spawned.processes[0].written, 'thread/start');
+    expect(threadStart.params?.config).toEqual({ mcp_servers: { ordewell: ordewellServer } });
+    // Codex lists MCP tools only on request, so the thread says where to look.
+    expect(threadStart.params?.developerInstructions).toContain('mcp__ordewell__task_complete');
+    expect(spawned.lastArgs()).toEqual(['app-server']);
+    expect(spawned.lastEnv().ORDEWELL_MCP_TOKEN_0).toBe('Bearer tok-secret');
+    expect(JSON.stringify(spawned.processes[0].written)).not.toContain('tok-secret');
+    adapter.dispose();
+  });
+
+  it('keeps the Landlock fallback beside the server in the thread config', async () => {
+    const { spawned, processDeps } = deps(handshake(), {
+      probe: (args) => (args.includes('use_legacy_landlock') ? { code: 0 } : { code: 1, output: 'bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted' }),
+    });
+    const adapter = new CodexAdapter(processDeps);
+    await adapter.start(taskStart('agent', { mcp }));
+
+    const [threadStart] = sentNamed(spawned.processes[0].written, 'thread/start');
+    expect(threadStart.params?.config).toEqual({ features: { use_legacy_landlock: true }, mcp_servers: { ordewell: ordewellServer } });
+    adapter.dispose();
+  });
+
+  it('resumes a task\'s thread with the new attempt\'s server', async () => {
+    const { spawned, processDeps } = deps(handshake());
+    const adapter = new CodexAdapter(processDeps);
+    await adapter.start(taskStart('agent', { mcp, resumeSessionId: 'thr-task-1' }));
+
+    const [resume] = sentNamed(spawned.processes[0].written, 'thread/resume');
+    expect(resume.params).toMatchObject({ threadId: 'thr-task-1', config: { mcp_servers: { ordewell: ordewellServer } } });
+    adapter.dispose();
+  });
+
+  it('gives a planner thread the server and keeps it read-only with nobody asked', async () => {
+    const { spawned, processDeps } = deps(plannerHandshake());
+    const adapter = new CodexAdapter(processDeps);
+    await adapter.start({ kind: 'planner', cwd: '/repo', systemPrompt: 'PLAN', mcp });
+
+    const [thread] = sentNamed(spawned.processes[0].written, 'thread/start');
+    expect(thread.params).toEqual({
+      cwd: '/repo',
+      sandbox: 'read-only',
+      approvalPolicy: 'never',
+      config: { mcp_servers: { ordewell: ordewellServer } },
+      developerInstructions: 'PLAN',
+    });
+    expect(spawned.lastEnv().ORDEWELL_MCP_TOKEN_0).toBe('Bearer tok-secret');
+    adapter.dispose();
+  });
+
+  it('adds nothing without a server: no config, no token in the environment', async () => {
+    const { spawned, processDeps } = deps(handshake());
+    const adapter = new CodexAdapter(processDeps);
+    await adapter.start(taskStart('agent'));
+
+    const [threadStart] = sentNamed(spawned.processes[0].written, 'thread/start');
+    expect(threadStart.params).not.toHaveProperty('config');
+    expect(Object.keys(spawned.lastEnv()).filter((name) => name.startsWith('ORDEWELL_MCP'))).toEqual([]);
+    expect(await adapter.mcpAttached()).toBe(false);
+    adapter.dispose();
+  });
+
+  describe('attachment, as Codex reports it', () => {
+    it('is attached once Codex says the server is ready, even when it said so before it was asked', async () => {
+      const { spawned, processDeps } = deps(handshake());
+      const adapter = new CodexAdapter(processDeps);
+      await adapter.start(taskStart('agent', { mcp }));
+      spawned.processes[0].emitStdout(startup('starting') + startup('ready'));
+      expect(await adapter.mcpAttached()).toBe(true);
+      adapter.dispose();
+    });
+
+    it('waits through starting for the answer', async () => {
+      const { spawned, processDeps } = deps(handshake());
+      const adapter = new CodexAdapter(processDeps);
+      await adapter.start(taskStart('agent', { mcp }));
+      spawned.processes[0].emitStdout(startup('starting'));
+      const attached = adapter.mcpAttached();
+      await tick();
+      spawned.processes[0].emitStdout(startup('ready'));
+      expect(await attached).toBe(true);
+      adapter.dispose();
+    });
+
+    it.each(['failed', 'cancelled'])('is not attached when the server %s', async (status) => {
+      const { spawned, processDeps } = deps(handshake());
+      const adapter = new CodexAdapter(processDeps);
+      await adapter.start(taskStart('agent', { mcp }));
+      spawned.processes[0].emitStdout(startup(status));
+      expect(await adapter.mcpAttached()).toBe(false);
+      adapter.dispose();
+    });
+
+    it('is not attached when the process ends before saying', async () => {
+      const { spawned, processDeps } = deps(handshake());
+      const adapter = new CodexAdapter(processDeps);
+      await adapter.start(taskStart('agent', { mcp }));
+      const attached = adapter.mcpAttached();
+      spawned.processes[0].exit(1);
+      expect(await attached).toBe(false);
+    });
+
+    it('ignores another server\'s report', async () => {
+      const { spawned, processDeps } = deps(handshake());
+      const adapter = new CodexAdapter(processDeps);
+      await adapter.start(taskStart('agent', { mcp }));
+      spawned.processes[0].emitStdout(line({ method: 'mcpServer/startupStatus/updated', params: { name: 'linear', status: 'ready' } }) + startup('failed'));
+      expect(await adapter.mcpAttached()).toBe(false);
+      adapter.dispose();
+    });
+  });
+
+  it('answers an approval Codex still raises for an Ordewell tool at once, in a task and in a planner', async () => {
+    const ask = (id: number) => line({ id, method: 'mcpServer/elicitation/request', params: { threadId: 'thr-task-1', turnId: 'turn-a', serverName: 'ordewell', mode: 'form', message: 'Allow ordewell to run task_complete?', requestedSchema: { type: 'object', properties: {} } } });
+    const task = await (async () => {
+      const { spawned, processDeps } = deps(handshake());
+      const adapter = new CodexAdapter(processDeps);
+      await adapter.start(taskStart('agent', { mcp }));
+      const events: AgentEvent[] = [];
+      void adapter.send('go', (e) => events.push(e));
+      spawned.processes[0].emitStdout(turnStarted('turn-a') + ask(30));
+      await tick();
+      return { adapter, proc: spawned.processes[0], events };
+    })();
+    expect(answerTo(task.proc, 30)?.result).toEqual({ action: 'accept', content: {} });
+    expect(task.events.filter((e) => e.type === 'permission_request')).toEqual([]);
+    task.adapter.dispose();
+
+    const { spawned, processDeps } = deps(plannerHandshake());
+    const planner = new CodexAdapter(processDeps);
+    await planner.start({ kind: 'planner', cwd: '/repo', systemPrompt: 'PLAN', mcp });
+    void planner.send('plan', () => {});
+    spawned.processes[0].emitStdout(ask(31));
+    await tick();
+    expect(answerTo(spawned.processes[0], 31)?.result).toEqual({ action: 'accept', content: {} });
+    planner.dispose();
+  });
+
+  it('shows an Ordewell tool call under the name Claude Code gives it, and another server\'s under its own', async () => {
+    const call = (id: string, server: string, tool: string) => line({ method: 'item/started', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { id, type: 'mcpToolCall', server, tool, status: 'inProgress', arguments: { status: 'done', summary: 'ok' } } } });
+    const done = (id: string, server: string, tool: string) => line({ method: 'item/completed', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { id, type: 'mcpToolCall', server, tool, status: 'completed', arguments: {}, result: { content: [{ type: 'text', text: 'Recorded.' }] } } } });
+    const { adapter, events } = await openTurn([call('m1', 'ordewell', 'task_complete'), done('m1', 'ordewell', 'task_complete'), call('m2', 'linear', 'create_issue'), done('m2', 'linear', 'create_issue')]);
+
+    expect(events.filter((e) => e.type === 'tool_call' || e.type === 'tool_result').map((e) => [e.type, e.type === 'tool_call' || e.type === 'tool_result' ? e.name : ''])).toEqual([
+      ['tool_call', 'mcp__ordewell__task_complete'],
+      ['tool_result', 'mcp__ordewell__task_complete'],
+      ['tool_call', 'create_issue'],
+      ['tool_result', 'create_issue'],
+    ]);
+    expect(events.find((e) => e.type === 'tool_result')).toMatchObject({ output: 'Recorded.', success: true });
+    adapter.dispose();
+  });
+
+  it('is a runner whose structured tasks are taught the tools', () => {
+    expect(takesOrdewellTools('codex')).toBe(true);
   });
 });
