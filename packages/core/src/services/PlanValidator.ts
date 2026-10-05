@@ -57,30 +57,68 @@ function parsePlanObject(
     throw new PlanParseError(`Plan response was not valid JSON: ${detail}`, raw);
   }
 
-  if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as { tasks?: unknown }).tasks)) {
-    throw new PlanParseError('Invalid plan: missing tasks array', raw);
-  }
+  const result = validatePlanTasks(parsed, runners, runnerModes, autonomousDefault);
+  if (result.ok) return result.tasks;
+  const [first] = result.errors;
+  // An envelope problem (no tasks array, an empty one) keeps the generic
+  // re-emit; only a rule broken by a task is worth naming in the corrective.
+  throw new PlanParseError(first.message, raw, { semantic: first.taskId !== undefined });
+}
 
-  const rawTasks = (parsed as { tasks: Record<string, unknown>[] }).tasks;
+/** One reason a plan was refused, pinned to the task and field it is about. */
+export interface PlanTaskError {
+  /** Absent when the envelope itself is wrong rather than one of its tasks. */
+  taskId?: string;
+  field: string;
+  message: string;
+}
+
+export type PlanTasksResult = { ok: true; tasks: Task[] } | { ok: false; errors: PlanTaskError[] };
+
+/**
+ * Every check a plan's tasks must pass, on an already-parsed `{ tasks }`
+ * object — what a plan is held to whichever channel it arrived on. All
+ * problems are reported, in the order the text path has always met them, so
+ * the first is the one its corrective names.
+ */
+export function validatePlanTasks(
+  obj: unknown,
+  runners: RunnerId[],
+  runnerModes?: Record<RunnerId, RunnerModeInfo[]>,
+  autonomousDefault = true,
+): PlanTasksResult {
+  const rawTasks = isRecord(obj) ? obj.tasks : undefined;
+  if (!Array.isArray(rawTasks)) {
+    return { ok: false, errors: [{ field: 'tasks', message: 'Invalid plan: missing tasks array' }] };
+  }
   if (rawTasks.length === 0) {
-    throw new PlanParseError('Plan contained no tasks', raw);
+    return { ok: false, errors: [{ field: 'tasks', message: 'Plan contained no tasks' }] };
   }
 
-  const tasks = rawTasks.map((t) => parseTask(t, runners, runnerModes, autonomousDefault));
+  const tasks = rawTasks.map((t) => parseTask(asRecord(t), runners, runnerModes, autonomousDefault));
 
-  validateVerticalSliceShape(tasks, raw);
-
+  const errors = verticalSliceErrors(tasks);
   for (const t of tasks) {
     if (!runners.includes(t.assignedRunner)) {
-      throw new PlanParseError(
-        `Task "${t.title}" has invalid assignedRunner "${t.assignedRunner}". Expected one of: ${runners.join(', ')}`,
-        raw,
-        { semantic: true },
-      );
+      errors.push({
+        taskId: t.id,
+        field: 'assignedRunner',
+        message: `Task "${t.title}" has invalid assignedRunner "${t.assignedRunner}". Expected one of: ${runners.join(', ')}`,
+      });
     }
   }
 
-  return tasks;
+  return errors.length > 0 ? { ok: false, errors } : { ok: true, tasks };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// A non-object entry reads as an empty task, so the shape checks name it
+// instead of the parser throwing a TypeError out of the validator.
+function asRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
 }
 
 /**
@@ -142,15 +180,15 @@ function parseTask(
     // a task never silently ends up unschedulable (getReadyTasks requires prompt).
     prompt: raw.prompt ? String(raw.prompt) : (description || title || undefined),
     userSteps: Array.isArray(raw.userSteps)
-      ? raw.userSteps.map((s: Record<string, unknown>) => ({
+      ? raw.userSteps.map(asRecord).map((s) => ({
           order: Number(s.order ?? 0),
           instruction: String(s.instruction ?? ''),
           completed: false,
         }))
       : undefined,
     subtasks: Array.isArray(raw.subtasks)
-      ? raw.subtasks.map((s: Record<string, unknown>) =>
-          parseTask(s, runners, runnerModes, autonomousDefault, { sliceType, autonomy }))
+      ? raw.subtasks.map((s: unknown) =>
+          parseTask(asRecord(s), runners, runnerModes, autonomousDefault, { sliceType, autonomy }))
       : [],
     assignedModel: raw.assignedModel
       ? {
@@ -177,50 +215,37 @@ function parseTask(
   });
 }
 
-function validateVerticalSliceShape(tasks: Task[], raw: string, parentTitle?: string): void {
+function verticalSliceErrors(tasks: Task[], parentTitle?: string): PlanTaskError[] {
   // Without this the message names a title that appears nowhere in the plan's
   // top-level `tasks` array, and neither the corrective nor a human can find
   // the offending object.
   const where = (t: Task) => (parentTitle ? `subtask "${t.title}" of "${parentTitle}"` : `Task "${t.title}"`);
-  const semantic = { semantic: true };
+  const errors: PlanTaskError[] = [];
 
   for (const t of tasks) {
+    const fail = (field: string, message: string) => errors.push({ taskId: t.id, field, message });
+
     if (!t.sliceType) {
-      throw new PlanParseError(
-        `${where(t)} is missing sliceType. Every task must specify sliceType ("AFK" or "HITL").`,
-        raw,
-        semantic,
-      );
+      fail('sliceType', `${where(t)} is missing sliceType. Every task must specify sliceType ("AFK" or "HITL").`);
     }
 
     if (t.type === 'ai' && !t.autonomy) {
-      throw new PlanParseError(
-        `AI ${where(t)} is missing autonomy. Every AI task must specify autonomy ("AFK" or "HITL").`,
-        raw,
-        semantic,
-      );
+      fail('autonomy', `AI ${where(t)} is missing autonomy. Every AI task must specify autonomy ("AFK" or "HITL").`);
     }
 
     if (t.autonomy === 'AFK' && t.userSteps && t.userSteps.length > 0) {
-      throw new PlanParseError(
-        `${where(t)} has autonomy "AFK" but contains userSteps. AFK tasks must not have user touchpoints.`,
-        raw,
-        semantic,
-      );
+      fail('userSteps', `${where(t)} has autonomy "AFK" but contains userSteps. AFK tasks must not have user touchpoints.`);
     }
 
-    if (t.type === 'user' && t.sliceType !== 'HITL') {
-      throw new PlanParseError(
-        `User ${where(t)} has sliceType "${t.sliceType}". User tasks must have sliceType "HITL".`,
-        raw,
-        semantic,
-      );
+    if (t.type === 'user' && t.sliceType && t.sliceType !== 'HITL') {
+      fail('sliceType', `User ${where(t)} has sliceType "${t.sliceType}". User tasks must have sliceType "HITL".`);
     }
 
     if (t.subtasks.length > 0) {
-      validateVerticalSliceShape(t.subtasks, raw, t.title);
+      errors.push(...verticalSliceErrors(t.subtasks, t.title));
     }
   }
+  return errors;
 }
 
 export function checkUniqueIds(ctx: ValidationContext): ValidationResult {

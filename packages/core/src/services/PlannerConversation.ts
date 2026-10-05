@@ -53,7 +53,14 @@ interface UserTurn {
   stream: TurnStream;
   signal?: AbortSignal;
   reads: ReadBudget;
+  /** Handed in since the backend last answered; see {@link PlannerConversation.submit}. */
+  submitted?: PlannerSubmission;
 }
+
+/** A plan or task edit handed to the open turn over a channel other than its reply (ADR-0022). */
+export type PlannerSubmission =
+  | { kind: 'plan'; tasks: Task[] }
+  | { kind: 'task_ops'; ops: TaskOp[] };
 
 interface SettledTurn {
   plan: LegacyPlanState;
@@ -191,7 +198,7 @@ export class PlannerConversation {
   private savedInBackground = 0;
   private turnsInFlight = 0;
   private compacting = false;
-  private openTurnId: string | null = null;
+  private openTurn: UserTurn | null = null;
 
   constructor(private readonly host: PlannerConversationHost) {}
 
@@ -206,7 +213,19 @@ export class PlannerConversation {
 
   /** The user turn being answered, for what the host raises during it — an approval the turn's research asks for. */
   get currentTurnId(): string | undefined {
-    return this.openTurnId ?? undefined;
+    return this.openTurn?.stream.turnId;
+  }
+
+  /**
+   * Hand the open turn a plan (already validated) or a task edit. The turn
+   * settles with it exactly as with the same plan or ops parsed out of its
+   * reply, and it wins over any envelope that reply carries. A later
+   * submission replaces an earlier one. False when no user turn is open.
+   */
+  submit(submission: PlannerSubmission): boolean {
+    if (!this.openTurn) return false;
+    this.openTurn.submitted = submission;
+    return true;
   }
 
   /** Whether the model still holds this conversation in memory. */
@@ -543,15 +562,16 @@ export class PlannerConversation {
   private async userTurn(prompt: string, signal: AbortSignal | undefined, run: (turn: UserTurn) => Promise<SettledTurn>): Promise<LegacyPlanState> {
     const turnId = uuidv4();
     const stream = new TurnStream(turnId, (p) => this.host.onProgress(p));
-    this.openTurnId = turnId;
+    const turn: UserTurn = { stream, signal, reads: freshReadBudget() };
+    this.openTurn = turn;
     this.host.broadcast({ type: 'planner_turn_started', turnId, prompt });
     let outcome: PlannerTurnOutcome = 'error';
     try {
-      const settled = await this.inTurn(() => run({ stream, signal, reads: freshReadBudget() }));
+      const settled = await this.inTurn(() => run(turn));
       outcome = settled.outcome;
       return settled.plan;
     } finally {
-      if (this.openTurnId === turnId) this.openTurnId = null;
+      if (this.openTurn === turn) this.openTurn = null;
       // A stop can still settle — a backend hands back what it had as a
       // message — but the user asked for it to end, and that is what it did.
       this.host.broadcast({ type: 'planner_turn_ended', turnId, outcome: signal?.aborted ? 'stopped' : outcome });
@@ -618,10 +638,11 @@ export class PlannerConversation {
    * ops JSON still gets its two corrective retries; charging it for the read
    * would cost it the chance to fix the edit.
    */
-  private async drainTaskQueries(turn: ConversationTurn, { reads, signal, stream }: UserTurn): Promise<SettleableTurn> {
+  private async drainTaskQueries(turn: ConversationTurn, userTurn: UserTurn): Promise<SettleableTurn> {
+    const { reads, signal, stream } = userTurn;
     const ai = this.host.aiService();
     const carried: ConversationTurn['researchLog'] = [];
-    let current = turn;
+    let current = this.claimSubmission(turn, userTurn);
     while (current.kind === 'task_query') {
       carried.push(...current.researchLog);
       if (reads.answered >= MAX_TASK_QUERIES_HARD || !ai.hasActiveConversation() || signal?.aborted) {
@@ -638,15 +659,31 @@ export class PlannerConversation {
       reads.seen.add(signature);
       reads.answered++;
       const answer = this.taskQueryAnswer(current.query);
-      current = await ai.continueConversation(
+      current = this.claimSubmission(await ai.continueConversation(
         insist ? `${answer}\n\n${TASK_QUERY_ANSWER_OR_OPS}` : answer,
         stream.sink(),
         signal,
-      );
+      ), userTurn);
     }
     return carried.length > 0
       ? { ...current, researchLog: [...carried, ...current.researchLog] }
       : current;
+  }
+
+  /**
+   * The backend's answer, with what was handed in while it ran standing in
+   * for whatever its reply carried. Taken once: a corrective re-send after a
+   * rejected edit must not settle on the same submission again. A stopped
+   * turn commits nothing, the same as a stopped reply with a plan in it.
+   */
+  private claimSubmission(turn: ConversationTurn, userTurn: UserTurn): ConversationTurn {
+    const submitted = userTurn.submitted;
+    userTurn.submitted = undefined;
+    if (!submitted || userTurn.signal?.aborted) return turn;
+    const { text, researchLog } = turn;
+    return submitted.kind === 'plan'
+      ? { kind: 'plan', tasks: submitted.tasks, text, researchLog }
+      : { kind: 'task_ops', ops: submitted.ops, text, researchLog };
   }
 
   /**
