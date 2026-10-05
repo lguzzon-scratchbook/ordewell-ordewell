@@ -164,6 +164,26 @@ export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = 
 }
 
 /**
+ * A fake spawn whose every process hands each stdin write to `onWrite`, with
+ * the argv it was spawned under — for an agent that must answer the control
+ * channel and the turns alike, however many of each a scenario sends.
+ */
+export function respondingSpawn(onWrite: (written: string, proc: FakeAgentProcess, args: string[]) => void): FakeSpawnResult {
+  const processes: FakeAgentProcess[] = [];
+  let command = '';
+  let args: string[] = [];
+  const spawn: SpawnFn = (cmd, argv) => {
+    command = cmd;
+    args = argv;
+    const proc = makeProcess();
+    processes.push(proc);
+    proc.on('__written', (chunk: string) => onWrite(chunk, proc, argv));
+    return proc as unknown as ChildProcess;
+  };
+  return { spawn, processes, lastArgs: () => args, lastCommand: () => command, probeArgs: () => [] };
+}
+
+/**
  * Read a recorded agent transcript. One fixture per agent per scenario;
  * re-recording one against a newer CLI is how schema drift becomes a
  * reviewable diff.
