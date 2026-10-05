@@ -4,6 +4,7 @@ import type { SubagentOutcome } from '../../models/Task';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { UsageRecord } from '../../models/Usage';
 import { StdioAgentAdapter, type SpawnSpec } from './StdioAgentAdapter';
+import { markedLines } from './fileDiff';
 import { probeCodexSandbox, codexSandboxUnavailableMessage, type CodexSandboxDecision } from './codexSandbox';
 
 const HANDSHAKE_TIMEOUT_MS = 30000;
@@ -68,15 +69,13 @@ function changeName(change: FileUpdateChange): string {
 
 /**
  * Codex's `diff` is a hunk only for an update: an added file arrives as its
- * whole content and a deleted one as what it held. Marked as a diff, neither
- * reads as the other in a row's preview.
+ * whole content and a deleted one as what it held.
  */
 function changeDiff(change: FileUpdateChange): string {
   const diff = change.diff ?? '';
-  const mark = change.kind?.type === 'add' ? '+' : change.kind?.type === 'delete' ? '-' : '';
-  if (!mark || !diff) return diff;
-  const body = diff.endsWith('\n') ? diff.slice(0, -1) : diff;
-  return `${body.split('\n').map((line) => `${mark}${line}`).join('\n')}${body === diff ? '' : '\n'}`;
+  if (change.kind?.type === 'add') return markedLines(diff, '+');
+  if (change.kind?.type === 'delete') return markedLines(diff, '-');
+  return diff;
 }
 
 /** One model call's usage, from `thread/tokenUsage/updated` — see {@link emitUsage}. */

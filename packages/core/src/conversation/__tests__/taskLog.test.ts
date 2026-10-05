@@ -84,6 +84,35 @@ describe('reduceTaskLog', () => {
     expect(tools[0].args).toBe('{"file_path":"src/a.ts"}');
   });
 
+  it('counts the lines a file edit added and removed, whichever runner named the edit', () => {
+    const hunk = '@@ -1,3 +1,3 @@\n export function sum(a, b) {\n-  return a - b;\n+  return a + b;\n }\n';
+    const view = replayTaskLog([
+      start,
+      { type: 'tool_call', id: 'c1', name: 'Update', args: '{"path":"src/sum.ts"}' },
+      { type: 'tool_result', id: 'c1', output: hunk, success: true },
+      { type: 'tool_call', id: 'c2', name: 'Write', args: '{"file_path":"/repo/hello.txt"}' },
+      { type: 'tool_result', id: 'c2', output: '+hi\n+there\n', success: true },
+      { type: 'tool_call', id: 'c3', name: 'edit', args: '{"filePath":"/repo/b.ts"}' },
+      { type: 'tool_result', id: 'c3', output: '-gone\n', success: true },
+    ]);
+    const tools = view.blocks.filter((b): b is ToolBlock => b.type === 'tool');
+    expect(tools.map((t) => t.diff)).toEqual([{ added: 1, removed: 1 }, { added: 2, removed: 0 }, { added: 0, removed: 1 }]);
+  });
+
+  it('counts nothing for an edit that reported prose, failed, or a command that printed a diff', () => {
+    const view = replayTaskLog([
+      start,
+      { type: 'tool_call', id: 'c1', name: 'Edit', args: '{"file_path":"/repo/a.ts"}' },
+      { type: 'tool_result', id: 'c1', output: 'The file /repo/a.ts has been updated successfully.', success: true },
+      { type: 'tool_call', id: 'c2', name: 'Update', args: '{"path":"a.ts"}' },
+      { type: 'tool_result', id: 'c2', output: '-a\n+b\n', success: false },
+      { type: 'tool_call', id: 'c3', name: 'Bash', args: '{"command":"git diff"}' },
+      { type: 'tool_result', id: 'c3', output: '-a\n+b\n', success: true },
+    ]);
+    const tools = view.blocks.filter((b): b is ToolBlock => b.type === 'tool');
+    expect(tools.map((t) => t.diff)).toEqual([undefined, undefined, undefined]);
+  });
+
   it('nests a subagent’s calls and thinking under the call that started it', () => {
     const view = replayTaskLog([
       start,

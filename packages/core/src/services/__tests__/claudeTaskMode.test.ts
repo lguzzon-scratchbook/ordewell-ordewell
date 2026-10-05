@@ -392,6 +392,35 @@ describe('ClaudeCodeAdapter in task mode', () => {
     adapter.dispose();
   });
 
+  it('reports a file edit\'s result as its diff, a created file as its added lines', async () => {
+    const toolResult = (id: string, content: string, toolUseResult: Record<string, unknown>, isError = false) => JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: [{ tool_use_id: id, type: 'tool_result', content, ...(isError ? { is_error: true } : {}) }] },
+      parent_tool_use_id: null, session_id: 'sess-edit', tool_use_result: toolUseResult,
+    });
+    const stream = [
+      toolResult('toolu_e', 'The file /repo/sum.ts has been updated successfully.', {
+        filePath: '/repo/sum.ts', oldString: 'a - b', newString: 'a + b',
+        structuredPatch: [{ oldStart: 1, oldLines: 3, newStart: 1, newLines: 3, lines: [' export function sum(a, b) {', '-  return a - b;', '+  return a + b;', ' }'] }],
+      }),
+      toolResult('toolu_w', 'File created successfully at: /repo/a.txt', { type: 'create', filePath: '/repo/a.txt', content: 'a\nb\n', structuredPatch: [], originalFile: null }),
+      toolResult('toolu_x', 'String to replace not found in file.', { filePath: '/repo/x.ts', structuredPatch: [] }, true),
+      JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', session_id: 'sess-edit', stop_reason: 'end_turn' }),
+    ].join('\n') + '\n';
+    const { processDeps } = deps([stream]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskStart());
+    const events: AgentEvent[] = [];
+    await adapter.send('fix sum', (e) => events.push(e));
+
+    expect(events.filter((e) => e.type === 'tool_result').map((e) => e.type === 'tool_result' && [e.id, e.output, e.success])).toEqual([
+      ['toolu_e', '@@ -1,3 +1,3 @@\n export function sum(a, b) {\n-  return a - b;\n+  return a + b;\n }\n', true],
+      ['toolu_w', '+a\n+b\n', true],
+      ['toolu_x', 'String to replace not found in file.', false],
+    ]);
+    adapter.dispose();
+  });
+
   it('answers Deny with the note as the message the agent reads', async () => {
     const { spawned, processDeps } = deps([fixture('claude-code', 'permission-task-deny'), fixture('claude-code', 'permission-task-denied')]);
     const adapter = new ClaudeCodeAdapter(processDeps);

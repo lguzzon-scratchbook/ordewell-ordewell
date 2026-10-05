@@ -1,7 +1,8 @@
 import type { ResearchStep, ResearchStepOutcome } from '../models/Task';
 import type { UsageLine } from '../models/Usage';
 import type { MessageBlock, MessageRole, PlanMarkerStatus, SubagentBlock, ToolBlock, ToolStatus, UsageBlock } from './blocks';
-import { outputLines, toolHeadline } from './format';
+import { diffStat, outputLines, toolHeadline } from './format';
+import { isFileEditTool } from '../services/harness/agentTools';
 
 /*
  * How the session's records — messages, research steps, subagents, transcript
@@ -40,7 +41,8 @@ const STATUS_OF_OUTCOME: Record<ResearchStepOutcome, ToolStatus> = {
 };
 
 export function finishedTool(call: ToolBlock, output: string, outcome: ResearchStepOutcome): ToolBlock {
-  return { ...call, status: STATUS_OF_OUTCOME[outcome], outcome, output, outputLineCount: outputLines(output).length };
+  const diff = outcome === 'success' && isFileEditTool(call.toolLabel ?? call.tool) ? diffStat(output) : null;
+  return { ...call, status: STATUS_OF_OUTCOME[outcome], outcome, output, outputLineCount: outputLines(output).length, ...(diff ? { diff } : {}) };
 }
 
 export function settledTool(call: ToolBlock, step: ResearchStep): ToolBlock {

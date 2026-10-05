@@ -1,4 +1,4 @@
-import type { ToolHeadline } from './blocks';
+import type { DiffStat, ToolHeadline } from './blocks';
 import { ANSI_OR_CTRL_RE } from '../services/terminalRender';
 
 /**
@@ -119,4 +119,21 @@ export function outputPreview(output: string, maxLines: number): OutputPreview {
   const lines = outputLines(output);
   const shown = lines.slice(0, Math.max(0, maxLines));
   return { lines: shown, hiddenLineCount: lines.length - shown.length };
+}
+
+/**
+ * The lines a diff adds and removes, or null when `output` is not one: every
+ * line a hunk header, context, an addition or a removal, and at least one of
+ * the last two.
+ */
+export function diffStat(output: string): DiffStat | null {
+  const lines = outputLines(output);
+  let added = 0;
+  let removed = 0;
+  for (const line of lines) {
+    if (line.startsWith('+')) added += 1;
+    else if (line.startsWith('-')) removed += 1;
+    else if (!(line.startsWith('@@') || line.startsWith(' ') || line === '' || line.startsWith('\\'))) return null;
+  }
+  return added + removed > 0 ? { added, removed } : null;
 }

@@ -32,6 +32,17 @@ const KNOWN_TOOLS: Record<string, ResearchToolType> = {
   fetch: 'fetch',
 };
 
+/**
+ * The tools that write a file, by their normalized names: Claude Code's,
+ * OpenCode's, and the change kinds a Codex row is named for. Their output is
+ * a diff (see `fileDiff.ts`) when the runner reported one.
+ */
+const FILE_EDIT_TOOLS = new Set(['edit', 'write', 'multiedit', 'notebookedit', 'applypatch', 'patch', 'add', 'update', 'delete', 'filechange']);
+
+export function isFileEditTool(name: string): boolean {
+  return FILE_EDIT_TOOLS.has(name.trim().toLowerCase().replace(/[_-]/g, ''));
+}
+
 export interface MappedTool {
   tool: ResearchToolType;
   /** The agent's own name, kept whenever it differs from the member it mapped to. */

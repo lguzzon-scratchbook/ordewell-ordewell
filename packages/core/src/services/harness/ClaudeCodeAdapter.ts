@@ -4,6 +4,7 @@ import type { ApprovalDecision } from '../../interfaces/IApproval';
 import { claudeThinkingArgs } from '../../plugins/resolveArgs';
 import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter, TaskStartOptions } from './AgentAdapter';
 import { StdioAgentAdapter, type SpawnSpec } from './StdioAgentAdapter';
+import { markedLines, structuredPatchText } from './fileDiff';
 
 /**
  * Tools a planning Claude Code session may use. `--permission-mode plan`
@@ -167,6 +168,18 @@ function flattenContent(content: unknown): string {
  * same way. It is the richest of the three streams — partial messages and
  * separate thinking blocks — which is why this agent went first.
  */
+/**
+ * What a file edit changed, from the structured result the CLI sends beside
+ * the text the model reads: an edit's hunks, a created file's lines. The text
+ * only says the edit happened.
+ */
+function editDiff(result: unknown): string {
+  if (!result || typeof result !== 'object') return '';
+  const { type, content, structuredPatch } = result as Record<string, unknown>;
+  if (type === 'create' && typeof content === 'string') return markedLines(content, '+');
+  return structuredPatchText(structuredPatch);
+}
+
 export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgentAdapter {
   readonly agentId = 'claude-code';
 
@@ -438,6 +451,7 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
           if (block.type !== 'tool_result') continue;
           const id = block.tool_use_id ?? '';
           const output = flattenContent(block.content);
+          const diff = block.is_error === true ? '' : editDiff(msg.tool_use_result);
           const subagent = subagentId ? undefined : this.openSubagents.get(id);
           if (!subagentId && output.includes(ASYNC_LAUNCH_MARKER)) {
             emit({ type: 'background_agent', id });
@@ -445,7 +459,7 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
           } else if (subagent) {
             this.finishForegroundSubagent(id, msg.tool_use_result, output, block.is_error === true, emit);
           }
-          emit({ type: 'tool_result', id, name: '', output, success: block.is_error !== true, subagentId });
+          emit({ type: 'tool_result', id, name: '', output: diff || output, success: block.is_error !== true, subagentId });
         }
         return;
 

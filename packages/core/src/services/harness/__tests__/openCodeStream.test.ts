@@ -125,6 +125,18 @@ describe('OpenCodeAdapter — recorded event stream', () => {
     });
   });
 
+  // Recorded from `opencode serve` 1.18.34: an `edit`, then a `write` of a new file.
+  it('reports an edit as its diff\'s hunks and a new file as its added lines', async () => {
+    const events = await replay('edit');
+
+    const results = events.flatMap((e) => (e.type === 'tool_result' && (e.name === 'edit' || e.name === 'write') ? [[e.name, e.output]] : []));
+    expect(results).toEqual(expect.arrayContaining([
+      ['edit', '@@ -1,3 +1,3 @@\n export function sum(a, b) {\n-  return a - b;\n+  return a + b;\n }\n'],
+      ['write', '+hi\n'],
+    ]));
+    expect(results).toHaveLength(2);
+  });
+
   describe('a task call that runs a subagent in a child session', () => {
     const callId = 'call_81f9f8695fab49009d73c828';
 

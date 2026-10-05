@@ -50,6 +50,12 @@ export interface ToolHeadline {
 
 export type ToolStatus = 'pending' | 'ok' | 'error' | 'denied' | 'interrupted';
 
+/** What a file edit changed, counted from its diff. */
+export interface DiffStat {
+  added: number;
+  removed: number;
+}
+
 export interface ToolBlock {
   type: 'tool';
   id: string;
@@ -65,6 +71,8 @@ export interface ToolBlock {
   output: string;
   /** Every line of `output`, counted as {@link outputPreview} counts them. */
   outputLineCount: number;
+  /** Present when the call edited a file and `output` is its diff: a surface draws it as one. */
+  diff?: DiffStat;
   turnId?: string;
   /**
    * The subagent this call starts. The call becomes that subagent's block once
