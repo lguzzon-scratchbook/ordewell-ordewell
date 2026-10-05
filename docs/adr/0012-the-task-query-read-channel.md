@@ -2,6 +2,8 @@
 
 **Status:** accepted
 
+*Pending (2026-10-05):* [ADR-0022](0022-ordewell-mcp-server.md) adopts M2, the MCP server, as the read and edit path for MCP-capable planners; this text envelope remains the fallback.
+
 The per-turn plan context block (`Session.planContextBlock`) deliberately
 carries only short fields — id, order, title, status, type, runner, model,
 mode, effort, autonomy, deps. A twenty-task plan re-sent in full on every

@@ -2,6 +2,8 @@
 
 **Status:** accepted
 
+*Pending (2026-10-05):* [ADR-0022](0022-ordewell-mcp-server.md) adopts a planner tool for listing models (`list_models`), rejected below because a tool would not reach harness planners; the server is injected at spawn.
+
 Ordewell's planner emits `assignedModel.modelId` per AI task drawn from `modelsByRunner`, the set `ModelResolver.modelsForRunners()` discovers per runner. There is no constraint on which of those ids the planner may pick — a user who only wants the planner to choose from `kimi-2.6` and `deepseek-v4-pro` on opencode has no way to express it; the planner sees the full discovered set and is free to pick the expensive `gpt-5`.
 
 We decided to add a per-**RunnerId** model-id allowlist (stored on `UserSettings.modelAllowlist: Partial<Record<RunnerId, string[]>>`, defaulting to unset = "all models fetched as available"). The allowlist is **advice to the planner, not a runtime contract**: it narrows only what `modelsByRunner` the planner sees in its prompt and coerces the planner's stray emissions; the per-task dropdown in the webview stays full so a human can manually override to any discovered model, loaded plans keep their stored ids as-is, and the orchestrator (the executor) is never aware of the allowlist.

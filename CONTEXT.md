@@ -416,6 +416,47 @@ carded.
 *Avoid:* "permission prompt" for Ordewell's side (that is Claude's protocol),
 and "awaiting approval" as a task status.
 
+**Ordewell MCP server** — the one MCP server Ordewell runs (ADR-0022,
+proposed): Streamable HTTP on `127.0.0.1` at a random port, started on first
+use by the process that owns the session (the daemon or the VS Code extension
+host) and shared by every session in it. Its configuration is injected into a
+runner when Ordewell spawns it — structured task runners and the three harness
+planners only — with its tools pre-authorized so no call ever prompts. Who sees
+which tools is decided by the caller's *task token* or *planner token*, never
+by running separate servers. Where it is not injected or did not attach, the
+completion marker and the JSON envelopes carry the same signals.
+*Avoid:* "the task server" / "the planner server" (there is one server; the
+token decides the role), "MCP bridge", "plugin".
+
+**Task token** — the credential that binds one structured task attempt to the
+*Ordewell MCP server*: one session, one task, one attempt generation (the
+generations `VerdictEngine` tracks). It lists only `task_complete` and
+`checkpoint`, is revoked when the attempt ends, and a call carrying it after
+that is refused. It reaches the runner only in the injected MCP configuration,
+as an HTTP header — never in a prompt and never on a command line.
+*Avoid:* "session token" (*Session* is the plan's lifecycle module, and the
+token is narrower than a session), "attempt id", "API key", and the
+*completion marker* (that is the text signal, and stays in the prompt).
+
+**Planner token** — the credential that binds one session's harness planner
+conversation to the *Ordewell MCP server*. It lists only the planner tools:
+`list_runners`, `list_models`, `task_query` and `task_output`, which read
+Ordewell state only, and `submit_plan` and `edit_plan`, the only writes, which
+go through the same validation and commit path as the plan and `taskOps`
+envelopes. Revoked when the planner process is disposed.
+*Avoid:* "session token", "admin token", and describing the planner as
+write-capable — it writes nothing but the plan, and only through validation.
+
+**Completion call** — a `task_complete({status, summary, reason?})` call made
+with a task's *task token*: the second channel for the runner's own completion
+signal, beside the *completion marker*. Either is evidence; whichever arrives
+first in an attempt is handed to `VerdictEngine`, which alone produces the
+verdict. Only `done` passes; `blocked` and `failed` carry their reason. The
+`summary` is the output handed to dependent tasks.
+*Avoid:* "self-report" or "the model says it's done" (it is the runner's
+explicit signal bound to the attempt, not a judgement anyone weighs), and
+"tool verdict" (the tool produces no verdict).
+
 **Spawn toolkit** — the pure OS/shell policy behind the runner adapters
 (`core/src/utils/shell.ts`): ANSI stripping (`stripAnsi`), POSIX/PowerShell
 quoting, the login-shell invocation (`buildShellInvocation`), and the
