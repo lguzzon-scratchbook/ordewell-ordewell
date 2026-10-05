@@ -311,7 +311,7 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
 
         {!isExecuting && task.taskMode && (
           <span className="task-type-badge" style={{ background: 'rgba(210,153,29,0.15)', color: 'var(--orange)' }}
-            title={modeInfo?.autonomous ? 'Full auto: runs without permission prompts — the level is set by the "ordewell.autonomousMode" setting' : undefined}>
+            title={modeInfo?.autonomous ? 'Full: runs without permission prompts — the level is set by the "ordewell.autonomousMode" setting' : undefined}>
             {modeInfo?.label ?? task.taskMode}
             {modeInfo?.autonomous && ' ⚡'}
           </span>

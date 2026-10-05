@@ -702,7 +702,7 @@ function taskLines(state: TuiState, row: PlanRow, index: number, cols: number): 
       lines.push(...taskText('Forced', `Started before the work of ${task.forcedPastGate.join(', ')} was merged into your branch.`, cols, bodyPad));
     }
     if (modeInfo?.autonomous) {
-      lines.push(...taskText('Autonomy', 'Runs without permission prompts (Full auto). Change the level with /auto.', cols, bodyPad));
+      lines.push(...taskText('Autonomy', 'Runs without permission prompts (Full). Change the level with /auto.', cols, bodyPad));
     }
     // The prompt editor is seeded from prompt ?? description ?? title, so only
     // show the static description when it carries information the editor won't.

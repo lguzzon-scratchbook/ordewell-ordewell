@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { resolveAutonomousQuickPickItems, applyAutonomousChoice } from '../SlashAutonomous';
 
 describe('resolveAutonomousQuickPickItems', () => {
-  it('lists Full auto first, with per-runner resolved mode in the detail', () => {
+  it('lists Full first, with per-runner resolved mode in the detail', () => {
     const runners = ['claude-code', 'opencode'];
     const modesByRunner = {
       'claude-code': [
@@ -17,11 +17,11 @@ describe('resolveAutonomousQuickPickItems', () => {
 
     const items = resolveAutonomousQuickPickItems(runners, modesByRunner);
 
-    expect(items[0].label).toBe('Full auto (recommended)');
+    expect(items[0].label).toBe('Full (recommended)');
     // Resolved modes appear per runner in the detail
     expect(items[0].detail).toContain('claude-code: bypassPermissions');
     expect(items[0].detail).toContain('opencode: build');
-    expect(items[1].label).toBe('Auto');
+    expect(items[1].label).toBe('Guarded');
     expect(items[1].detail).toContain('claude-code: auto');
     expect(items[1].detail).toContain('opencode: build');
     // Each item carries its boolean value for persistence
@@ -51,7 +51,7 @@ describe('resolveAutonomousQuickPickItems', () => {
   it('gracefully handles a runner with no manifest modes by listing "(default)"', () => {
     const runners = ['unknown-runner'];
     const items = resolveAutonomousQuickPickItems(runners, {});
-    expect(items[0].label).toMatch(/^Full auto/);
+    expect(items[0].label).toMatch(/^Full/);
     expect(items[0].detail).toContain('unknown-runner: (default)');
   });
 });
@@ -71,12 +71,12 @@ describe('applyAutonomousChoice', () => {
     };
 
     const onEcho = applyAutonomousChoice(true, runners, modesByRunner);
-    expect(onEcho).toContain('Autonomy level: Full auto.');
+    expect(onEcho).toContain('Autonomy level: Full.');
     expect(onEcho).toContain('claude-code: bypassPermissions');
     expect(onEcho).toContain('opencode: build');
 
     const offEcho = applyAutonomousChoice(false, runners, modesByRunner);
-    expect(offEcho).toContain('Autonomy level: Auto.');
+    expect(offEcho).toContain('Autonomy level: Guarded.');
     expect(offEcho).toContain('claude-code: auto');
   });
 });

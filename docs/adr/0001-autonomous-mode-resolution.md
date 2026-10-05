@@ -20,7 +20,7 @@ own set. Three things made that hard to just ask the planner to do:
 
 ## Decision
 
-Mode resolution is **planner-nudged, parser-validated, never runtime-overridden**, driven by **symmetric manifest tags** (`autonomous` / `safe`) and a **global user setting with two named levels**, *Full auto* and *Auto*.
+Mode resolution is **planner-nudged, parser-validated, never runtime-overridden**, driven by **symmetric manifest tags** (`autonomous` / `safe`) and a **global user setting with two named levels**, *Full* and *Guarded*.
 
 Concretely:
 
@@ -30,10 +30,10 @@ Concretely:
   is deliberate — it is the same rule `/model set` follows.
 - **Two levels, one boolean.** The setting is a boolean (`autonomousMode`,
   `autonomousDefault`, TUI `autonomous`, VS Code `ordewell.autonomousMode`,
-  default on). **Full auto** is on: each runner's `autonomous`-tagged mode.
-  **Auto** is off: each runner's `safe`-tagged mode. `/auto full` and
-  `/auto auto` select them (`ordewell auto full|auto` likewise); `on` and `off`
-  stay as aliases, and a bare `/auto` in the TUI reports the current level
+  default on). **Full** is on: each runner's `autonomous`-tagged mode.
+  **Guarded** is off: each runner's `safe`-tagged mode. `/auto full` and
+  `/auto guarded` select them (`ordewell auto full|guarded` likewise); `on`, `off`
+  and `auto` stay as aliases, and a bare `/auto` in the TUI reports the current level
   instead of flipping it.
 - **Manifests declare what autonomy means for that runner.** Core never
   hardcodes mode IDs. Each manifest tags one mode `autonomous: true` and one
@@ -107,7 +107,7 @@ Concretely:
 - OpenCode resolves to `build` at either level. The setting is effectively a
   no-op for OpenCode-only plans. Correct, not a bug: there is nothing for it to
   switch between.
-- "Auto" is not the least-privileged choice on every runner: it trades a prompt
+- "Guarded" is not the least-privileged choice on every runner: it trades a prompt
   for a reviewer's judgement. A person who wants every action to wait for them
   picks `default` (Claude) by hand, which no level selects.
 - `bypassPermissions`' manifest description no longer carries the "use only in
@@ -124,3 +124,6 @@ Concretely:
 - 2026-07-31 — accepted: one on/off toggle, `/auto`.
 - 2026-10-01 — the two states named *Full auto* and *Auto*; Claude's `safe` mode
   moved from `default` to `auto`, Codex's `safe` mode gained the auto reviewer.
+- 2026-10-05 — the levels renamed *Full* and *Guarded*: *Auto* collided with Claude
+  Code's own `auto` permission mode (`/auto auto`), and *Guarded* holds on every
+  runner, where a classifier does not. `auto` stays an alias of Guarded.

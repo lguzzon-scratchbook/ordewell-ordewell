@@ -270,7 +270,7 @@
         "ordewell.autonomousMode": {
           "type": "boolean",
           "default": true,
-          "description": "Autonomy level for new plans. On = Full auto: each runner's autonomous mode. Off = Auto: each runner's safe mode, where the runner's own reviewer or classifier decides what to approve. Change it with /auto full or /auto auto."
+          "description": "Autonomy level for new plans. On = Full: each runner's autonomous mode, with no permission prompts. Off = Guarded: each runner's safe mode, where the runner's own reviewer or classifier decides what to approve. Change it with /auto full or /auto guarded."
         },
         "ordewell.worktreeIsolation": {
           "type": "boolean",

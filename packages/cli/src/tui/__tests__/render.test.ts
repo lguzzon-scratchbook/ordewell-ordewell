@@ -147,11 +147,11 @@ describe('top bar', () => {
     expect(on).toContain('tdd');
   });
 
-  it('names the autonomy level, Full auto or Auto', () => {
-    expect(text({ autonomous: true })).toContain('Full auto');
+  it('names the autonomy level, Full or Guarded', () => {
+    expect(text({ autonomous: true })).toContain('Full');
     const auto = text({ autonomous: false });
-    expect(auto).toContain('Auto');
-    expect(auto).not.toContain('Full auto');
+    expect(auto).toContain('Guarded');
+    expect(auto).not.toContain('Full');
   });
 
   it('carries no product name, model, or workspace — those live in the welcome banner', () => {

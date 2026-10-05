@@ -123,33 +123,34 @@ describe('runners and autonomy', () => {
     });
   });
 
-  it('/auto full and /auto auto select the two levels', () => {
+  it('/auto full and /auto guarded select the two levels', () => {
     expect(run('/auto full', { autonomous: false }).effects).toEqual([{ type: 'setAutonomous', enabled: true }]);
-    expect(run('/auto auto', { autonomous: true }).effects).toEqual([{ type: 'setAutonomous', enabled: false }]);
+    expect(run('/auto guarded', { autonomous: true }).effects).toEqual([{ type: 'setAutonomous', enabled: false }]);
   });
 
-  it('the legacy on and off are aliases of Full auto and Auto', () => {
+  it('on, off and auto are aliases of Full and Guarded', () => {
     expect(run('/auto on', { autonomous: false }).effects).toEqual([{ type: 'setAutonomous', enabled: true }]);
     expect(run('/auto off', { autonomous: true }).effects).toEqual([{ type: 'setAutonomous', enabled: false }]);
+    expect(run('/auto auto', { autonomous: true }).effects).toEqual([{ type: 'setAutonomous', enabled: false }]);
   });
 
   it('a bare /auto prints the current level and changes nothing', () => {
     const full = run('/auto', { autonomous: true });
     expect(full.effects).toEqual([]);
     expect(full.state.autonomous).toBe(true);
-    expect(lastMessage(full.state)?.text).toContain('Full auto');
-    expect(lastMessage(run('/auto', { autonomous: false }).state)?.text).toContain('Auto');
+    expect(lastMessage(full.state)?.text).toContain('Full');
+    expect(lastMessage(run('/auto', { autonomous: false }).state)?.text).toContain('Guarded');
   });
 
   it('/auto updates the state so the badge sees the new level', () => {
-    expect(run('/auto auto', { autonomous: true }).state.autonomous).toBe(false);
+    expect(run('/auto guarded', { autonomous: true }).state.autonomous).toBe(false);
     expect(run('/auto full', { autonomous: false }).state.autonomous).toBe(true);
   });
 
   it('/auto with anything else shows the usage with both level names', () => {
     const { effects, state } = run('/auto maybe');
     expect(effects).toEqual([]);
-    expect(lastMessage(state)?.text).toBe('Usage: /auto [full|auto]');
+    expect(lastMessage(state)?.text).toBe('Usage: /auto [full|guarded]');
   });
 
   // Capture used to cost the user drag-select outright; now the app does the

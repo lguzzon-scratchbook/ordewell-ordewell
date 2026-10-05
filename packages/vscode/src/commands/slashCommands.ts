@@ -22,7 +22,7 @@ export const SLASH_COMMANDS: readonly SlashCommandSpec[] = [
   { label: '/compact', detail: 'Condense this conversation into a summary; the last two exchanges and all tasks are kept', insertText: '/compact' },
   { label: '/allowlist', detail: 'Restrict which models the planner may auto-assign per runner', insertText: '/allowlist' },
   { label: '/refresh', detail: 'Re-discover runner models (e.g. after enabling an opencode backend)', insertText: '/refresh' },
-  { label: '/auto', detail: 'Set the autonomy level for new plans: Full auto or Auto', insertText: '/auto' },
+  { label: '/auto', detail: 'Set the autonomy level for new plans: Full or Guarded', insertText: '/auto' },
   { label: '/parallel', detail: 'How many AI tasks run at once — applies to a run already going', insertText: '/parallel ' },
   { label: '/help', detail: 'Show all available commands', insertText: '/help' },
 ];

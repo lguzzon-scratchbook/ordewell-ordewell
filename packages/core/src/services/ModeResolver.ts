@@ -76,15 +76,15 @@ export function filteredBuildModes(modes: RunnerModeInfo[], autonomousDefault: b
 }
 
 /** The user-facing name of the `autonomousMode` boolean's two states. */
-export function autonomyLevelLabel(autonomous: boolean): 'Full auto' | 'Auto' {
-  return autonomous ? 'Full auto' : 'Auto';
+export function autonomyLevelLabel(autonomous: boolean): 'Full' | 'Guarded' {
+  return autonomous ? 'Full' : 'Guarded';
 }
 
-/** `full`/`auto` name the levels; `on`/`off` are the toggle's old words for them. Null for anything else. */
+/** `full`/`guarded` name the levels; `on`/`off` and `auto` are older words for them. Null for anything else. */
 export function parseAutonomyLevel(arg: string | undefined): boolean | null {
   switch (arg?.trim().toLowerCase()) {
     case 'full': case 'on': return true;
-    case 'auto': case 'off': return false;
+    case 'guarded': case 'auto': case 'off': return false;
     default: return null;
   }
 }

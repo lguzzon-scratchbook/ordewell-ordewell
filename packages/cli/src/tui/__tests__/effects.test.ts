@@ -945,7 +945,7 @@ describe('skills and settings', () => {
     const h = harness();
     await runEffect({ type: 'setAutonomous', enabled: false }, h.deps);
     expect(h.env.ORDEWELL_AUTONOMOUS_MODE).toBe('false');
-    expect(h.actions).toContainEqual({ type: 'notice', message: 'Autonomy level: Auto for new plans.' });
+    expect(h.actions).toContainEqual({ type: 'notice', message: 'Autonomy level: Guarded for new plans.' });
   });
 });
 

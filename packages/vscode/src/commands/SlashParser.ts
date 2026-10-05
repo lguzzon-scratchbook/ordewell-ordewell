@@ -301,7 +301,7 @@ export async function handleSlashCommand(text: string, deps: SlashDeps): Promise
     }
     const direct = parseAutonomyLevel(args[0]);
     if (args[0] !== undefined && direct === null) {
-      vscode.window.showWarningMessage('Usage: /auto [full|auto]');
+      vscode.window.showWarningMessage('Usage: /auto [full|guarded]');
       return;
     }
     if (direct !== null) {

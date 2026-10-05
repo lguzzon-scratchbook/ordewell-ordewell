@@ -549,7 +549,7 @@ describe('buildModeGuide', () => {
     { id: 'plan', label: 'Plan', description: 'Read-only agent' },
   ];
 
-  it('shows only autonomous-compatible modes for claude-code under Full auto, safe-only modes hidden', () => {
+  it('shows only autonomous-compatible modes for claude-code under Full, safe-only modes hidden', () => {
     const guide = buildModeGuide({ 'claude-code': claudeModes, 'opencode': opencodeModes }, true);
     expect(guide).toContain('AVAILABLE MODES PER RUNNER');
     // safe-only "auto" is filtered out
@@ -579,18 +579,18 @@ describe('buildModeGuide', () => {
 
   it('names the autonomy level the plan is generated under', () => {
     const runners = { 'claude-code': claudeModes };
-    expect(buildModeGuide(runners, true)).toContain('Autonomy level: Full auto');
-    expect(buildModeGuide(runners, false)).toContain('Autonomy level: Auto');
+    expect(buildModeGuide(runners, true)).toContain('Autonomy level: Full');
+    expect(buildModeGuide(runners, false)).toContain('Autonomy level: Guarded');
   });
 
   it('labels the two levels', () => {
-    expect(autonomyLevelLabel(true)).toBe('Full auto');
-    expect(autonomyLevelLabel(false)).toBe('Auto');
+    expect(autonomyLevelLabel(true)).toBe('Full');
+    expect(autonomyLevelLabel(false)).toBe('Guarded');
   });
 
   it.each([
     ['full', true], ['FULL', true], ['on', true],
-    ['auto', false], ['Auto', false], ['off', false],
+    ['guarded', false], ['GUARDED', false], ['auto', false], ['off', false],
     ['maybe', null], ['', null], [undefined, null],
   ])('parses the level argument %s', (arg, expected) => {
     expect(parseAutonomyLevel(arg)).toBe(expected);

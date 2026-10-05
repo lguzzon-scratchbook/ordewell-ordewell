@@ -409,9 +409,9 @@ function setMaxParallel(state: TuiState, arg: string | undefined): Step {
 }
 
 function setAutonomous(state: TuiState, arg: string | undefined): Step {
-  if (arg === undefined) return step(say(state, 'system', `Autonomy level: ${autonomyLevelLabel(state.autonomous)} — /auto full or /auto auto changes it for new plans.`));
+  if (arg === undefined) return step(say(state, 'system', `Autonomy level: ${autonomyLevelLabel(state.autonomous)} — /auto full or /auto guarded changes it for new plans.`));
   const enabled = parseAutonomyLevel(arg);
-  if (enabled === null) return fail(state, 'Usage: /auto [full|auto]');
+  if (enabled === null) return fail(state, 'Usage: /auto [full|guarded]');
   // Updated here, not from the effect: nothing round-trips this setting back
   // (it lives in .env), and a stale flag would freeze the toggle and the badge.
   return step({ ...state, autonomous: enabled }, [{ type: 'setAutonomous', enabled }]);

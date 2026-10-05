@@ -33,7 +33,7 @@ export async function handleRunners(subArgs: string[], injectedApi?: ApiClient):
   console.log(`${runner} ${enabled ? 'enabled' : 'disabled'}.`);
 }
 
-const AUTO_USAGE = 'Usage: ordewell auto [full|auto]';
+const AUTO_USAGE = 'Usage: ordewell auto [full|guarded]';
 
 /**
  * The approval posture new sessions start in. It lives only in `.env` and is

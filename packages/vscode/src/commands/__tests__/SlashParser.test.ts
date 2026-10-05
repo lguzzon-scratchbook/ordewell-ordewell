@@ -219,10 +219,11 @@ describe('conversation-editing slash commands', () => {
       window[name] as unknown as ReturnType<typeof vi.fn>;
 
     it.each([
-      ['full', true, 'Full auto'],
-      ['auto', false, 'Auto'],
-      ['on', true, 'Full auto'],
-      ['off', false, 'Auto'],
+      ['full', true, 'Full'],
+      ['guarded', false, 'Guarded'],
+      ['auto', false, 'Guarded'],
+      ['on', true, 'Full'],
+      ['off', false, 'Guarded'],
     ])('/auto %s stores %s and names the level %s', async (arg, stored, label) => {
       const updateConfig = vi.fn(async () => {});
       mocked('showInformationMessage').mockClear();
@@ -236,7 +237,7 @@ describe('conversation-editing slash commands', () => {
       mocked('showQuickPick').mockReset().mockResolvedValue(undefined);
       await handleSlashCommand('/auto', makeDeps({ updateConfig }));
       const items = mocked('showQuickPick').mock.calls[0][0] as { label: string; picked: boolean }[];
-      expect(items.map((i) => i.label)).toEqual(['Full auto (recommended)', 'Auto']);
+      expect(items.map((i) => i.label)).toEqual(['Full (recommended)', 'Guarded']);
       expect(items.map((i) => i.picked)).toEqual([true, false]);
       expect(updateConfig).not.toHaveBeenCalled();
     });
@@ -245,7 +246,7 @@ describe('conversation-editing slash commands', () => {
       const updateConfig = vi.fn(async () => {});
       mocked('showWarningMessage').mockClear();
       await handleSlashCommand('/auto maybe', makeDeps({ updateConfig }));
-      expect(mocked('showWarningMessage').mock.calls[0][0]).toBe('Usage: /auto [full|auto]');
+      expect(mocked('showWarningMessage').mock.calls[0][0]).toBe('Usage: /auto [full|guarded]');
       expect(updateConfig).not.toHaveBeenCalled();
     });
   });

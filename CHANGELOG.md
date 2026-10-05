@@ -55,6 +55,11 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   terminal and its prompt in its arguments now has its stdin closed.
 
 ## [0.6.2] — 2026-10-04
+### Changed
+
+- The autonomy levels are now **Full** and **Guarded** (were Full auto and Auto):
+  `/auto full` and `/auto guarded`, `ordewell auto full|guarded`. `auto`, `on`
+  and `off` still work as aliases.
 
 ### Fixed
 

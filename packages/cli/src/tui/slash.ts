@@ -52,7 +52,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'key', usage: '/key [set <provider> <key>]', description: 'Configure API provider keys', category: 'models' },
   { name: 'allowlist', usage: '/allowlist [set <runner> <ids> | clear <runner>]', description: 'Limit which models a runner may use', category: 'models' },
   { name: 'runners', usage: '/runners [<id> on|off]', description: 'Enable or disable runners (claude-code, opencode, codex)', category: 'models' },
-  { name: 'auto', usage: '/auto [full|auto]', description: 'Autonomy level for new plans: Full auto or Auto', category: 'models' },
+  { name: 'auto', usage: '/auto [full|guarded]', description: 'Autonomy level for new plans: Full or Guarded', category: 'models' },
   { name: 'transport', usage: '/transport [terminal|structured]', description: 'Drive tasks through each runner\'s protocol (structured) or a terminal, from the next run', category: 'models' },
   { name: 'parallel', usage: '/parallel [<n>]', description: 'How many AI tasks run at once (applies to a live run)', category: 'models' },
   { name: 'refresh', usage: '/refresh', description: 'Re-discover runners and model catalogs', category: 'models' },

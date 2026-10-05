@@ -48,7 +48,7 @@ Planner, models and runners:
   ordewell key [set <p> <key>]    Show which providers have a key, or store one
   ordewell runners [<id> on|off]  Enable or disable runners (claude-code, opencode, codex)
   ordewell allowlist set|clear|show       Limit which models a runner may use
-  ordewell auto [full|auto]       Autonomy level for new sessions: Full auto or Auto
+  ordewell auto [full|guarded]    Autonomy level for new sessions: Full or Guarded
   ordewell transport [terminal|structured]   Structured (default) or terminal task transport, from the next run
   ordewell parallel [<n>]         How many AI tasks run at once (default 3; applies to a live run)
   ordewell refresh                Re-discover runners and model catalogs
@@ -122,7 +122,7 @@ Environment:
   ORDEWELL_PLANNER_EFFORT    Thinking effort for a coding-agent planner
   ORCHESTRATOR_MODEL         Default: deepseek/deepseek-v4-flash
   OPENROUTER_BASE_URL        Default: https://openrouter.ai/api/v1
-  ORDEWELL_AUTONOMOUS_MODE   true: Full auto, false: Auto, for new sessions (see "ordewell auto")
+  ORDEWELL_AUTONOMOUS_MODE   true: Full, false: Guarded, for new sessions (see "ordewell auto")
   ORDEWELL_PORT              Daemon port CLI commands target (default: 3742)
   ORDEWELL_DIRENV            false: agents skip the project's direnv .envrc
   ORDEWELL_RESEARCH_ENABLED  true (default) or false

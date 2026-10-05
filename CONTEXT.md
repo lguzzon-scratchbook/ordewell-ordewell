@@ -1004,19 +1004,20 @@ keep the two surfaces from diverging.
 **ModeResolver** — the deep module owning ADR-0001 mode resolution: the
 planner-nudged, parser-validated policy that picks each AI task's runner mode
 (`build`/`acceptEdits`/`plan`/…) from manifest `autonomous`/`safe` tags and the
-global autonomy toggle — two named levels, **Full auto** (the `autonomous`-tagged
-mode, today's ON) and **Auto** (the `safe`-tagged mode, today's OFF), carried as
+global autonomy toggle — two named levels, **Full** (the `autonomous`-tagged
+mode, today's ON) and **Guarded** (the `safe`-tagged mode, today's OFF), carried as
 the boolean `autonomousMode` (`autonomousDefault`, TUI `autonomous`) and named for
-users by `autonomyLevelLabel`; `/auto full|auto` selects one, with `on`/`off` as
+users by `autonomyLevelLabel`; `/auto full|guarded` selects one, with `on`/`off` and `auto` as
 aliases (`parseAutonomyLevel`). Three operations behind one interface:
 `resolveDefaultMode` (tag-based default per toggle), `buildModeGuide` (the
 mode list the planner's prompt shows, DEFAULT-tagged, opposite-toggle modes
 hidden), and `resolveTaskMode` (the parser's validator — fixes invalid or
 toggle-conflicting emissions, never overrides a valid `plan`). The policy is
 planner-nudged, never runtime-overridden; what the plan says is what runs.
-*Avoid:* "mode service", "mode manager", "auto mode" for either level — Claude Code
-has a real `auto` permission mode (its classifier), which is Ordewell's *Auto*
-level on that runner, not a synonym for Full auto — and do not confuse with
+*Avoid:* "mode service", "mode manager", "auto mode" for either level, and "Full auto" /
+"Auto" (the levels' old names) — Claude Code has a real `auto` permission mode
+(its classifier), which is Ordewell's *Guarded* level on that runner, not a
+synonym for Full — and do not confuse with
 **ModelResolver** (model discovery/routing). The names differ by one letter on
 purpose: ModeResolver resolves *runner modes*; ModelResolver resolves *models*.
 *Avoid:* "the parser" for this policy — it lives in `ModeResolver.ts`, not the
