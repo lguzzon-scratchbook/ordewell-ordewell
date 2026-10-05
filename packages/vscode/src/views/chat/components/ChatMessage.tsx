@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 import type {
   ApprovalBlock, ApprovalDecision, ApprovalKind, ApprovalSource, DisplayBlock, MessageBlock, PlanBlock, SubagentBlock, SubagentStatus,
-  ThinkingDisplayBlock, ToolBlock, ToolStatus,
+  ThinkingDisplayBlock, ToolBlock, ToolStatus, DiffRow, DiffStat,
 } from '@ordewell/core';
-import { outputLines, outputPreview } from '@ordewell/core/plan-utils';
+import { diffRows, diffSummary, outputLines, outputPreview } from '@ordewell/core/plan-utils';
 
 /*
  * The planner conversation (#51 display blocks) as the webview draws it.
@@ -13,6 +13,12 @@ import { outputLines, outputPreview } from '@ordewell/core/plan-utils';
  */
 
 const PREVIEW_LINES = 3;
+// A diff is read rather than skimmed, so its preview runs longer than a command's.
+const DIFF_PREVIEW_ROWS = 10;
+
+// One word with a slash and no scheme: a file path, whose end is the part
+// worth keeping when the row is too narrow. A URL keeps its host instead.
+const PATH_LIKE = /^(?![a-z][a-z0-9+.-]*:\/\/)\S*\/\S*$/i;
 
 // The text is a model's, and can be steered by what it read: quotes are
 // escaped so nothing leaves the href, and only a web URL becomes a link.
@@ -92,17 +98,54 @@ function prettyArgs(args: string): string {
   }
 }
 
+const DIFF_SIGN: Record<DiffRow['kind'], string> = { added: '+', removed: '-', context: ' ', gap: '' };
+
+function moreLines(count: number): string {
+  return `+${count} line${count === 1 ? '' : 's'}`;
+}
+
+/** An edit as an editor shows one: what it changed, then its lines numbered and marked. */
+function DiffView({ output, diff, expanded }: { output: string; diff: DiffStat; expanded: boolean }) {
+  const rows = diffRows(output);
+  const shown = expanded ? rows : rows.slice(0, DIFF_PREVIEW_ROWS);
+  const hidden = rows.length - shown.length;
+  return (
+    <>
+      <div className="diff-summary">{diffSummary(diff)}</div>
+      <div className="diff-view">
+        {shown.map((row, i) => (row.kind === 'gap'
+          ? <div key={i} className="diff-gap">⋮</div>
+          : (
+            <div key={i} className="diff-line" data-kind={row.kind}>
+              <span className="diff-num">{row.line}</span>
+              <span className="diff-sign">{DIFF_SIGN[row.kind]}</span>
+              <span className="diff-text">{row.text}</span>
+            </div>
+          )))}
+      </div>
+      {hidden > 0 && <span className="cmd-row-more">{moreLines(hidden)}</span>}
+    </>
+  );
+}
+
 export function CommandRow({ block, expanded }: { block: ToolBlock; expanded: boolean }) {
   const label = outcomeLabel(block);
   const preview = outputPreview(block.output, PREVIEW_LINES);
+  const { keyArg } = block.headline;
+  const path = PATH_LIKE.test(keyArg);
+  const diff = block.diff && block.status === 'ok' ? block.diff : null;
   return (
     <div className={`cmd-row${expanded ? ' expanded' : ''}`} data-status={block.status}>
       <div className="cmd-row-header">
         <span className="cmd-row-icon">{STATUS_ICON[block.status]}</span>
-        <code className="cmd-row-head">{block.headline.name}({block.headline.keyArg})</code>
+        <code className="cmd-row-head">
+          <span className="cmd-row-name">{block.headline.name}(</span>
+          <span className={`cmd-row-arg${path ? ' path' : ''}`} title={path ? keyArg : undefined}><bdi>{keyArg}</bdi></span>
+          <span className="cmd-row-name">)</span>
+        </code>
         {label && <span className="cmd-row-outcome">{label}</span>}
       </div>
-      {expanded ? (
+      {diff ? <DiffView output={block.output} diff={diff} expanded={expanded} /> : expanded ? (
         <>
           <pre className="cmd-row-args">{prettyArgs(block.args)}</pre>
           {block.output && <pre className="cmd-row-output">{outputLines(block.output).join('\n')}</pre>}
@@ -110,9 +153,7 @@ export function CommandRow({ block, expanded }: { block: ToolBlock; expanded: bo
       ) : preview.lines.length > 0 && (
         <>
           <pre className="cmd-row-preview">{preview.lines.join('\n')}</pre>
-          {preview.hiddenLineCount > 0 && (
-            <span className="cmd-row-more">+{preview.hiddenLineCount} line{preview.hiddenLineCount === 1 ? '' : 's'}</span>
-          )}
+          {preview.hiddenLineCount > 0 && <span className="cmd-row-more">{moreLines(preview.hiddenLineCount)}</span>}
         </>
       )}
     </div>

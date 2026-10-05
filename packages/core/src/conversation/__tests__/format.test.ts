@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { outputPreview, toolHeadline } from '../format';
+import { outputPreview, toolHeadline, diffRows, diffSummary } from '../format';
 
 describe('toolHeadline', () => {
   it('heads a shell call with its command', () => {
@@ -70,5 +70,34 @@ describe('outputPreview', () => {
     expect(outputPreview('', 3)).toEqual({ lines: [], hiddenLineCount: 0 });
     expect(outputPreview('\n', 3)).toEqual({ lines: [], hiddenLineCount: 0 });
     expect(outputPreview('a\nb', 0)).toEqual({ lines: [], hiddenLineCount: 2 });
+  });
+});
+
+describe('diffRows', () => {
+  it('numbers each line from its hunk header: a removal by the old file, the rest by the new', () => {
+    expect(diffRows('@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n@@ -9 +9,2 @@\n x\n+y\n')).toEqual([
+      { kind: 'context', line: 1, text: 'a' },
+      { kind: 'removed', line: 2, text: 'b' },
+      { kind: 'added', line: 2, text: 'B' },
+      { kind: 'context', line: 3, text: 'c' },
+      { kind: 'gap', text: '' },
+      { kind: 'context', line: 9, text: 'x' },
+      { kind: 'added', line: 10, text: 'y' },
+    ]);
+  });
+
+  it('numbers a whole new file from its first line, and leaves out the no-newline note', () => {
+    expect(diffRows('+hi\n+there\n\\ No newline at end of file\n')).toEqual([
+      { kind: 'added', line: 1, text: 'hi' },
+      { kind: 'added', line: 2, text: 'there' },
+    ]);
+  });
+});
+
+describe('diffSummary', () => {
+  it('says what an edit added and removed, leaving out a side that is nothing', () => {
+    expect(diffSummary({ added: 1, removed: 1 })).toBe('Added 1 line, removed 1 line');
+    expect(diffSummary({ added: 2, removed: 0 })).toBe('Added 2 lines');
+    expect(diffSummary({ added: 0, removed: 3 })).toBe('Removed 3 lines');
   });
 });

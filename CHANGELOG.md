@@ -8,6 +8,24 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **A task's file edits read as diffs, on every runner.** An edit row in the
+  TUI and VS Code task log now says what changed ("Added 3 lines, removed 2
+  lines"). Below that come the edited lines, numbered, with additions marked
+  `+` in green and removals `-` in red. Collapsed, a row previews the first ten
+  lines; the detail switch (ctrl+o in the TUI) shows all of them. Claude Code
+  and OpenCode rows used to say only that the edit succeeded.
+- **A Codex patch shows one row per file**, named for the change
+  (`Add`, `Update`, `Delete`), with paths relative to the task's worktree. A
+  patch to six files used to be one row listing six absolute paths.
+
+### Fixed
+
+- **A long path in a command row keeps its file name in view.** The TUI and
+  VS Code cut it from the left instead of the right, and VS Code shows the
+  whole path on hover. A worktree path used to hide the file name entirely.
+
 ## [0.6.4] — 2026-10-04
 
 ### Security

@@ -1061,6 +1061,26 @@ describe('command rows', () => {
     ]);
   });
 
+  it('cuts a path from the left, at a directory, so the file it names stays in view', () => {
+    const path = '/home/dev/app/.ordewell/worktrees/3c3de77a/2-a-task/packages/core/src/conversation/taskLog.ts';
+    const args = JSON.stringify({ path });
+    const state = heard(40,
+      { type: 'research_step', tool: 'read_file', args, toolCallId: 'tc-1' },
+      { type: 'research_step_done', step: { id: 'rs-tc-1', tool: 'read_file', args, result: 'export {}', success: true, outcome: 'success', toolCallId: 'tc-1', timestamp: '2026-09-27T10:00:00.000Z' } });
+
+    expect(blockRows(state, '●')[0]).toBe('● Read(…/src/conversation/taskLog.ts)');
+  });
+
+  it('cuts a URL from the right, keeping the host', () => {
+    const url = 'https://docs.example.com/guides/structured-transport/codex/file-changes';
+    const args = JSON.stringify({ url });
+    const state = heard(40,
+      { type: 'research_step', tool: 'fetch', args, toolCallId: 'tc-1' },
+      { type: 'research_step_done', step: { id: 'rs-tc-1', tool: 'fetch', args, result: 'ok', success: true, outcome: 'success', toolCallId: 'tc-1', timestamp: '2026-09-27T10:00:00.000Z' } });
+
+    expect(blockRows(state, '●')[0]).toBe('● Fetch(https://docs.example.com/guide…)');
+  });
+
   it('shows the whole header and preview when a 120-column pane has room', () => {
     const state = heard(120, bash(LOOP), ran(LOOP, ISSUES));
 

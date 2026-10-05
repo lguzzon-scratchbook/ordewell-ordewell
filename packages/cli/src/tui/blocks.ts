@@ -1,5 +1,6 @@
 import {
-  outputLines, outputPreview,
+  diffRows, diffSummary, outputLines, outputPreview,
+  type DiffRow, type DiffStat,
   type ApprovalBlock, type ApprovalKind, type ApprovalSource, type DisplayBlock, type MessageBlock, type MessageRole, type PlanBlock,
   type SubagentBlock, type SubagentStatus, type ThinkingDisplayBlock, type ToolBlock,
 } from '@ordewell/core';
@@ -106,6 +107,22 @@ function commandMark(block: ToolBlock): string {
   return (unsettledOutcome(block)?.paint ?? style.green)('●');
 }
 
+// One word with a slash and no scheme: a file path, whose last part is the
+// part worth keeping. A URL keeps its host instead.
+const PATH_LIKE = /^(?![a-z][a-z0-9+.-]*:\/\/)\S*\/\S*$/i;
+
+/** Cut a path from the left to `max` columns, starting at a directory boundary when one fits. */
+function truncatePath(path: string, max: number): string {
+  if (width(path) <= max) return path;
+  let tail = '';
+  for (const char of Array.from(path).reverse()) {
+    if (width(char + tail) > max - 1) break;
+    tail = char + tail;
+  }
+  const slash = tail.indexOf('/');
+  return `…${slash > 0 ? tail.slice(slash) : tail}`;
+}
+
 /**
  * `● Name(keyArg)` on one row. The argument gives way first, so the row still
  * names the tool and still closes its parenthesis. In full detail the header
@@ -119,7 +136,8 @@ function commandHeader(block: ToolBlock, cols: number, detailAll: boolean): stri
   }
   const open = `● ${name}(`;
   const room = cols - width(open) - 1;
-  const text = room > 1 ? `${open}${truncate(keyArg, room)})` : truncate(`${open}${keyArg})`, cols);
+  const cut = PATH_LIKE.test(keyArg) ? truncatePath(keyArg, room) : truncate(keyArg, room);
+  const text = room > 1 ? `${open}${cut})` : truncate(`${open}${keyArg})`, cols);
   return [`${commandMark(block)}${text.slice(1)}`];
 }
 
@@ -165,10 +183,42 @@ function resultLines(block: ToolBlock, room: number, detailAll: boolean): string
   return [...lines.map(sanitize), ...more].map((line) => style.grey(truncate(line, room)));
 }
 
+// A diff is read rather than skimmed, so its preview runs longer than a command's.
+const DIFF_PREVIEW_ROWS = 10;
+
+const DIFF_PAINT: Record<DiffRow['kind'], (text: string) => string> = {
+  added: style.green,
+  removed: style.red,
+  context: style.grey,
+  gap: style.grey,
+};
+const DIFF_SIGN: Record<DiffRow['kind'], string> = { added: '+', removed: '-', context: ' ', gap: '' };
+
+/**
+ * An edit as an editor shows one: what it changed, then its lines numbered,
+ * marked `+` green and `-` red. Collapsed, the head of the diff and a count of
+ * the rest; in full detail, all of it.
+ */
+function diffLines(block: ToolBlock, diff: DiffStat, room: number, detailAll: boolean): string[] {
+  const rows = diffRows(block.output);
+  const gutter = Math.max(0, ...rows.map((row) => String(row.line ?? '').length));
+  const draw = (row: DiffRow): string[] => {
+    const text = row.kind === 'gap' ? `${' '.repeat(gutter)} ⋮` : `${String(row.line ?? '').padStart(gutter)} ${DIFF_SIGN[row.kind]} ${sanitize(row.text)}`;
+    return (detailAll ? wrap(text, room) : [truncate(text, room)]).map(DIFF_PAINT[row.kind]);
+  };
+  const shown = detailAll ? rows : rows.slice(0, DIFF_PREVIEW_ROWS);
+  const hidden = rows.length - shown.length;
+  const more = hidden > 0 ? [style.grey(`… +${countOf(hidden, 'line')} (ctrl+o to expand)`)] : [];
+  return [diffSummary(diff), ...shown.flatMap(draw), ...more];
+}
+
 function toolLines(block: ToolBlock, cols: number, detailAll: boolean): string[] {
   const room = Math.max(1, cols - OUTPUT_INDENT.length);
-  const args = detailAll ? argumentLines(block.args).flatMap((line) => wrap(line, room)).map((line) => OUTPUT_INDENT + style.grey(line)) : [];
-  return [...commandHeader(block, cols, detailAll), ...args, ...underHeader(resultLines(block, room, detailAll))];
+  // An edit's arguments only restate its diff (the old and new text, the whole file written).
+  const diff = block.diff && block.status === 'ok' ? block.diff : null;
+  const args = detailAll && !diff ? argumentLines(block.args).flatMap((line) => wrap(line, room)).map((line) => OUTPUT_INDENT + style.grey(line)) : [];
+  const result = diff ? diffLines(block, diff, room, detailAll) : resultLines(block, room, detailAll);
+  return [...commandHeader(block, cols, detailAll), ...args, ...underHeader(result)];
 }
 
 // ── Subagents ────────────────────────────────────────────────────────────────

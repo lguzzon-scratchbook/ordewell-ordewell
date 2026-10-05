@@ -1,8 +1,10 @@
+import { isAbsolute, relative, sep } from 'path';
 import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter } from './AgentAdapter';
 import type { SubagentOutcome } from '../../models/Task';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { UsageRecord } from '../../models/Usage';
 import { StdioAgentAdapter, type SpawnSpec } from './StdioAgentAdapter';
+import { markedLines } from './fileDiff';
 import { probeCodexSandbox, codexSandboxUnavailableMessage, type CodexSandboxDecision } from './codexSandbox';
 
 const HANDSHAKE_TIMEOUT_MS = 30000;
@@ -47,9 +49,33 @@ interface ThreadItem {
   /** `collabAgentToolCall`: threads on the receiving end of the call. */
   receiverThreadIds?: string[];
   /** `fileChange`: the files the patch touches. */
-  changes?: Array<{ path?: string; diff?: string }>;
+  changes?: FileUpdateChange[];
   /** `collabAgentToolCall`: last known status of each target thread. */
   agentsStates?: Record<string, { status?: string; message?: string | null } | undefined>;
+}
+
+interface FileUpdateChange {
+  path?: string;
+  kind?: { type?: string; move_path?: string | null };
+  diff?: string;
+}
+
+/** A row's name is the change in Codex's own patch vocabulary, not a tool it did not call (ADR-0009). */
+const CHANGE_NAMES: Record<string, string> = { add: 'Add', update: 'Update', delete: 'Delete' };
+
+function changeName(change: FileUpdateChange): string {
+  return CHANGE_NAMES[change.kind?.type ?? ''] ?? 'file_change';
+}
+
+/**
+ * Codex's `diff` is a hunk only for an update: an added file arrives as its
+ * whole content and a deleted one as what it held.
+ */
+function changeDiff(change: FileUpdateChange): string {
+  const diff = change.diff ?? '';
+  if (change.kind?.type === 'add') return markedLines(diff, '+');
+  if (change.kind?.type === 'delete') return markedLines(diff, '-');
+  return diff;
 }
 
 /** One model call's usage, from `thread/tokenUsage/updated` — see {@link emitUsage}. */
@@ -238,6 +264,8 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
    * names only the item, and a person deciding needs to see the files.
    */
   private readonly fileChangePaths = new Map<string, string[]>();
+  /** The row each announced file of an in-flight `fileChange` item is shown under, by the file's shown path. */
+  private readonly fileChangeRows = new Map<string, Map<string, string>>();
   /** Requests this adapter sent and awaits an answer to, by JSON-RPC id. */
   private readonly pendingRequests = new Map<number, (ok: boolean) => void>();
   private resumeAttempted = false;
@@ -765,7 +793,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
         const paths = (item.changes ?? []).map((change) => change.path).filter((path): path is string => !!path);
         this.fileChangePaths.set(item.id, paths);
         if (this.startOpts?.kind === 'task') {
-          emit({ type: 'tool_call', id: item.id, name: 'file_change', args: { path: paths.join(', ') }, ...(subagentId ? { subagentId } : {}) });
+          for (const change of item.changes ?? []) this.announceFileChange(item.id, change, emit, subagentId);
         }
         return;
       }
@@ -831,8 +859,11 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
       case 'fileChange':
         this.fileChangePaths.delete(id);
         if (this.startOpts?.kind === 'task') {
-          const diff = (item.changes ?? []).map((change) => change.diff ?? '').join('\n');
-          emit({ type: 'tool_result', id, name: 'file_change', output: diff, success: item.status === 'completed', ...(subagentId ? { subagentId } : {}) });
+          for (const change of item.changes ?? []) {
+            const row = this.announceFileChange(id, change, emit, subagentId);
+            emit({ type: 'tool_result', id: row, name: changeName(change), output: changeDiff(change), success: item.status === 'completed', ...(subagentId ? { subagentId } : {}) });
+          }
+          this.fileChangeRows.delete(id);
           return;
         }
         // A planner's `fileChange` can only appear if the read-only sandbox
@@ -842,6 +873,36 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
       default:
         return;
     }
+  }
+
+  /**
+   * One row per changed file: a patch is several files, and one row naming
+   * them all reads as a single cut-off path. The first file keeps the item's
+   * id, which an approval for the patch points at. Announcing a file twice
+   * returns the row it already has, so a change first seen completed still
+   * gets its call.
+   */
+  private announceFileChange(itemId: string, change: FileUpdateChange, emit: (e: AgentEvent) => void, subagentId?: string): string {
+    const rows = this.fileChangeRows.get(itemId) ?? new Map<string, string>();
+    this.fileChangeRows.set(itemId, rows);
+    const path = this.shownChangePath(change);
+    const known = rows.get(path);
+    if (known) return known;
+    const row = rows.size === 0 ? itemId : `${itemId}:${path}`;
+    rows.set(path, row);
+    emit({ type: 'tool_call', id: row, name: changeName(change), args: { path }, ...(subagentId ? { subagentId } : {}) });
+    return row;
+  }
+
+  /** Relative to the task's worktree, where every path but a stray one lies; a move names both ends. */
+  private shownChangePath(change: FileUpdateChange): string {
+    const shown = (path: string): string => {
+      const cwd = this.startOpts?.cwd;
+      const rel = cwd ? relative(cwd, path) : path;
+      return rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel) ? rel : path;
+    };
+    const from = shown(change.path ?? '');
+    return change.kind?.move_path ? `${from} → ${shown(change.kind.move_path)}` : from;
   }
 
   /**

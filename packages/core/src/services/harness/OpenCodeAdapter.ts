@@ -7,6 +7,7 @@ import { killTree } from '../../utils/processTree';
 import { workspaceEnvOf } from '../workspaceEnv';
 import { runnerEnv } from './runnerEnv';
 import { OpenCodeV2 } from './OpenCodeV2';
+import { hunksOf, markedLines } from './fileDiff';
 import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { AgentEvent, AgentProcessDeps, AgentStartOptions, PlannerStartOptions, TaskModeAgentAdapter, TaskStartOptions } from './AgentAdapter';
@@ -64,8 +65,12 @@ interface OpenCodePart {
     input?: Record<string, unknown>;
     output?: string;
     error?: string;
-    /** On a `task` call once its child session exists: that session's id and the model it runs. */
-    metadata?: { sessionId?: string; model?: { providerID?: string; modelID?: string } };
+    /**
+     * On a `task` call once its child session exists: that session's id and
+     * the model it runs. On an `edit`, the unified diff it applied; on a
+     * `write`, whether the file was there before.
+     */
+    metadata?: { sessionId?: string; model?: { providerID?: string; modelID?: string }; diff?: unknown; exists?: unknown };
   };
 }
 
@@ -262,6 +267,18 @@ function taskDigest(output: string): string {
 function unwrapFileToolOutput(output: string): string {
   const inner = output.match(/<content>\n?([\s\S]*?)\n?<\/content>/);
   return inner ? inner[1] : output;
+}
+
+/**
+ * What a file edit changed, beside the text the model reads ("Edit applied
+ * successfully."): an edit's hunks, or a new file's lines. A write over an
+ * existing file reports no diff, so it keeps its text.
+ */
+function editDiff(tool: string, state: OpenCodePart['state']): string {
+  const { diff, exists } = state?.metadata ?? {};
+  if (typeof diff === 'string' && diff) return hunksOf(diff);
+  const content = state?.input?.content;
+  return tool === 'write' && exists === false && typeof content === 'string' ? markedLines(content, '+') : '';
 }
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -819,7 +836,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
         type: 'tool_result',
         id: callId,
         name,
-        output: unwrapFileToolOutput(part.state?.output ?? part.state?.error ?? ''),
+        output: (status === 'completed' && editDiff(name, part.state)) || unwrapFileToolOutput(part.state?.output ?? part.state?.error ?? ''),
         success: status === 'completed',
         subagentId,
       });
