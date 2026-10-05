@@ -56,6 +56,17 @@ describe('OrdewellMcpServer', () => {
     expect(await names(planner)).toEqual(['edit_plan', 'list_models', 'list_runners', 'submit_plan', 'task_output', 'task_query']);
   });
 
+  // Claude Code in plan mode refuses any MCP tool not marked read-only, even
+  // one pre-allowed with --allowedTools (verified against 2.1.289).
+  it('marks every planner tool read-only, and no task tool', async () => {
+    const server = newServer();
+    const task = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1 }));
+    const planner = await connect(await server.issuePlannerToken({ sessionId: 's1' }));
+
+    expect((await planner.listTools()).tools.map((t) => t.annotations?.readOnlyHint)).toEqual([true, true, true, true, true, true]);
+    expect((await task.listTools()).tools.map((t) => t.annotations?.readOnlyHint)).toEqual([undefined, undefined]);
+  });
+
   it('answers an unknown or revoked token with 401, and the SDK client cannot connect with it', async () => {
     const server = newServer();
     const credential = await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1 });

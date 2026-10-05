@@ -18,6 +18,10 @@ import { flattenTasks } from '../models/Task';
  */
 const CATALOG_MODEL_CAP = 100;
 
+/** Stands in for the catalog block where the planner pulls the catalog itself (ADR-0022, L3). */
+const PLANNER_TOOLS_REMINDER =
+  'Runners, models and modes may have changed since you last read them: call list_runners and list_models just before submit_plan.';
+
 /**
  * Reads a planner gets per user turn before every answer also carries an
  * instruction to land the turn. Three covers the realistic shape of a read —
@@ -809,10 +813,12 @@ export class PlannerConversation {
    *
    * The host's catalog is allowlist-filtered, so a restricted allowlist stays a
    * hard bound on every turn, and reads the plan's runners live, so a runner
-   * admitted mid-session by a retarget is shown like every other.
+   * admitted mid-session by a retarget is shown like every other. A planner
+   * with Ordewell's tools gets a reminder to read the catalog instead.
    */
   private catalogBlock(): string | null {
     if (!this.host.plan()) return null;
+    if (this.host.aiService().plannerToolsAttached?.()) return PLANNER_TOOLS_REMINDER;
     const { runners, models, modes, autonomousDefault } = this.host.catalog();
 
     const modelLines = runners.map((runner) => {

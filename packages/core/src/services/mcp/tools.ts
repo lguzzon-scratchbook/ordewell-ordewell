@@ -133,6 +133,7 @@ export interface McpTool<H> {
   name: string;
   description: string;
   inputSchema: { type: 'object'; [key: string]: unknown };
+  annotations?: { readOnlyHint: boolean };
   /** Validate `args` and hand them to the handler's method for this tool. */
   call(handler: H, args: unknown, context: McpToolContext): Promise<McpToolReply>;
 }
@@ -142,11 +143,13 @@ function tool<H, S extends z.ZodObject>(
   description: string,
   input: S,
   pick: (handler: H) => Run<z.infer<S>> | undefined,
+  annotations?: McpTool<H>['annotations'],
 ): McpTool<H> {
   return {
     name,
     description,
     inputSchema: { ...z.toJSONSchema(input, { io: 'input' }), type: 'object' },
+    ...(annotations ? { annotations } : {}),
     async call(handler, args, context) {
       const run = pick(handler);
       if (!run) return { text: `${name} is not available in this session.`, isError: true };
@@ -164,17 +167,26 @@ export const TASK_TOOLS: readonly McpTool<TaskToolHandler>[] = [
     checkpointInput, (h) => h.checkpoint?.bind(h)),
 ];
 
+/**
+ * Claude Code's plan mode refuses an MCP tool that does not declare itself
+ * read-only, pre-allowed or not, and the harness planner runs in plan mode.
+ * True of the workspace for every planner tool: `submit_plan` and `edit_plan`
+ * write only Ordewell's plan, through the same validation as the envelopes
+ * (ADR-0022, P1/P2).
+ */
+const PLANNER_READ_ONLY = { readOnlyHint: true };
+
 export const PLANNER_TOOLS: readonly McpTool<PlannerToolHandler>[] = [
   tool('list_runners', 'List the runners enabled right now, each with its modes and default mode. Call it just before submit_plan.',
-    listRunnersInput, (h) => h.listRunners?.bind(h)),
+    listRunnersInput, (h) => h.listRunners?.bind(h), PLANNER_READ_ONLY),
   tool('list_models', 'List the models a runner may use right now, with labels and thinking-effort variants.',
-    listModelsInput, (h) => h.listModels?.bind(h)),
+    listModelsInput, (h) => h.listModels?.bind(h), PLANNER_READ_ONLY),
   tool('submit_plan', 'Submit the whole plan. It is checked against the live runners and models; an error names the task, the field and what would be accepted.',
-    submitPlanInput, (h) => h.submitPlan?.bind(h)),
+    submitPlanInput, (h) => h.submitPlan?.bind(h), PLANNER_READ_ONLY),
   tool('edit_plan', 'Change the current plan with task operations: update, add, remove, reorder, merge, split or rearm.',
-    editPlanInput, (h) => h.editPlan?.bind(h)),
+    editPlanInput, (h) => h.editPlan?.bind(h), PLANNER_READ_ONLY),
   tool('task_query', 'Read the long fields of plan tasks that the plan summary leaves out.',
-    taskQueryInput, (h) => h.taskQuery?.bind(h)),
+    taskQueryInput, (h) => h.taskQuery?.bind(h), PLANNER_READ_ONLY),
   tool('task_output', "Read the tail of a task's captured output.",
-    taskOutputInput, (h) => h.taskOutput?.bind(h)),
+    taskOutputInput, (h) => h.taskOutput?.bind(h), PLANNER_READ_ONLY),
 ];

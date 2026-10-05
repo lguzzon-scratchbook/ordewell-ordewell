@@ -1,6 +1,8 @@
 import { createAiService, type IAiService } from './AiService';
 import { applyTaskOps, canMergeTasks, canSplitTask } from './TaskOps';
 import type { TaskQueryCatalog } from './TaskQuery';
+import { plannerToolHandler } from './plannerTools';
+import { sharedMcpServer, type OrdewellMcpServer, type PlannerToolHandler } from './mcp';
 import { validateTaskEdit, type EditCatalog } from './TaskEditValidator';
 import { ConversationEditError, PlannerConversation, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type PlannerSubmission, type RewindTarget } from './PlannerConversation';
 import { forkPlanState, type ForkedDialogue } from './conversationFork';
@@ -232,6 +234,8 @@ export interface SessionDeps {
   saveSession?: SaveSession;
   /** Where a structured task's log is saved (ADR-0018, P1). Defaults to a file per attempt beside the session's. */
   openTaskLog?: (location: TaskLogLocation, taskId: string) => TaskLogFile;
+  /** The Ordewell MCP server a harness planner's tools are served from (ADR-0022). Defaults to the process's one. */
+  mcpServer?: OrdewellMcpServer;
 }
 
 /**
@@ -248,14 +252,14 @@ export interface SessionDeps {
  * Switching releases the outgoing service: a harness planner holds an OS
  * process, so dropping the reference without `reset()` leaks an agent.
  */
-function liveAiService(config: IConfig, workspaceRoot: () => string): () => IAiService {
+function liveAiService(config: IConfig, workspaceRoot: () => string, mcpServer: OrdewellMcpServer): () => IAiService {
   let live: IAiService | null = null;
   let liveProvider: AiProvider | null = null;
   return () => {
     const provider = config.aiProvider;
     if (live && liveProvider === provider) return live;
     live?.reset();
-    live = createAiService(config, { workspaceRoot });
+    live = createAiService(config, { workspaceRoot, mcpServer });
     liveProvider = provider;
     return live;
   };
@@ -277,7 +281,7 @@ function isPlannerApproval(request: ApprovalRequest): boolean {
  */
 export function createSession(deps: SessionDeps): Session {
   const pinnedAiService = deps.aiService;
-  const aiService = pinnedAiService ? () => pinnedAiService : liveAiService(deps.config, deps.workspaceRoot);
+  const aiService = pinnedAiService ? () => pinnedAiService : liveAiService(deps.config, deps.workspaceRoot, deps.mcpServer ?? sharedMcpServer());
   const store = new PlanStore();
   const taskLogs = new TaskLogRecorder({
     broadcast: deps.broadcast,
@@ -455,6 +459,11 @@ export class Session {
   private currentSessionId: string;
   private readonly skillsService: Pick<SkillsService, 'findSkill' | 'listSkills'>;
   private readonly conversation: PlannerConversation;
+  private readonly plannerTools: PlannerToolHandler = plannerToolHandler({
+    liveCatalog: () => this.liveCatalog(),
+    coerce: (tasks, runners) => coerceAssignments(tasks, this.allowlist(), runners, this.models()),
+    submitPlan: (tasks, runners) => this.submitPlanFromTool(tasks, runners),
+  });
 
   constructor(parts: SessionParts) {
     this.config = parts.config;
@@ -941,6 +950,17 @@ export class Session {
     return this.conversation.submit(submission);
   }
 
+  /**
+   * A plan the planner submitted through its tool, already checked against the
+   * live catalog. Its runners join `plan.runners` here, so a runner enabled
+   * since planning started is not snapped back by the commit (#69).
+   */
+  private submitPlanFromTool(tasks: Task[], runners: RunnerId[]): boolean {
+    if (!this.plan || !this.conversation.submit({ kind: 'plan', tasks })) return false;
+    for (const runner of runners) this.admitRunner(runner, this.modelsCache[runner] ?? []);
+    return true;
+  }
+
   /** Whether the planner conversation is live (started and not yet committed to a plan). */
   get isConversationActive(): boolean {
     return this.conversation.isActive;
@@ -990,6 +1010,7 @@ export class Session {
       contextWindow: this.modelResolver.contextWindowFor?.(this.config.orchestratorModel),
       fs: this.fsAdapter,
       fetcher: this.fetcher,
+      plannerTools: { sessionId: this.sessionId, handler: this.plannerTools },
     };
   }
 

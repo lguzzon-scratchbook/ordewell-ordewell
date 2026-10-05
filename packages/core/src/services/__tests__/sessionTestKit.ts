@@ -65,6 +65,7 @@ export interface SessionOverrides {
   saveSession?: SaveSession;
   /** Defaults to attempt files held in memory, so a structured run never writes into the repo the suite runs in. */
   openTaskLog?: SessionDeps['openTaskLog'];
+  mcpServer?: SessionDeps['mcpServer'];
 }
 
 /** Task-log files that live in memory, numbered per task as the real store numbers them. */
@@ -113,8 +114,9 @@ export function makeSession(overrides: SessionOverrides = {}): Session {
     sessionId: overrides.sessionId,
     // Session drops a live conversation via reset() on fresh-plan and
     // plan-adoption boundaries — default it so partial fakes don't explode.
+    // A real service keeps its methods on the prototype, where a spread would drop them.
     aiService: overrides.aiService
-      ? ({ reset: vi.fn(), ...overrides.aiService } as IAiService)
+      ? ('reset' in overrides.aiService ? overrides.aiService as IAiService : ({ reset: vi.fn(), ...overrides.aiService } as IAiService))
       : undefined,
     planner: overrides.planner as SessionPlanner | undefined,
     skillsService: overrides.skillsService as SkillsService | undefined,
@@ -122,6 +124,7 @@ export function makeSession(overrides: SessionOverrides = {}): Session {
     isolation: overrides.isolation,
     saveSession: overrides.saveSession ?? save,
     openTaskLog: overrides.openTaskLog ?? memoryTaskLogs(),
+    mcpServer: overrides.mcpServer,
   });
   if (!overrides.saveSession) saveFakes.set(session, save);
   return session;

@@ -53,6 +53,6 @@ describe('CliAgentAiService start boundary', () => {
     const source = readFileSync(join(__dirname, '..', 'harness', 'CliAgentAiService.ts'), 'utf8');
     expect(source).not.toMatch(/kind:\s*['"]task['"]/);
     expect(source).not.toMatch(/TaskStartOptions|createTaskAdapter|TaskModeAgentAdapter/);
-    expect(source).toMatch(/private async startAdapter\(opts: PlannerStartOptions\)/);
+    expect(source).toMatch(/private async startAdapter\(opts: PlannerStartOptions[,)]/);
   });
 });
