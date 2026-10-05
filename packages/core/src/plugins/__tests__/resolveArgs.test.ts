@@ -442,7 +442,7 @@ describe('resolveArgs — Codex manifest', () => {
     expect(result.args).toContain('danger-full-access');
   });
 
-  // Full auto: nothing to review, so neither shape carries a reviewer, and the
+  // Full: nothing to review, so neither shape carries a reviewer, and the
   // interactive shape keeps `-a never`; `exec` already implies it.
   it.each([
     ['interactive', { interactive: true }, ['-a', 'never', '--sandbox', 'danger-full-access', 'go']],
