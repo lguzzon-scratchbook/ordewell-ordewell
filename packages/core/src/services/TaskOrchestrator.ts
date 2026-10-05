@@ -29,7 +29,7 @@ import { MessageQueue } from './MessageQueue';
 import { mergeGate, selectReadyTasks, type Readiness } from './readiness';
 import { capConflictFiles } from './conflictFiles';
 import { resolveWorkspaceEnv, type WorkspaceEnv } from './workspaceEnv';
-import { routeTransport } from './TransportRouter';
+import { givesCompletionTool, routeTransport } from './TransportRouter';
 import { continuability } from './continuation';
 import type { MergeGateView } from './SessionMessage';
 
@@ -285,6 +285,11 @@ export class TaskOrchestrator {
       this.verifier.pauseIdle(taskId);
       this.emit('onTaskSettled', { taskId });
       this.emit('onCheckpoint', { taskId, taskTitle: task.title, summary });
+    });
+    this.verifier.onCheckpointWithdrawn((taskId) => {
+      if (!this.atCheckpoint(taskId)) return;
+      this.store.markInProgress(taskId);
+      this.emit('onTaskChanged');
     });
     // idleSince is advisory UI state, not a store mutation — broadcast it
     // through the same onTaskChanged seam without touching PlanStore.
@@ -1337,10 +1342,14 @@ export class TaskOrchestrator {
         this.abandonSpawn(task, attempt);
         return false;
       }
+      // A continue resumes a session only the structured transport can reach,
+      // whatever the plan's latest run copied: the task already ran that way.
+      const transport = attempt.continuation ? 'structured' : this.planTransport ?? 'terminal';
+      const completionTool = givesCompletionTool(transport, attempt.runner, this.registry);
       // Through the same augmenting as any spawn, so the marker is the task's
       // own and the VerdictEngine watches for it unchanged.
       const finalPrompt = attempt.continuation
-        ? composeContinuationPrompt(task, attempt.continuation.message, { ops: attempt.ops })
+        ? composeContinuationPrompt(task, attempt.continuation.message, { ops: attempt.ops, completionTool })
         : composeAugmentedPrompt(attempt.repair ? { ...task, prompt: this.landing.repairPrompt(task) } : task, this.store.planTasks, {
           planMapEnabled: this.config.planMapEnabled,
           // A merge to resolve is not new behaviour to drive test-first.
@@ -1348,12 +1357,10 @@ export class TaskOrchestrator {
           // An ops task's effects outlive a failed attempt and are never rolled
           // back, so the next one is told what the last one did (ADR-0020).
           previousAttempt: attempt.ops ? this.opsPreviousAttempt(task.id) : undefined,
+          completionTool,
         });
       this.lingering.close(task.id);
       const env = await this.envForTask(cwd);
-      // A continue resumes a session only the structured transport can reach,
-      // whatever the plan's latest run copied: the task already ran that way.
-      const transport = attempt.continuation ? 'structured' : this.planTransport ?? 'terminal';
       const session = await this.terminalRunner.spawn({
         taskId: task.id,
         runner: attempt.runner,
@@ -1369,6 +1376,7 @@ export class TaskOrchestrator {
         env,
         transport,
         resumeSessionId: attempt.continuation?.resumeSessionId,
+        attempt: attempt.attempt,
       });
 
       // Stop/load/cancel can end the attempt while the async adapter is

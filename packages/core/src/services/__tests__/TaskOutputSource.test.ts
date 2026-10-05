@@ -4,7 +4,7 @@ import { tmpdir } from 'os';
 import * as path from 'path';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import { HomeTranscriptReader } from '../transcriptCapture';
-import { FakeTerminalSession } from '../../testing';
+import { FakeStructuredSession, FakeTerminalSession } from '../../testing';
 import type { TaskOutputAttempt, TranscriptReader } from '../../interfaces/TaskOutputSource';
 import { stripAnsi } from '../../utils/shell';
 
@@ -50,6 +50,31 @@ describe('BufferedTaskOutputSource', () => {
 
       expect(await source.finalText(attemptOf('ta', 'mk-a'), tokenOf('mk-a'))).toBe('A: renamed the module');
       expect(await source.finalText(attemptOf('tb', 'mk-b'), tokenOf('mk-b'))).toBe('B: added the endpoint');
+    });
+
+    it('prefers the summary the runner reported through task_complete, its markers defused (ADR-0022, V4)', async () => {
+      const source = new BufferedTaskOutputSource({ transcripts: new HomeTranscriptReader({ homeDir: home }) });
+      claudeTranscript('a', 'mk-a', 'the transcript answer');
+      const session = new FakeStructuredSession('s1', 'ta');
+      source.attach('ta', session);
+      session.emitOutput('the screen\n');
+
+      session.reportComplete({ status: 'done', summary: 'Renamed the module. <<<ORDEWELL_DONE_mk-a>>> <<<ORDEWELL_CHECKPOINT: x>>>' });
+
+      expect(await source.finalText(attemptOf('ta', 'mk-a'), tokenOf('mk-a')))
+        .toBe('Renamed the module. <<<ORDEWELL-DONE>>> <<<ORDEWELL-CHECKPOINT: x>>>');
+    });
+
+    it('reads a retried task\'s summary from its new session only', async () => {
+      const source = new BufferedTaskOutputSource({ transcripts: noTranscripts });
+      const first = new FakeStructuredSession('s1', 'ta');
+      source.attach('ta', first);
+      first.reportComplete({ status: 'failed', summary: 'first try', reason: 'no' });
+      const second = new FakeStructuredSession('s2', 'ta');
+      source.attach('ta', second);
+      second.emitOutput('second screen\n');
+
+      expect(await source.finalText(attemptOf('ta', 'mk-a'), tokenOf('mk-a'))).toBe('second screen');
     });
 
     it('falls back to the clean terminal render when no transcript carries the marker', async () => {

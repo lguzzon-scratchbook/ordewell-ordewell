@@ -4,7 +4,10 @@ import { join } from 'path';
 import { describe, it, expect } from 'vitest';
 import { StructuredRunner } from '../StructuredRunner';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
-import { isStructuredSession, type ITerminalSession, type StructuredTurnEnd } from '../../interfaces/ITerminalRunner';
+import { isStructuredSession, type ITerminalSession, type StructuredEvent, type StructuredTurnEnd } from '../../interfaces/ITerminalRunner';
+import { VerdictEngine } from '../VerdictEngine';
+import { composeAugmentedPrompt } from '../promptAugment';
+import { createTask, type Verdict } from '../../models/Task';
 
 /**
  * The opt-in live check for the structured transport (ADR-0018), gated like
@@ -16,8 +19,10 @@ import { isStructuredSession, type ITerminalSession, type StructuredTurnEnd } fr
  * It runs in a throwaway directory under `acceptEdits`, on the cheapest model
  * unless ORDEWELL_LIVE_MODEL says otherwise. What it asserts is the transport:
  * the marker reaches `onOutput` whole, a tool call becomes one line, a soft
- * interrupt ends the turn without ending the task, and a turn is not closed
- * while background work is still running.
+ * interrupt ends the turn without ending the task, a turn is not closed
+ * while background work is still running, and a task completes through the
+ * `task_complete` tool without an approval, and a `checkpoint` call stays
+ * open until the checkpoint is answered (ADR-0022).
  *
  * The `auto` case needs a model and an account the CLI offers auto mode on. If
  * it refuses, the case is skipped with the CLI's own words — the mode is never
@@ -171,6 +176,84 @@ describe.runIf(live)('structured transport — live smoke', () => {
       await turns.next();
       expect(turns.ends).toEqual(['interrupted', 'completed']);
       expect(session.getOutput().toLowerCase()).toContain('ok');
+    } finally {
+      runner.stopAll();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, TIMEOUT_MS);
+  it('completes a task through task_complete in default mode, with nothing asked of a person (ADR-0022)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-'));
+    const runner = new StructuredRunner();
+    const task = createTask({ id: 'live-tool', title: 'Multiply', prompt: 'Work out 17 * 23 and state the result.', taskMode: 'default', completionMarker: 'live-tool' });
+    const engine = new VerdictEngine();
+    const verdict = new Promise<Verdict>((resolve) => engine.onVerdict((_taskId, v) => resolve(v)));
+    try {
+      const session = await runner.spawn({
+        taskId: task.id,
+        runner: 'claude-code',
+        prompt: composeAugmentedPrompt(task, [task], { completionTool: true }),
+        modelId: model,
+        mode: 'default',
+        cwd: dir,
+        registry: new RunnerRegistry(),
+        attempt: 1,
+      });
+      const turns = turnEnds(session);
+      const events: StructuredEvent[] = [];
+      turns.session.onEvent((event) => events.push(event));
+      engine.watch(task, session);
+
+      const decided = await verdict;
+      expect(decided.outcome).toBe('pass');
+      expect(decided.checks[0].name, session.getOutput()).toBe('task_complete');
+      await turns.next();
+      const call = events.find((e) => e.type === 'tool_call' && e.name === 'mcp__ordewell__task_complete');
+      expect(call).toBeDefined();
+      expect(events.find((e) => e.type === 'tool_result' && call?.type === 'tool_call' && e.id === call.id)).toMatchObject({ success: true });
+      expect(events.filter((e) => e.type === 'permission_request' && !e.decided)).toEqual([]);
+      console.error(`[live] task_complete verdict for Claude Code session ${turns.session.nativeSessionId()}`);
+      session.kill();
+    } finally {
+      runner.stopAll();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, TIMEOUT_MS);
+
+  it('holds a checkpoint tool call open until it is answered, and returns the answer (ADR-0022, V5)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-'));
+    const runner = new StructuredRunner();
+    const task = createTask({ id: 'live-checkpoint', title: 'Ask', prompt: 'Your task: call the checkpoint tool with the question "Shall I proceed with the migration?", then state exactly what the result was. Whatever it is, do not call the checkpoint tool a second time.', taskMode: 'default', completionMarker: 'live-checkpoint', autonomy: 'HITL' });
+    const engine = new VerdictEngine();
+    const verdict = new Promise<Verdict>((resolve) => engine.onVerdict((_taskId, v) => resolve(v)));
+    const asked: string[] = [];
+    engine.onCheckpoint((taskId, question) => {
+      asked.push(question);
+      // A model told "rejected" may ask again; only the first ask is refused.
+      setTimeout(() => (asked.length === 1 ? engine.rejectCheckpoint(taskId, 'not today') : engine.approveCheckpoint(taskId)), 3000);
+    });
+    try {
+      const session = await runner.spawn({
+        taskId: task.id,
+        runner: 'claude-code',
+        prompt: composeAugmentedPrompt(task, [task], { completionTool: true }),
+        modelId: model,
+        mode: 'default',
+        cwd: dir,
+        registry: new RunnerRegistry(),
+        attempt: 1,
+      });
+      const events: StructuredEvent[] = [];
+      if (!isStructuredSession(session)) throw new Error('not a structured session');
+      session.onEvent((event) => events.push(event));
+      engine.watch(task, session);
+
+      await verdict;
+      const call = events.find((e) => e.type === 'tool_call' && e.name === 'mcp__ordewell__checkpoint');
+      expect(call, session.getOutput()).toBeDefined();
+      expect(asked).toHaveLength(1);
+      expect(events.find((e) => e.type === 'tool_result' && call?.type === 'tool_call' && e.id === call.id)).toMatchObject({ success: true, output: 'rejected: not today' });
+      expect(events.filter((e) => e.type === 'permission_request' && !e.decided)).toEqual([]);
+      session.kill();
     } finally {
       runner.stopAll();
       rmSync(dir, { recursive: true, force: true });

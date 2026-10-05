@@ -4,6 +4,7 @@ import { join } from 'path';
 import type { ChildProcess } from 'child_process';
 import type { SpawnFn } from '../HeadlessRunner';
 import type { AgentAdapterFactory, AgentEvent } from '../harness/AgentAdapter';
+import type { RunnerPluginManifest } from '../../plugins/types';
 
 /**
  * The one test seam for harness planners (ADR-0009): a fake process boundary,
@@ -42,6 +43,8 @@ export interface FakeSpawnResult {
   /** The argv of the most recent spawn — how the read-only flags are asserted. */
   lastArgs(): string[];
   lastCommand(): string;
+  /** The environment of the most recent spawn. */
+  lastEnv(): NodeJS.ProcessEnv;
   /** The argv of each sandbox probe, in order — see {@link FakeSpawnOptions.probe}. */
   probeArgs(): string[][];
 }
@@ -124,9 +127,10 @@ export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = 
   const probes: string[][] = [];
   let command = '';
   let args: string[] = [];
+  let env: NodeJS.ProcessEnv = {};
   const queue = [...replies];
 
-  const spawn: SpawnFn = (cmd, argv) => {
+  const spawn: SpawnFn = (cmd, argv, spawnOptions) => {
     // The sandbox probe is a short-lived side process, not the agent's
     // transport: it is kept out of `processes` and `lastArgs` so that adding it
     // does not shift the indices every other scenario asserts on.
@@ -143,6 +147,7 @@ export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = 
 
     command = cmd;
     args = argv;
+    env = spawnOptions?.env ?? {};
     const proc = makeProcess();
     processes.push(proc);
     proc.on('__written', (chunk: string) => {
@@ -159,8 +164,29 @@ export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = 
     processes,
     lastArgs: () => args,
     lastCommand: () => command,
+    lastEnv: () => env,
     probeArgs: () => probes,
   };
+}
+
+/**
+ * A fake spawn whose every process hands each stdin write to `onWrite`, with
+ * the argv it was spawned under — for an agent that must answer the control
+ * channel and the turns alike, however many of each a scenario sends.
+ */
+export function respondingSpawn(onWrite: (written: string, proc: FakeAgentProcess, args: string[]) => void): FakeSpawnResult {
+  const processes: FakeAgentProcess[] = [];
+  let command = '';
+  let args: string[] = [];
+  const spawn: SpawnFn = (cmd, argv) => {
+    command = cmd;
+    args = argv;
+    const proc = makeProcess();
+    processes.push(proc);
+    proc.on('__written', (chunk: string) => onWrite(chunk, proc, argv));
+    return proc as unknown as ChildProcess;
+  };
+  return { spawn, processes, lastArgs: () => args, lastCommand: () => command, lastEnv: () => ({}), probeArgs: () => [] };
 }
 
 /**
@@ -237,4 +263,11 @@ export function openCodeFixture(name: string): { sessionId: string; frames: stri
     .filter((line) => line.trim())
     .map((line) => `data: ${line}\n\n`);
   return { sessionId: response.info.sessionID, frames, response };
+}
+
+/** Every mode a runner offers, so a per-mode test cannot quietly run over none. */
+export function modeIds(manifest: RunnerPluginManifest): string[] {
+  const ids = (manifest.modes ?? []).map((mode) => mode.id);
+  if (ids.length === 0) throw new Error(`${manifest.name} lists no modes`);
+  return ids;
 }

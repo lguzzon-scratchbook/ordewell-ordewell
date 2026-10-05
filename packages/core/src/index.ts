@@ -86,7 +86,7 @@ export type { TaskQuery, TaskQueryField, TaskQueryCatalog, LiveOutputLookup } fr
 export { Session, createSession, PlanEditError, sessionRuntimeSettings, resolveSkillInvocation } from './services/createSession';
 export type { SessionDeps, SessionRuntimeSettings, SessionPlanner, SaveSession, ConversationFork, ConversationRewind } from './services/createSession';
 export { ConversationEditError, ConversationBusyError } from './services/PlannerConversation';
-export type { RewindTarget, ConversationCompaction } from './services/PlannerConversation';
+export type { RewindTarget, ConversationCompaction, PlannerSubmission } from './services/PlannerConversation';
 export {
   SkillsService,
   createSkillsService,
@@ -136,6 +136,7 @@ export { continuability, canContinue } from './services/continuation';
 export type { Continuability } from './services/continuation';
 export { TaskLogRecorder } from './services/TaskLogRecorder';
 export type { TaskLogRecorderDeps } from './services/TaskLogRecorder';
+export * from './services/mcp';
 export * from './utils/shell';
 export {
   planDirectLaunch,

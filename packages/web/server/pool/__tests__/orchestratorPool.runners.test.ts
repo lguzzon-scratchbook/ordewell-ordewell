@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { ModelResolver, Session, type LegacyPlanState } from '@ordewell/core';
 import { OrchestratorPool } from '../orchestratorPool';
 
 /**
@@ -51,5 +52,24 @@ describe('OrchestratorPool enabled runners', () => {
     pool.setRunnerEnabled('opencode', true);
     pool.setRunnerEnabled('opencode', true);
     expect(new OrchestratorPool().getRunnerState().enabledRunners).toEqual(['claude-code', 'opencode']);
+  });
+
+  it('a session already open sees a runner enabled after it started', async () => {
+    const workspace = path.join(dir, 'ws');
+    fs.mkdirSync(path.join(workspace, '.git'), { recursive: true });
+    const startSpy = vi.spyOn(Session.prototype, 'startPlanning').mockResolvedValue({} as LegacyPlanState);
+    const discoverSpy = vi.spyOn(ModelResolver.prototype, 'modelsForRunners').mockResolvedValue({});
+    const pool = new OrchestratorPool();
+    try {
+      await pool.startPlanning('s1', 'ship it', ['claude-code'], workspace);
+
+      pool.setRunnerEnabled('opencode', true);
+
+      expect((await pool.session('s1').liveCatalog()).runners).toEqual(['claude-code', 'opencode']);
+    } finally {
+      startSpy.mockRestore();
+      discoverSpy.mockRestore();
+      pool.destroyAll();
+    }
   });
 });

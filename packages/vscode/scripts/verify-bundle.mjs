@@ -21,8 +21,11 @@ const OPTIONAL = new Set(['encoding']);
 const source = readFileSync(BUNDLE, 'utf8');
 const builtins = new Set(builtinModules);
 
+// A `require(` that opens a string or template literal is text, not a call:
+// Ajv (bundled with the MCP SDK) keeps `'require("ajv/dist/runtime/uri")'`
+// and the like as source for its standalone code output, which never runs here.
 const specifiers = new Set(
-  [...source.matchAll(/\brequire\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1]),
+  [...source.matchAll(/(?<![`'"])\brequire\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1]),
 );
 
 const unresolvable = [...specifiers].filter((id) => {

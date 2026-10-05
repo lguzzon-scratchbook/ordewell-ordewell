@@ -46,10 +46,11 @@ describe('mode toggle registry', () => {
   it('carries the fields that are not toggles alongside them', () => {
     // What a host actually needs. Stopping at the toggles left both hosts
     // spreading and appending `modelAllowlist` by hand — the same shape twice.
-    expect(sessionRuntimeSettings({ ...settings, modelAllowlist: { opencode: ['a/b'] }, runnerTransport: 'structured' })).toEqual({
+    expect(sessionRuntimeSettings({ ...settings, modelAllowlist: { opencode: ['a/b'] }, runnerTransport: 'structured', enabledRunners: ['codex'] })).toEqual({
       ...plannerRuntimeToggles(settings),
       modelAllowlist: { opencode: ['a/b'] },
       runnerTransport: 'structured',
+      enabledRunners: ['codex'],
     });
   });
 

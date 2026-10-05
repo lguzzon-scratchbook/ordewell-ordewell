@@ -404,6 +404,61 @@ describe('composeAugmentedPrompt', () => {
   });
 });
 
+describe('the completion instruction where the task_complete tool is given (ADR-0022)', () => {
+  const a = createTask({ id: 'a', order: 1, title: 'A', prompt: 'do work', completionMarker: 'mk-tool' });
+  const b = createTask({ id: 'b', order: 2, title: 'B', prompt: 'pb' });
+
+  it('asks for the tool call first, and for the marker in two halves as the fallback', () => {
+    const out = composeAugmentedPrompt(a, [a, b], { completionTool: true });
+
+    expect(out).toContain('call the `task_complete` tool with status `done`');
+    expect(out).toContain('`blocked` or `failed`');
+    expect(out.indexOf('task_complete')).toBeLessThan(out.indexOf('DONE_mk-tool>>>'));
+    expect(out).toContain('`<<<ORDEWELL_` immediately followed by `DONE_mk-tool>>>`');
+    expect(out).not.toContain('<<<ORDEWELL_DONE_mk-tool>>>');
+  });
+
+  it('names no tool where none is given', () => {
+    expect(composeAugmentedPrompt(a, [a, b])).not.toContain('task_complete');
+    expect(composeContinuationPrompt(a, 'go on')).not.toContain('task_complete');
+  });
+
+  it('asks a continued task for the tool call too', () => {
+    const out = composeContinuationPrompt(a, 'go on', { completionTool: true });
+
+    expect(out).toContain('call the `task_complete` tool with status `done`');
+    expect(out).toContain('`<<<ORDEWELL_` immediately followed by `DONE_mk-tool>>>`');
+  });
+});
+
+describe('the checkpoint instruction where the checkpoint tool is given (ADR-0022, V5)', () => {
+  const a = createTask({ id: 'a', order: 1, title: 'A', prompt: 'do work', completionMarker: 'mk-tool', autonomy: 'HITL' });
+
+  it('asks for the tool call first, and for the marker in two halves as the fallback', () => {
+    const out = composeAugmentedPrompt(a, [a], { completionTool: true });
+
+    expect(out).toContain('## Human-in-the-loop checkpoints');
+    expect(out).toContain('Call the `checkpoint` tool');
+    expect(out).toContain('`continue`');
+    expect(out).toContain('`rejected:`');
+    expect(out.indexOf('Call the `checkpoint` tool')).toBeLessThan(out.indexOf('`<<<ORDEWELL_` immediately followed by `CHECKPOINT:`'));
+    expect(out).not.toMatch(/<<<ORDEWELL_CHECKPOINT/);
+  });
+
+  it('teaches only the marker where no tool is given', () => {
+    expect(composeAugmentedPrompt(a, [a])).not.toContain('`checkpoint` tool');
+    expect(composeContinuationPrompt(a, 'go on')).not.toContain('`checkpoint` tool');
+  });
+
+  it('reminds a continued task of the tool, with the marker as the fallback', () => {
+    const out = composeContinuationPrompt(a, 'go on', { completionTool: true });
+
+    expect(out).toContain('call the `checkpoint` tool');
+    expect(out).toContain('`<<<ORDEWELL_` immediately followed by `CHECKPOINT:`');
+    expect(out).not.toContain('<<<ORDEWELL_CHECKPOINT');
+  });
+});
+
 describe('composeContinuationPrompt (ADR-0018, K1)', () => {
   const task = createTask({ id: 't1', order: 1, title: 'Parse JSON', prompt: 'ORIGINAL PROMPT BODY', completionMarker: 'mk-1' });
 

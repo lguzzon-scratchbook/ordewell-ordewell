@@ -2,6 +2,7 @@ import type { SpawnFn } from '../HeadlessRunner';
 import type { SubagentOutcome } from '../../models/Task';
 import type { UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
+import type { McpClientConfig } from '../mcp';
 
 
 /**
@@ -100,6 +101,8 @@ export interface PlannerStartOptions extends AgentStartCommon {
   systemPrompt: string;
   /** Variant / reasoning effort id from that model's `variants` list. */
   effort?: string;
+  /** The Ordewell MCP server to inject, pre-authorized (ADR-0022). Only for an adapter with {@link AgentAdapter.mcpAttached}. */
+  mcp?: McpClientConfig;
 }
 
 /**
@@ -122,6 +125,12 @@ export interface TaskStartOptions extends AgentStartCommon {
   /** The task's runner mode id, as the plan names it. */
   mode: string;
   flags: TaskRunnerFlags;
+  /**
+   * The Ordewell MCP server and this attempt's token (ADR-0022). An adapter
+   * that can inject it does, with its tools pre-approved; one that cannot
+   * ignores it, and the task completes by its marker.
+   */
+  mcp?: McpClientConfig;
 }
 
 /**
@@ -166,6 +175,13 @@ export interface AgentAdapter {
 
   /** Kill the process and release its resources. Idempotent. */
   dispose(): void;
+
+  /**
+   * Whether the Ordewell MCP server passed in {@link PlannerStartOptions.mcp}
+   * is connected, as the runner itself reports it (ADR-0022, S4). Absent on an
+   * adapter that cannot inject the server at all.
+   */
+  mcpAttached?(): Promise<boolean>;
 }
 
 /** What an adapter adds to run a task rather than a planner (ADR-0018). */

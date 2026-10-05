@@ -8,12 +8,15 @@ import type {
   StructuredTurnEnd,
 } from '../interfaces/ITerminalRunner';
 import type { ApprovalDecision } from '../interfaces/IApproval';
+import { checkpointReply, type CheckpointAnswer, type TaskCompleteArgs } from './mcp/tools';
+import { sharedMcpServer, type OrdewellMcpServer, type TaskTokenScope } from './mcp/OrdewellMcpServer';
+import { mcpClientConfig } from './mcp/clientConfig';
 import type { ResearchToolType } from '../models/Task';
 import { resolveTaskRunnerFlags } from '../plugins/resolveArgs';
 import { AbstractRunner, AbstractTerminalSession, type RunnerSpawnOptions } from './AbstractRunner';
 import type { AgentEvent, AgentProcessDeps, TaskModeAgentAdapter, TaskStartOptions } from './harness/AgentAdapter';
 import { mapAgentTool, normalizeAgentArgs } from './harness/agentTools';
-import { createTaskAdapter } from './harness/taskAdapters';
+import { createTaskAdapter, takesOrdewellTools } from './harness/taskAdapters';
 
 /** How long a soft interrupt may take before the runner is killed and resumed instead. */
 const DEFAULT_INTERRUPT_GRACE_MS = 5000;
@@ -25,6 +28,8 @@ export interface StructuredRunnerDeps {
   /** Overrides adapter construction; production picks by runner id and refuses runners without a connector. */
   createAdapter?: (runner: string, deps: AgentProcessDeps) => TaskModeAgentAdapter;
   interruptGraceMs?: number;
+  /** Serves the task tools of the runners that take them (ADR-0022). Defaults to the process's one server. */
+  mcp?: OrdewellMcpServer;
 }
 
 
@@ -140,6 +145,8 @@ interface SessionLaunch {
   createAdapter: (runner: string, deps: AgentProcessDeps) => TaskModeAgentAdapter;
   startOptions: TaskStartOptions;
   interruptGraceMs: number;
+  /** Where this attempt's task tools are served, when its runner takes them (ADR-0022). */
+  tools?: { server: OrdewellMcpServer; scope: TaskTokenScope };
 }
 
 /**
@@ -174,9 +181,15 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
    * requests — while an approval must be answerable by id across the session.
    */
   private readonly permissions = new Map<string, { requestId: string; adapter: TaskModeAgentAdapter }>();
+  /** The launch's start options, with this attempt's server once its token is issued. */
+  private startOptions: TaskStartOptions;
+  /** This attempt's MCP token, until the session ends (ADR-0022, A2). */
+  private toolToken: string | null = null;
+  private checkpointHandler: ((question: string, signal: AbortSignal) => Promise<CheckpointAnswer>) | null = null;
 
   constructor(id: string, taskId: string, private readonly launch: SessionLaunch) {
     super(id, taskId);
+    this.startOptions = launch.startOptions;
     this.text = new PlainTextChannel((text) => {
       this.output += text;
       this.outputEmitter.emit('output', text);
@@ -185,7 +198,13 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
 
   /** Start the runner and send the task's prompt as its first turn. */
   async start(prompt: string): Promise<void> {
-    await this.startAdapter(this.launch.startOptions);
+    await this.issueTools();
+    try {
+      await this.startAdapter(this.startOptions);
+    } catch (err) {
+      this.revokeTools();
+      throw err;
+    }
     // Callers attach their listeners once `spawn` resolves, so the first turn
     // waits for that or its opening events reach nobody. Working already, so
     // a message sent in the meantime queues behind the prompt.
@@ -194,6 +213,54 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
   }
 
   getOutput(): string { return this.output; }
+
+  onTaskComplete(listener: (report: TaskCompleteArgs) => void): void {
+    this.structuredEmitter.on('taskComplete', listener);
+  }
+
+  onToolCheckpoint(handler: (question: string, signal: AbortSignal) => Promise<CheckpointAnswer>): void {
+    this.checkpointHandler = handler;
+  }
+
+  /**
+   * A server that cannot start costs the task its tools, not its run: the
+   * prompt still teaches the marker (ADR-0022, S2).
+   */
+  private async issueTools(): Promise<void> {
+    const tools = this.launch.tools;
+    if (!tools) return;
+    try {
+      const credential = await tools.server.issueTaskToken(tools.scope, {
+        taskComplete: async (report) => {
+          this.structuredEmitter.emit('taskComplete', report);
+          return { text: 'Recorded. End your turn now.' };
+        },
+        checkpoint: async ({ question }, { signal }) => {
+          if (!this.checkpointHandler) return { text: 'checkpoint is not available in this session.', isError: true };
+          return checkpointReply(await this.checkpointHandler(question, signal));
+        },
+      });
+      if (this.exited) {
+        tools.server.revoke(credential.token);
+        return;
+      }
+      this.toolToken = credential.token;
+      this.startOptions = { ...this.startOptions, mcp: mcpClientConfig(credential) };
+    } catch (err) {
+      console.error(`[structured] No Ordewell tools for task ${this.taskId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  private revokeTools(): void {
+    if (this.toolToken === null) return;
+    this.launch.tools?.server.revoke(this.toolToken);
+    this.toolToken = null;
+  }
+
+  protected override baseHandleExit(code: number): void {
+    this.revokeTools();
+    super.baseHandleExit(code);
+  }
 
   /** A reply typed at the task — a checkpoint answer, most often — is a user message. */
   write(text: string): void {
@@ -301,12 +368,12 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
   private async restartInterrupted(turn: OpenTurn): Promise<void> {
     // A continue interrupted before its runner took the session up still
     // resumes that session, never a fresh one.
-    const resumeSessionId = this.nativeSessionId() ?? this.launch.startOptions.resumeSessionId;
+    const resumeSessionId = this.nativeSessionId() ?? this.startOptions.resumeSessionId;
     this.generation += 1;
     turn.abort.abort();
     if (this.adapter) this.withdrawPermissions(this.adapter);
     try {
-      await this.startAdapter({ ...this.launch.startOptions, resumeSessionId });
+      await this.startAdapter({ ...this.startOptions, resumeSessionId });
     } catch (err) {
       this.text.line(`Could not restart ${this.launch.runner} after the interrupt: ${err instanceof Error ? err.message : String(err)}`);
       this.endTurn(turn, 'interrupted');
@@ -453,12 +520,14 @@ export class StructuredRunner extends AbstractRunner<StructuredSession> {
   private readonly processDeps: Partial<Omit<AgentProcessDeps, 'workspaceEnv'>>;
   private readonly createAdapter: (runner: string, deps: AgentProcessDeps) => TaskModeAgentAdapter;
   private readonly interruptGraceMs: number;
+  private readonly mcp: OrdewellMcpServer;
 
   constructor(deps: StructuredRunnerDeps = {}) {
     super();
     this.processDeps = deps.process ?? {};
     this.createAdapter = deps.createAdapter ?? createTaskAdapter;
     this.interruptGraceMs = deps.interruptGraceMs ?? DEFAULT_INTERRUPT_GRACE_MS;
+    this.mcp = deps.mcp ?? sharedMcpServer();
   }
 
   async spawn(opts: RunnerSpawnOptions): Promise<ITerminalSession> {
@@ -488,6 +557,9 @@ export class StructuredRunner extends AbstractRunner<StructuredSession> {
         resumeSessionId: opts.resumeSessionId,
       },
       interruptGraceMs: this.interruptGraceMs,
+      ...(takesOrdewellTools(opts.runner)
+        ? { tools: { server: this.mcp, scope: { sessionId: opts.planSessionId ?? '', taskId: opts.taskId, attempt: opts.attempt ?? 1 } } }
+        : {}),
     });
 
     console.error(`[structured] Starting ${opts.runner} [${opts.mode ?? 'default'}] (${opts.modelId || 'default'}) for task ${opts.taskId.slice(0, 8)}`);

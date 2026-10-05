@@ -1,9 +1,12 @@
 import type { Task, Verdict, VerificationCheck } from '../models/Task';
 import { isStructuredSession, type ITerminalSession } from '../interfaces/ITerminalRunner';
 import { flattenTerminalOutput, renderTerminalOutput } from './terminalRender';
+import type { CheckpointAnswer, TaskCompleteArgs } from './mcp/tools';
 
 export type VerdictListener = (taskId: string, verdict: Verdict) => void;
 export type CheckpointListener = (taskId: string, summary: string) => void;
+/** A tool-raised checkpoint whose call went away while its attempt lives on, so nothing is left to answer it. */
+export type CheckpointWithdrawnListener = (taskId: string) => void;
 /** Fires on every idleSince transition (null→timestamp on silence, timestamp→null on resume/teardown). */
 export type IdleListener = (taskId: string, idleSince: string | null) => void;
 
@@ -36,6 +39,13 @@ export class VerdictEngine {
   private pausedSessions = new Map<string, ITerminalSession>();
   private listeners: VerdictListener[] = [];
   private checkpointListeners: CheckpointListener[] = [];
+  private withdrawnListeners: CheckpointWithdrawnListener[] = [];
+  /**
+   * The open `checkpoint` tool call per task (ADR-0022, V5): settling it is how
+   * an answer reaches a runner that asked through the tool, where the marker's
+   * answer is typed into the session instead.
+   */
+  private toolCheckpoints = new Map<string, (answer: CheckpointAnswer) => void>();
   private idleListeners: IdleListener[] = [];
   /**
    * Per-task generation. Replaced on every watch(), clear() and verdict.
@@ -67,6 +77,10 @@ export class VerdictEngine {
 
   onCheckpoint(listener: CheckpointListener): void {
     this.checkpointListeners.push(listener);
+  }
+
+  onCheckpointWithdrawn(listener: CheckpointWithdrawnListener): void {
+    this.withdrawnListeners.push(listener);
   }
 
   onIdleChange(listener: IdleListener): void {
@@ -135,6 +149,11 @@ export class VerdictEngine {
 
   approveCheckpoint(taskId: string): void {
     this.resumeIdle(taskId);
+    const toolCall = this.toolCheckpoints.get(taskId);
+    if (toolCall) {
+      toolCall({ kind: 'continue' });
+      return;
+    }
     const session = this.pausedSessions.get(taskId);
     if (session) {
       session.write(this.resumeToken(session, 'ORDEWELL_CONTINUE'));
@@ -144,6 +163,11 @@ export class VerdictEngine {
 
   rejectCheckpoint(taskId: string, reason: string): void {
     this.resumeIdle(taskId);
+    const toolCall = this.toolCheckpoints.get(taskId);
+    if (toolCall) {
+      toolCall({ kind: 'rejected', reason });
+      return;
+    }
     const session = this.pausedSessions.get(taskId);
     if (session) {
       session.write(this.resumeToken(session, `ORDEWELL_REJECT: ${reason}`));
@@ -155,9 +179,12 @@ export class VerdictEngine {
    * Attach to a spawned session: scan the output tail for the task's completion
    * marker (delivering a verdict immediately while leaving interactive sessions
    * open), scan for checkpoint markers, and on exit produce a failed verdict
-   * when the marker was never observed.
+   * when the marker was never observed. A structured session's `task_complete`
+   * call is evidence too (ADR-0022, V2): whichever signal comes first decides.
+   *
+   * Returns the attempt's generation, what {@link signalComplete} is checked against.
    */
-  watch(task: Task, session: ITerminalSession): void {
+  watch(task: Task, session: ITerminalSession): number {
     const doneToken = `<<<ORDEWELL_DONE_${task.completionMarker}>>>`;
     const gen = this.bumpGeneration(task.id);
     this.markerTails.set(task.id, '');
@@ -189,6 +216,8 @@ export class VerdictEngine {
         else if (event.type === 'permission_request' && !event.decided) this.approvalOpened(task.id, event.id);
         else if (event.type === 'permission_decided' || event.type === 'permission_withdrawn') this.approvalClosed(task.id, event.id, gen);
       });
+      session.onTaskComplete((report) => this.signalComplete(task.id, gen, report));
+      session.onToolCheckpoint((question, signal) => this.raiseCheckpoint(task.id, gen, question, signal));
     }
     session.onExit((exitCode: number) => {
       if (this.generations.get(task.id) !== gen) return;
@@ -199,6 +228,55 @@ export class VerdictEngine {
       const verdict = this.decide(task, exitCode);
       for (const l of this.listeners) l(task.id, verdict);
     });
+    return gen;
+  }
+
+  /**
+   * The runner's own `task_complete` call (ADR-0022, V1/V3): settles the
+   * attempt exactly as the marker does, unless that attempt is no longer the
+   * task's current one or another signal already settled it.
+   */
+  signalComplete(taskId: string, generation: number, report: TaskCompleteArgs): void {
+    if (this.generations.get(taskId) !== generation) return;
+    this.forget(taskId);
+    this.bumpGeneration(taskId);
+    const verdict = reportedVerdict(report);
+    for (const l of this.listeners) l(taskId, verdict);
+  }
+
+  /**
+   * The runner's `checkpoint` call (ADR-0022, V5): raised through the same
+   * listeners as the marker, so the task waits on the user the same way, and
+   * settled by {@link approveCheckpoint} or {@link rejectCheckpoint}. It is
+   * withdrawn, never left hanging, once the attempt is over or the call goes.
+   */
+  raiseCheckpoint(taskId: string, generation: number, question: string, signal: AbortSignal): Promise<CheckpointAnswer> {
+    if (this.generations.get(taskId) !== generation || signal.aborted) {
+      return Promise.resolve({ kind: 'withdrawn', why: 'this attempt has ended.' });
+    }
+    if (this.toolCheckpoints.has(taskId)) {
+      return Promise.resolve({ kind: 'withdrawn', why: 'another checkpoint is still waiting for an answer. Wait for it before asking again.' });
+    }
+    return new Promise((resolve) => {
+      const settle = (answer: CheckpointAnswer) => {
+        signal.removeEventListener('abort', onAbort);
+        if (this.toolCheckpoints.get(taskId) === settle) this.toolCheckpoints.delete(taskId);
+        resolve(answer);
+      };
+      const onAbort = () => {
+        settle({ kind: 'withdrawn', why: 'the call was cancelled.' });
+        if (this.generations.get(taskId) !== generation) return;
+        this.resumeIdle(taskId);
+        for (const l of this.withdrawnListeners) l(taskId);
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.toolCheckpoints.set(taskId, settle);
+      for (const l of this.checkpointListeners) l(taskId, question.trim());
+    });
+  }
+
+  private withdrawToolCheckpoint(taskId: string): void {
+    this.toolCheckpoints.get(taskId)?.({ kind: 'withdrawn', why: 'this attempt has ended.' });
   }
 
   private approvalOpened(taskId: string, approvalId: string): void {
@@ -237,6 +315,7 @@ export class VerdictEngine {
     this.markerTails.delete(taskId);
     this.checkpointCarry.delete(taskId);
     this.pausedSessions.delete(taskId);
+    this.withdrawToolCheckpoint(taskId);
     this.idlePaused.delete(taskId);
     this.openApprovals.delete(taskId);
     this.clearIdle(taskId);
@@ -275,6 +354,7 @@ export class VerdictEngine {
     this.markerTails.clear();
     this.checkpointCarry.clear();
     this.pausedSessions.clear();
+    for (const taskId of [...this.toolCheckpoints.keys()]) this.withdrawToolCheckpoint(taskId);
     for (const timer of this.idleTimers.values()) clearTimeout(timer);
     this.idleTimers.clear();
     this.idleSince.clear();
@@ -333,4 +413,27 @@ export class VerdictEngine {
       decidedAt: new Date().toISOString(),
     };
   }
+}
+
+function reportedVerdict(report: TaskCompleteArgs): Verdict {
+  const checks: VerificationCheck[] = [
+    {
+      name: 'task_complete',
+      passed: report.status === 'done',
+      skipped: false,
+      detail: `the runner called task_complete with status "${report.status}"`,
+    },
+    {
+      name: 'completion_marker',
+      passed: report.status === 'done',
+      skipped: true,
+      detail: 'bypassed — the runner reported through task_complete',
+    },
+  ];
+  const decidedAt = new Date().toISOString();
+  if (report.status === 'done') {
+    return { outcome: 'pass', reason: 'Verified: the runner reported completion through task_complete. Task completed successfully.', checks, decidedAt };
+  }
+  const why = report.reason?.trim() || 'no reason given';
+  return { outcome: 'fail', reason: `The runner reported the task ${report.status}: ${why}`, checks, decidedAt };
 }

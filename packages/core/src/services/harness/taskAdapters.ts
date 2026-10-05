@@ -10,9 +10,17 @@ const TASK_MODE_ADAPTERS: Record<string, (deps: AgentProcessDeps) => TaskModeAge
   opencode: (deps) => new OpenCodeAdapter(deps),
 };
 
+/** The connectors that hand their runner the Ordewell MCP server (ADR-0022). */
+const ORDEWELL_TOOL_RUNNERS = new Set(['claude-code', 'codex', 'opencode']);
+
 /** Whether a runner's tasks can run on the structured transport. */
 export function supportsTaskMode(runner: string): boolean {
   return Object.hasOwn(TASK_MODE_ADAPTERS, runner);
+}
+
+/** Whether a structured task on this runner is given the Ordewell task tools. */
+export function takesOrdewellTools(runner: string): boolean {
+  return ORDEWELL_TOOL_RUNNERS.has(runner);
 }
 
 /** The adapter that drives one task. Throws {@link TaskModeUnsupportedError} for a runner without a connector. */

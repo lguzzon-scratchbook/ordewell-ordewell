@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { ConversationRequest, ConversationTurn, IAiService } from './AiService';
 import { repairLoop, taskOpsRejectedPrompt } from './PlanRepair';
-import { renderTaskQueryAnswer, taskQuerySignature, TASK_QUERY_ANSWER_OR_OPS, TASK_QUERY_REMINDER, type LiveOutputLookup, type TaskQuery, type TaskQueryCatalog } from './TaskQuery';
+import { renderTaskQueryAnswer, taskQuerySignature, TASK_QUERY_ANSWER_OR_OPS, TASK_QUERY_REMINDER, TASK_READ_TOOLS_REMINDER, type LiveOutputLookup, type TaskQuery, type TaskQueryCatalog } from './TaskQuery';
 import { taskOpsProtocol, refMatchesTask, taskOpRefs, type ApplyTaskOpsResult, type TaskOp } from './TaskOps';
 import { resolveDefaultMode } from './ModeResolver';
 import type { PlannerTurnOutcome, SessionBroadcaster } from './SessionMessage';
@@ -17,6 +17,10 @@ import { flattenTasks } from '../models/Task';
  * only runners that aggregate hundreds of models (e.g. OpenRouter) hit it.
  */
 const CATALOG_MODEL_CAP = 100;
+
+/** Stands in for the catalog block where the planner pulls the catalog itself (ADR-0022, L3). */
+const PLANNER_TOOLS_REMINDER =
+  'Runners, models and modes may have changed since you last read them: call list_runners and list_models just before submit_plan.';
 
 /**
  * Reads a planner gets per user turn before every answer also carries an
@@ -53,7 +57,17 @@ interface UserTurn {
   stream: TurnStream;
   signal?: AbortSignal;
   reads: ReadBudget;
+  /** Handed in since the backend last answered; see {@link PlannerConversation.submit}. */
+  submitted?: PlannerSubmission;
 }
+
+/** A read made through a planner tool: refused once the turn's budget is gone, else answered, told to land when the budget asks it to. */
+export type ToolRead<T> = { status: 'refused' } | { status: 'answered'; value: T; landNow: boolean };
+
+/** A plan or task edit handed to the open turn over a channel other than its reply (ADR-0022). */
+export type PlannerSubmission =
+  | { kind: 'plan'; tasks: Task[] }
+  | { kind: 'task_ops'; ops: TaskOp[] };
 
 interface SettledTurn {
   plan: LegacyPlanState;
@@ -191,7 +205,7 @@ export class PlannerConversation {
   private savedInBackground = 0;
   private turnsInFlight = 0;
   private compacting = false;
-  private openTurnId: string | null = null;
+  private openTurn: UserTurn | null = null;
 
   constructor(private readonly host: PlannerConversationHost) {}
 
@@ -206,7 +220,52 @@ export class PlannerConversation {
 
   /** The user turn being answered, for what the host raises during it — an approval the turn's research asks for. */
   get currentTurnId(): string | undefined {
-    return this.openTurnId ?? undefined;
+    return this.openTurn?.stream.turnId;
+  }
+
+  /**
+   * Hand the open turn a plan (already validated) or a task edit. The turn
+   * settles with it exactly as with the same plan or ops parsed out of its
+   * reply, and it wins over any envelope that reply carries. A later
+   * submission replaces an earlier one. False when no user turn is open.
+   */
+  submit(submission: PlannerSubmission): boolean {
+    if (!this.openTurn) return false;
+    this.openTurn.submitted = submission;
+    return true;
+  }
+
+  /**
+   * The edit the open turn already holds, for a further edit in the same reply
+   * to join rather than replace. Empty when it holds nothing; null when it holds
+   * a whole plan, which an edit cannot be layered on.
+   */
+  pendingOps(): TaskOp[] | null {
+    const held = this.openTurn?.submitted;
+    if (!held) return [];
+    return held.kind === 'task_ops' ? held.ops : null;
+  }
+
+  /** Whether the turn would park this edit until a batch boundary instead of applying it as it settles. */
+  editWouldQueue(ops: TaskOp[]): boolean {
+    return this.editTouchesLiveWork({ kind: 'task_ops', ops, text: '', researchLog: [] });
+  }
+
+  /**
+   * A read the planner makes through a tool. It spends the same per-turn budget
+   * as an envelope read, so a planner cannot read more by switching channels:
+   * past the soft limit, or on a repeated question, the answer still comes but
+   * is told to land the turn; at the hard limit it is refused. `signature`
+   * names the question, for the repeat check.
+   */
+  async read<T>(signature: string, answer: () => Promise<T>): Promise<ToolRead<T>> {
+    const reads = this.openTurn?.reads;
+    if (!reads) return { status: 'answered', value: await answer(), landNow: false };
+    if (reads.answered >= MAX_TASK_QUERIES_HARD) return { status: 'refused' };
+    const landNow = reads.seen.has(signature) || reads.answered >= MAX_TASK_QUERIES;
+    reads.seen.add(signature);
+    reads.answered++;
+    return { status: 'answered', value: await answer(), landNow };
   }
 
   /** Whether the model still holds this conversation in memory. */
@@ -543,15 +602,16 @@ export class PlannerConversation {
   private async userTurn(prompt: string, signal: AbortSignal | undefined, run: (turn: UserTurn) => Promise<SettledTurn>): Promise<LegacyPlanState> {
     const turnId = uuidv4();
     const stream = new TurnStream(turnId, (p) => this.host.onProgress(p));
-    this.openTurnId = turnId;
+    const turn: UserTurn = { stream, signal, reads: freshReadBudget() };
+    this.openTurn = turn;
     this.host.broadcast({ type: 'planner_turn_started', turnId, prompt });
     let outcome: PlannerTurnOutcome = 'error';
     try {
-      const settled = await this.inTurn(() => run({ stream, signal, reads: freshReadBudget() }));
+      const settled = await this.inTurn(() => run(turn));
       outcome = settled.outcome;
       return settled.plan;
     } finally {
-      if (this.openTurnId === turnId) this.openTurnId = null;
+      if (this.openTurn === turn) this.openTurn = null;
       // A stop can still settle — a backend hands back what it had as a
       // message — but the user asked for it to end, and that is what it did.
       this.host.broadcast({ type: 'planner_turn_ended', turnId, outcome: signal?.aborted ? 'stopped' : outcome });
@@ -618,10 +678,11 @@ export class PlannerConversation {
    * ops JSON still gets its two corrective retries; charging it for the read
    * would cost it the chance to fix the edit.
    */
-  private async drainTaskQueries(turn: ConversationTurn, { reads, signal, stream }: UserTurn): Promise<SettleableTurn> {
+  private async drainTaskQueries(turn: ConversationTurn, userTurn: UserTurn): Promise<SettleableTurn> {
+    const { reads, signal, stream } = userTurn;
     const ai = this.host.aiService();
     const carried: ConversationTurn['researchLog'] = [];
-    let current = turn;
+    let current = this.claimSubmission(turn, userTurn);
     while (current.kind === 'task_query') {
       carried.push(...current.researchLog);
       if (reads.answered >= MAX_TASK_QUERIES_HARD || !ai.hasActiveConversation() || signal?.aborted) {
@@ -638,15 +699,31 @@ export class PlannerConversation {
       reads.seen.add(signature);
       reads.answered++;
       const answer = this.taskQueryAnswer(current.query);
-      current = await ai.continueConversation(
+      current = this.claimSubmission(await ai.continueConversation(
         insist ? `${answer}\n\n${TASK_QUERY_ANSWER_OR_OPS}` : answer,
         stream.sink(),
         signal,
-      );
+      ), userTurn);
     }
     return carried.length > 0
       ? { ...current, researchLog: [...carried, ...current.researchLog] }
       : current;
+  }
+
+  /**
+   * The backend's answer, with what was handed in while it ran standing in
+   * for whatever its reply carried. Taken once: a corrective re-send after a
+   * rejected edit must not settle on the same submission again. A stopped
+   * turn commits nothing, the same as a stopped reply with a plan in it.
+   */
+  private claimSubmission(turn: ConversationTurn, userTurn: UserTurn): ConversationTurn {
+    const submitted = userTurn.submitted;
+    userTurn.submitted = undefined;
+    if (!submitted || userTurn.signal?.aborted) return turn;
+    const { text, researchLog } = turn;
+    return submitted.kind === 'plan'
+      ? { kind: 'plan', tasks: submitted.tasks, text, researchLog }
+      : { kind: 'task_ops', ops: submitted.ops, text, researchLog };
   }
 
   /**
@@ -772,10 +849,12 @@ export class PlannerConversation {
    *
    * The host's catalog is allowlist-filtered, so a restricted allowlist stays a
    * hard bound on every turn, and reads the plan's runners live, so a runner
-   * admitted mid-session by a retarget is shown like every other.
+   * admitted mid-session by a retarget is shown like every other. A planner
+   * with Ordewell's tools gets a reminder to read the catalog instead.
    */
   private catalogBlock(): string | null {
     if (!this.host.plan()) return null;
+    if (this.host.aiService().plannerToolsAttached?.()) return PLANNER_TOOLS_REMINDER;
     const { runners, models, modes, autonomousDefault } = this.host.catalog();
 
     const modelLines = runners.map((runner) => {
@@ -814,6 +893,7 @@ export class PlannerConversation {
     const tasks = this.host.tasks();
     const lines = this.currentPlanLines();
     if (!lines) return null;
+    const tools = this.host.aiService().plannerToolsAttached?.() ?? false;
     // Gated on live runners, not on an armed scheduler: a paused-but-armed run
     // takes edits immediately, so promising a queue there is a lie the model
     // plans around (it stops emitting ops and asks the user to wait).
@@ -827,8 +907,8 @@ export class PlannerConversation {
       '</current_plan>',
       'The block above is the CURRENT task plan — short fields only. Choose how to respond:',
       '- To answer a question or discuss, reply in plain prose (no JSON).',
-      TASK_QUERY_REMINDER,
-      ...taskOpsProtocol(execNote),
+      tools ? TASK_READ_TOOLS_REMINDER : TASK_QUERY_REMINDER,
+      ...taskOpsProtocol(execNote, tools),
     ].filter(Boolean).join('\n');
   }
 

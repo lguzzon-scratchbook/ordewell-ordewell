@@ -2,7 +2,7 @@ import { DiscoveredModel, RunnerId, type TaskSnapshot, type Task } from '../mode
 import type { LegacyPlanState } from '../models/Task';
 import { buildModeGuide, filteredBuildModes, type RunnerModeInfo } from './ModeResolver';
 import { DEFAULT_PLANNER_MODES, modesFor, type IsolatedExecution, type PlannerModes } from './plannerModes';
-import { TASK_QUERY_PROTOCOL } from './TaskQuery';
+import { TASK_QUERY_PROTOCOL, TASK_READ_TOOLS_PROTOCOL } from './TaskQuery';
 import { SELF_REPO } from './isolationRecord';
 
 export function buildResearchToolsPrompt(): string {
@@ -143,6 +143,8 @@ function researchPhaseBlock(harnessMode: boolean): string {
 export interface ConversationVariant {
   /** Harness planner (ADR-0009): the agent owns its own tools and research budget. */
   harness?: boolean;
+  /** The planner reads the catalog and submits the plan through Ordewell's MCP tools (ADR-0022), not the JSON envelope. */
+  plannerTools?: boolean;
   /** Every AI task gets its own worktree (ADR-0013), so file overlap no longer forces an order; of every repo of a group (ADR-0014). */
   isolatedExecution?: IsolatedExecution;
 }
@@ -242,6 +244,21 @@ export function buildConversationSystemPrompt(
   );
 }
 
+/**
+ * Where a planner with Ordewell's tools gets its catalog (ADR-0022, L3): pulled
+ * at the moment it submits, since a runner enabled or an allowlist edited
+ * while it planned is what the submission is checked against.
+ */
+const PLANNER_TOOLS_CATALOG = [
+  'RUNNERS, MODELS AND MODES:',
+  'Which runners, models and modes you may assign can change while you plan: the user may enable a runner or edit the model allowlist at any time. Read them just before you submit, never from memory:',
+  '1. Call list_runners: the enabled runners, each with its task modes and default mode.',
+  '2. Call list_models for each runner you will assign: its allowed models, with their thinking-effort variants.',
+  '3. Call submit_plan with the whole plan. "assignedRunner" must be a runner list_runners returned, "assignedModel.modelId" a modelId list_models returned for that runner, "taskMode" one of that runner\'s modes.',
+  '4. If submit_plan returns errors, fix exactly what each one names and call it again in the same reply. If it reports "coerced" changes, tell the user what was changed.',
+  '',
+];
+
 function buildConversationBody(
   goal: string,
   context: string,
@@ -252,27 +269,30 @@ function buildConversationBody(
   variant: ConversationVariant,
   verificationBlock: string,
 ): string {
+  const tools = variant.plannerTools ?? false;
   return [
-    'You are Ordewell\'s project planner. You explore the codebase, ask concise clarifying questions grounded in your findings, and produce structured task plans as JSON. Be direct: avoid unnecessary preamble, summaries, or explanations unless the user asks for detail.',
+    `You are Ordewell's project planner. You explore the codebase, ask concise clarifying questions grounded in your findings, and produce structured task plans ${tools ? 'through the submit_plan tool' : 'as JSON'}. Be direct: avoid unnecessary preamble, summaries, or explanations unless the user asks for detail.`,
     '',
     'WORKFLOW:',
     '1. Explore the workspace with tools to understand the codebase.',
     '2. Ask clarifying questions grounded in your findings. Reference actual files. When the goal is vague, or a decision would materially change the outcome (storage engine, library choice, scope, API shape), ask the user BEFORE planning — never silently assume. Clear, fully-specified goals need no questions.',
     '3. When you have enough context, produce a prose outline — a short list describing each vertical slice in order.',
-    '4. After the user confirms the outline, emit the final task plan as a JSON object with a "tasks" array.',
+    tools
+      ? '4. After the user confirms the outline, call list_runners and list_models, then submit the final task plan with submit_plan.'
+      : '4. After the user confirms the outline, emit the final task plan as a JSON object with a "tasks" array.',
     '',
     researchPhaseBlock(variant.harness ?? false),
     verificationBlock,
     '',
     'OUTLINE PHASE:',
-    '- When you are ready to propose a plan, first show a prose outline. DO NOT jump straight to JSON.',
+    `- When you are ready to propose a plan, first show a prose outline. DO NOT jump straight to ${tools ? 'submit_plan' : 'JSON'}.`,
     '- Format: a numbered list describing each vertical tracer-bullet slice, with the files/layers each slice touches.',
     '- Example: "1. Set up database schema (src/db/schema.ts) — creates tables for users and sessions\n2. Add auth middleware (src/auth/middleware.ts) — validates JWTs on protected routes\n3. Build login page (src/ui/Login.tsx) — form component with validation"',
     '- The user may reply with adjustments. Revise the outline and re-present it.',
-    '- When the user confirms the outline, emit the task plan JSON.',
+    tools ? '- When the user confirms the outline, submit the plan with submit_plan.' : '- When the user confirms the outline, emit the task plan JSON.',
     '',
     'PLAN FORMAT:',
-    'Generate a task plan using this JSON format:',
+    tools ? 'submit_plan takes {"tasks": [...]}, every task in this shape:' : 'Generate a task plan using this JSON format:',
     '',
     '{',
     '  "tasks": [',
@@ -286,8 +306,8 @@ function buildConversationBody(
     '      "prompt": "Detailed instructions for the AI assistant (ai tasks only)",',
     '      "userSteps": [{ "order": 1, "instruction": "Step description", "completed": false }],',
     '      "assignedModel": { "modelId": "model-id", "modelLabel": "Model Label", "thinkingEffort": "a variant id from that model\'s variants list — omit if the model has none" },',
-    '      "assignedRunner": "' + runners.join('|') + '",',
-    '      "taskMode": "' + modeExamples + '",',
+    '      "assignedRunner": "' + (tools ? 'a runner id from list_runners' : runners.join('|')) + '",',
+    '      "taskMode": "' + (tools ? 'one of that runner\'s modes from list_runners' : modeExamples) + '",',
     '      "autonomy": "AFK|HITL",',
     '      "sliceType": "AFK|HITL",',
     '      "ops": true,',
@@ -319,8 +339,15 @@ function buildConversationBody(
     ...opsTaskSection(true),
     '',
     'RULES:',
-    '- Do NOT wrap the JSON in markdown code blocks. Output ONLY the JSON object when committing the plan.',
-    '- Emit the outline BEFORE the JSON. Do not skip the outline.',
+    ...(tools
+      ? [
+        '- Submit the plan ONLY through submit_plan. Never write it as JSON in your reply.',
+        '- Show the outline BEFORE submitting. Do not skip the outline.',
+      ]
+      : [
+        '- Do NOT wrap the JSON in markdown code blocks. Output ONLY the JSON object when committing the plan.',
+        '- Emit the outline BEFORE the JSON. Do not skip the outline.',
+      ]),
     '- Reference specific files and patterns from your research in task prompts.',
     ...(variant.isolatedExecution ? [] : [OVERLAP_AVOIDANCE_RULE]),
     '',
@@ -328,23 +355,23 @@ function buildConversationBody(
     '- When suggesting libraries, frameworks, or patterns, first verify they already exist in the codebase. NEVER assume a library is available just because it is well-known. Check package.json, imports, or surrounding files first.',
     '- Follow the existing code style, naming conventions, and architectural patterns of the project.',
     '',
-    'MODEL ASSIGNMENT:',
-    'Available models:',
-    modelsJson,
-    '',
-    runnerInstruction(runners),
+    ...(tools
+      ? PLANNER_TOOLS_CATALOG
+      : ['MODEL ASSIGNMENT:', 'Available models:', modelsJson, '', runnerInstruction(runners)]),
     'MODEL SELECTION GUIDELINES:',
     '- Use stronger models for complex refactoring, architecture changes, security-critical code.',
     '- Use weaker/faster models for simple file operations, test generation, config changes, documentation.',
-    '- Assign thinkingEffort based on task complexity, choosing ONLY from the assigned model\'s "variants" list above (e.g. low for simple tasks, high for complex ones). Omit thinkingEffort if the model has no variants.',
+    `- Assign thinkingEffort based on task complexity, choosing ONLY from the assigned model's "variants" list ${tools ? 'from list_models' : 'above'} (e.g. low for simple tasks, high for complex ones). Omit thinkingEffort if the model has no variants.`,
     '',
     'TASK MODE:',
-    modeGuide,
+    tools
+      ? 'Use each runner\'s default mode from list_runners unless the task needs a different mode it lists. Avoid "plan" (read-only) unless the user asked for analysis only.'
+      : modeGuide,
     '',
-    // Shared by both variants on purpose: the read channel is a text envelope
-    // exactly so a harness planner, which Ordewell cannot hand tools to, speaks
-    // the same protocol as an API-backed one (ADR-0009).
-    ...TASK_QUERY_PROTOCOL,
+    // The envelope is shared by both variants on purpose: a harness planner
+    // Ordewell could not hand tools to speaks the same protocol as an
+    // API-backed one (ADR-0009). One it did hand them to reads through them.
+    ...(tools ? TASK_READ_TOOLS_PROTOCOL : TASK_QUERY_PROTOCOL),
     '',
     context ? `PROJECT CONTEXT:\n${context}\n` : '',
     `USER GOAL: ${goal}`,
@@ -740,7 +767,7 @@ export function buildModifyDuringExecutionPrompt(
  * task-ops protocol (with the "merge" op) is injected alongside it by
  * `planContextBlock`. The model emits a single taskOps merge op.
  */
-export function buildMergePrompt(taskIds: string[], tasks: readonly Task[]): string {
+export function buildMergePrompt(taskIds: string[], tasks: readonly Task[], tools = false): string {
   const idSet = new Set(taskIds);
   const selected = tasks.filter((t) => idSet.has(t.id)).sort((a, b) => a.order - b.order);
   const refs = selected.map((t) => `#${t.order} "${t.title}" (id=${t.id})`).join(', ');
@@ -748,9 +775,9 @@ export function buildMergePrompt(taskIds: string[], tasks: readonly Task[]): str
     `Merge these tasks into ONE combined task: ${refs}.`,
     'Write a clear combined title, description, and prompt that cover all of their work.',
     'The merged task takes the union of their dependencies (excluding the merged tasks themselves) and preserves their user stories.',
-    'Set "assignedRunner" and "assignedModel" on the merged task — use one of the runners and models listed in <available_models> above. Prefer the strongest model if the merged work is complex.',
-    'Reply with ONLY a taskOps JSON object using a single "merge" op:',
-    `  {"taskOps":[{"op":"merge","taskIds":[${selected.map((t) => `"${t.id}"`).join(', ')}],"merged":{"title":"...","description":"...","prompt":"...","assignedRunner":"...","assignedModel":{"modelId":"...","modelLabel":"..."}}}]}`,
+    `Set "assignedRunner" and "assignedModel" on the merged task — use one of the runners and models ${tools ? 'list_runners and list_models return' : 'listed in <available_models> above'}. Prefer the strongest model if the merged work is complex.`,
+    tools ? 'Call edit_plan with a single "merge" op:' : 'Reply with ONLY a taskOps JSON object using a single "merge" op:',
+    `  {"${tools ? 'ops' : 'taskOps'}":[{"op":"merge","taskIds":[${selected.map((t) => `"${t.id}"`).join(', ')}],"merged":{"title":"...","description":"...","prompt":"...","assignedRunner":"...","assignedModel":{"modelId":"...","modelLabel":"..."}}}]}`,
     'If this merge needs a companion op in the same batch (e.g. an added task that should depend on the merge result), give the merge op a "handle" (any unused name) and reference it from the later op\'s taskId/dependencies.',
   ].join('\n');
 }
@@ -760,16 +787,16 @@ export function buildMergePrompt(taskIds: string[], tasks: readonly Task[]): str
  * one task into a sequence of smaller tasks. The model decides the breakdown —
  * the user does not hand-type the parts.
  */
-export function buildSplitPrompt(taskId: string, tasks: readonly Task[]): string {
+export function buildSplitPrompt(taskId: string, tasks: readonly Task[], tools = false): string {
   const task = tasks.find((t) => t.id === taskId);
   if (!task) return `Split task ${taskId} into smaller tasks.`;
   return [
     `Split task #${task.order} "${task.title}" (id=${task.id}) into multiple smaller tasks that together accomplish the same work.`,
     'Decompose it into a sensible ordered sequence. Write a clear title, description, and prompt for each part.',
     'The first part inherits the original task\'s dependencies. Each later part depends on the previous part. Tasks that depended on the original now depend on the LAST part.',
-    'Set "assignedRunner" and "assignedModel" on each part — use the runners and models listed in <available_models> above. You may assign different models to different parts (e.g. a stronger model for a complex part, a faster one for a simple part).',
-    'Reply with ONLY a taskOps JSON object using a single "split" op:',
-    `  {"taskOps":[{"op":"split","taskId":"${task.id}","parts":[{"title":"...","description":"...","prompt":"...","assignedRunner":"...","assignedModel":{"modelId":"...","modelLabel":"..."}},...]}]}`,
+    `Set "assignedRunner" and "assignedModel" on each part — use the runners and models ${tools ? 'list_runners and list_models return' : 'listed in <available_models> above'}. You may assign different models to different parts (e.g. a stronger model for a complex part, a faster one for a simple part).`,
+    tools ? 'Call edit_plan with a single "split" op:' : 'Reply with ONLY a taskOps JSON object using a single "split" op:',
+    `  {"${tools ? 'ops' : 'taskOps'}":[{"op":"split","taskId":"${task.id}","parts":[{"title":"...","description":"...","prompt":"...","assignedRunner":"...","assignedModel":{"modelId":"...","modelLabel":"..."}},...]}]}`,
     'If this split needs a companion op in the same batch (e.g. another task that should depend on the last part), give the split op a "handle" (any unused name) — it names the last part — and reference it from the later op\'s taskId/dependencies.',
   ].join('\n');
 }

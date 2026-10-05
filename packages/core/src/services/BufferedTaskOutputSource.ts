@@ -1,4 +1,4 @@
-import type { ITerminalSession } from '../interfaces/ITerminalRunner';
+import { isStructuredSession, type ITerminalSession } from '../interfaces/ITerminalRunner';
 import type {
   LiveTail,
   LiveTailOptions,
@@ -7,6 +7,7 @@ import type {
   TranscriptReader,
 } from '../interfaces/TaskOutputSource';
 import { renderCleanCapture } from './terminalRender';
+import { defuseMarkers } from './promptAugment';
 import { HomeTranscriptReader } from './transcriptCapture';
 
 /**
@@ -24,6 +25,8 @@ interface Capture {
   dropped: number;
   attached: boolean;
   exited: boolean;
+  /** What the runner said it did in its `task_complete` call (ADR-0022, V4). */
+  reported?: string;
 }
 
 /**
@@ -50,6 +53,11 @@ export class BufferedTaskOutputSource implements TaskOutputSource {
     session.onExit(() => {
       capture.exited = true;
     });
+    if (isStructuredSession(session)) {
+      session.onTaskComplete(({ summary }) => {
+        if (capture.attached && summary.trim()) capture.reported = summary.trim();
+      });
+    }
   }
 
   detach(taskId: string): void {
@@ -63,6 +71,10 @@ export class BufferedTaskOutputSource implements TaskOutputSource {
   }
 
   async finalText(attempt: TaskOutputAttempt, doneToken: string): Promise<string> {
+    // The runner's own account of its work comes first. Dependents quote it, so
+    // a marker in it must not settle them on this task's evidence.
+    const reported = this.captures.get(attempt.taskId)?.reported;
+    if (reported) return defuseMarkers(reported);
     // The transcript is the agent's own structured record; the terminal
     // render only reconstructs what a TUI painted, so it is the fallback.
     if (attempt.cwd && attempt.completionMarker) {

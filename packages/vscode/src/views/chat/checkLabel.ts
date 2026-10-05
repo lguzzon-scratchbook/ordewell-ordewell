@@ -7,6 +7,7 @@ import type { VerificationCheck } from '@ordewell/core';
  */
 const CHECK_LABELS: Record<VerificationCheck['name'], string> = {
   completion_marker: 'Completion Marker',
+  task_complete: 'Completion Call',
   exit_code: 'Exit Code',
   manual: 'Marked by you',
 };

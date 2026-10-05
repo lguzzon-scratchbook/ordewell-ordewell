@@ -1,4 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StructuredRunner } from '../StructuredRunner';
 import type { RunnerSpawnOptions } from '../AbstractRunner';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
@@ -6,6 +8,7 @@ import { isStructuredSession, type ITerminalSession, type StructuredEvent, type 
 import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter } from '../harness/AgentAdapter';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import { FakeStructuredSession, FakeTerminalSession } from '../../testing';
+import { OrdewellMcpServer, type CheckpointAnswer, type McpClientConfig } from '../mcp';
 import { fakeSpawn, fixture, type ScriptedReply } from './harnessTestKit';
 
 /**
@@ -473,6 +476,163 @@ describe('the structured capability is detected, never assumed', () => {
     expect(isStructuredSession(new FakeStructuredSession())).toBe(true);
     expect(isStructuredSession(new FakeTerminalSession('s1', 't1'))).toBe(false);
     expect(isStructuredSession(Object.assign(new FakeTerminalSession('s2', 't1'), { transport: 'terminal' }))).toBe(false);
+    session.kill();
+  });
+});
+
+describe('the Ordewell task tools (ADR-0022)', () => {
+  const servers: OrdewellMcpServer[] = [];
+  const clients: Client[] = [];
+
+  afterEach(async () => {
+    await Promise.all(clients.splice(0).map((c) => c.close()));
+    await Promise.all(servers.splice(0).map((s) => s.dispose()));
+  });
+
+  /** {@link byHand}, with a server of the test's own for the tokens. */
+  function served(configure: (adapter: HandAdapter) => void = () => {}) {
+    const server = new OrdewellMcpServer();
+    servers.push(server);
+    const adapters: HandAdapter[] = [];
+    const runner = new StructuredRunner({
+      createAdapter: () => {
+        const adapter = new HandAdapter();
+        configure(adapter);
+        adapters.push(adapter);
+        return adapter;
+      },
+      interruptGraceMs: 20,
+      mcp: server,
+    });
+    return { runner, adapters };
+  }
+
+  function servedConfig(adapter: HandAdapter): McpClientConfig {
+    const start = adapter.starts[0];
+    if (start.kind !== 'task' || !start.mcp) throw new Error('the runner was not given the server');
+    return start.mcp;
+  }
+
+  async function connect(config: McpClientConfig): Promise<Client> {
+    const client = new Client({ name: 'test', version: '0.0.0' });
+    await client.connect(new StreamableHTTPClientTransport(new URL(config.url), { requestInit: { headers: config.headers } }));
+    clients.push(client);
+    return client;
+  }
+
+  it('gives a Claude Code task the server, and its task_complete call reaches the session', async () => {
+    const { runner, adapters } = served();
+    const session = await runner.spawn(options({ attempt: 2 }));
+    if (!isStructuredSession(session)) throw new Error('not a structured session');
+    const reports: unknown[] = [];
+    session.onTaskComplete((report) => reports.push(report));
+
+    const client = await connect(servedConfig(adapters[0]));
+    const result = await client.callTool({ name: 'task_complete', arguments: { status: 'done', summary: 'Built it.' } });
+
+    expect(result.isError).toBe(false);
+    expect(reports).toEqual([{ status: 'done', summary: 'Built it.' }]);
+    session.kill();
+  });
+
+  it('holds a checkpoint call open until the session answers it, and returns the answer', async () => {
+    const { runner, adapters } = served();
+    const session = await runner.spawn(options());
+    if (!isStructuredSession(session)) throw new Error('not a structured session');
+    const asked: string[] = [];
+    let answer!: (a: CheckpointAnswer) => void;
+    session.onToolCheckpoint((question) => {
+      asked.push(question);
+      return new Promise<CheckpointAnswer>((resolve) => { answer = resolve; });
+    });
+
+    const client = await connect(servedConfig(adapters[0]));
+    const call = client.callTool({ name: 'checkpoint', arguments: { question: 'Drop the table?' } });
+    await until(() => asked.length === 1);
+    answer({ kind: 'rejected', reason: 'keep it' });
+
+    expect(asked).toEqual(['Drop the table?']);
+    expect(await call).toMatchObject({ isError: false, content: [{ type: 'text', text: 'rejected: keep it' }] });
+    session.kill();
+  });
+
+  it('answers a checkpoint call that nothing attached to as not available', async () => {
+    const { runner, adapters } = served();
+    const session = await runner.spawn(options());
+
+    const client = await connect(servedConfig(adapters[0]));
+    const result = await client.callTool({ name: 'checkpoint', arguments: { question: 'Drop the table?' } });
+
+    expect(result.isError).toBe(true);
+    session.kill();
+  });
+
+  it('ends a waiting checkpoint call with a refusal when the session is killed', async () => {
+    const { runner, adapters } = served();
+    const session = await runner.spawn(options());
+    if (!isStructuredSession(session)) throw new Error('not a structured session');
+    let asked = false;
+    session.onToolCheckpoint((_question, signal) => new Promise<CheckpointAnswer>((resolve) => {
+      asked = true;
+      signal.addEventListener('abort', () => resolve({ kind: 'withdrawn', why: 'this attempt has ended.' }));
+    }));
+
+    const client = await connect(servedConfig(adapters[0]));
+    const call = client.callTool({ name: 'checkpoint', arguments: { question: 'Drop the table?' } });
+    await until(() => asked);
+    session.kill();
+
+    expect(await call).toMatchObject({ isError: true, content: [{ type: 'text', text: expect.stringContaining('withdrawn') }] });
+  });
+
+  it('keeps the server across a restart after an ignored interrupt', async () => {
+    const { runner, adapters } = served((adapter) => { adapter.interruptAnswer = 'ignore'; });
+    const session = await runner.spawn(options());
+    if (!isStructuredSession(session)) throw new Error('not a structured session');
+    await until(() => adapters[0].sent.length === 1);
+
+    await session.interrupt();
+
+    expect(adapters).toHaveLength(2);
+    expect(adapters[1].starts[0]).toMatchObject({ mcp: servedConfig(adapters[0]) });
+    session.kill();
+  });
+
+  it('refuses the token once the task is killed', async () => {
+    const { runner, adapters } = served();
+    const session = await runner.spawn(options());
+    const config = servedConfig(adapters[0]);
+
+    session.kill();
+
+    await expect(connect(config)).rejects.toThrow();
+  });
+
+  it('refuses the token once the runner\'s process is gone', async () => {
+    const { runner, adapters } = served();
+    await runner.spawn(options());
+    const config = servedConfig(adapters[0]);
+
+    adapters[0].exit(0);
+
+    await expect(connect(config)).rejects.toThrow();
+  });
+
+  it('refuses the token of a runner that could not start', async () => {
+    const { runner, adapters } = served((adapter) => { adapter.startError = new Error('no such binary'); });
+
+    await expect(runner.spawn(options())).rejects.toThrow('no such binary');
+
+    await expect(connect(servedConfig(adapters[0]))).rejects.toThrow();
+  });
+
+  it('gives a runner whose connector cannot inject it no server', async () => {
+    const { runner, adapters } = served();
+    // Every built-in runner is given the server, so this is a plugin runner.
+    const plugin = { get: () => registry.get('claude-code') } as unknown as RunnerRegistry;
+    const session = await runner.spawn(options({ runner: 'other-runner', registry: plugin }));
+
+    expect(adapters[0].starts[0]).not.toHaveProperty('mcp');
     session.kill();
   });
 });

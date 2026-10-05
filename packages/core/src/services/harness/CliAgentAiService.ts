@@ -14,7 +14,7 @@ import type { IConfig } from '../../interfaces/IConfig';
 import type { IFileSystem } from '../../interfaces/IFileSystem';
 import type { IWebFetcher } from '../../interfaces/IWebFetcher';
 import type { RunnerModeInfo } from '../ModeResolver';
-import type { IAiService, ConversationRequest, ConversationTurn } from '../AiService';
+import type { IAiService, ConversationRequest, ConversationTurn, PlannerToolsOffer } from '../AiService';
 import {
   buildConversationSystemPrompt,
   buildPlanWithResults,
@@ -33,6 +33,7 @@ import { CodexAdapter } from './CodexAdapter';
 import { OpenCodeAdapter } from './OpenCodeAdapter';
 import { mapAgentTool, normalizeAgentArgs } from './agentTools';
 import { DEFAULT_PLANNER_MODES, type PlannerModes } from '../plannerModes';
+import { mcpClientConfig, type McpCredential, type OrdewellMcpServer } from '../mcp';
 
 /**
  * How many times a turn that backgrounded a subagent may be asked to wait for
@@ -61,6 +62,14 @@ export interface CliAgentAiServiceDeps extends Partial<AgentProcessDeps> {
   createAdapter?: (runner: string, deps: AgentProcessDeps) => AgentAdapter | null;
   /** Workspace root the agent explores. Defaults to the host process's cwd. */
   workspaceRoot?: () => string;
+  /** Where a conversation's planner tools are served (ADR-0022). Absent: every planner gets the envelopes. */
+  mcpServer?: OrdewellMcpServer;
+}
+
+/** A conversation's planner tools, and the system prompt that teaches them in place of the envelopes. */
+interface PlannerTools {
+  offer: PlannerToolsOffer;
+  systemPrompt: string;
 }
 
 function defaultAdapter(runner: string, deps: AgentProcessDeps): AgentAdapter | null {
@@ -109,7 +118,12 @@ export class CliAgentAiService implements IAiService {
    * every session boundary — nothing from one goal may reach the next.
    */
   private lastNativeSessionId: string | null = null;
-  private conversation: { startOptions: PlannerStartOptions; runners: RunnerId[]; runnerModes?: Record<RunnerId, RunnerModeInfo[]>; autonomousDefault?: boolean } | null = null;
+  private conversation: { startOptions: PlannerStartOptions; tools?: PlannerTools; runners: RunnerId[]; runnerModes?: Record<RunnerId, RunnerModeInfo[]>; autonomousDefault?: boolean } | null = null;
+  private readonly mcpServer: OrdewellMcpServer | undefined;
+  /** The planner token the running process was spawned with; revoked with the process (ADR-0022, A3). */
+  private plannerToken: string | null = null;
+  /** Whether the running planner was spawned with its tools and the CLI reported them connected. */
+  private toolsAttached = false;
   private activeAbort: AbortController | null = null;
   /**
    * Every subagent this conversation has reported starting, and finishing.
@@ -132,6 +146,7 @@ export class CliAgentAiService implements IAiService {
     };
     this.makeAdapter = deps.createAdapter ?? defaultAdapter;
     this.workspaceRoot = deps.workspaceRoot ?? (() => process.cwd());
+    this.mcpServer = deps.mcpServer;
   }
 
   hasActiveConversation(): boolean { return this.conversation !== null; }
@@ -150,14 +165,17 @@ export class CliAgentAiService implements IAiService {
       && this.conversation.startOptions.effort === this.config.plannerThinkingEffort;
   }
 
+  /** Whether this conversation's planner submits through the Ordewell MCP server rather than the envelopes. */
+  plannerToolsAttached(): boolean { return this.toolsAttached; }
+
   /** The agent's own session id, a resumption hint only — Ordewell's transcript is authoritative (T4). */
   nativeSessionId(): string | null { return this.adapter?.nativeSessionId() ?? null; }
 
   reset(): void {
     this.activeAbort?.abort();
     this.activeAbort = null;
-    this.adapter?.dispose();
-    this.adapter = null;
+    this.disposeAdapter();
+    this.toolsAttached = false;
     // Session boundaries are hard (ADR-0008): the next goal must not resume
     // the previous goal's agent session.
     this.lastNativeSessionId = null;
@@ -190,11 +208,22 @@ export class CliAgentAiService implements IAiService {
       model: this.plannerModel(),
       effort: this.config.plannerThinkingEffort,
     };
+    const tools: PlannerTools | undefined = req.plannerTools && this.mcpServer
+      ? {
+        offer: req.plannerTools,
+        systemPrompt: buildConversationSystemPrompt(
+          req.goal, contextStr, req.modelsByRunner, req.runners, req.runnerModes,
+          req.autonomousDefault ?? true, req.verificationEnabled ?? false,
+          { harness: true, isolatedExecution: req.isolatedExecution, plannerTools: true },
+        ),
+      }
+      : undefined;
 
-    await this.startAdapter(startOptions);
+    await this.startAdapter(startOptions, tools);
 
     this.conversation = {
       startOptions,
+      tools,
       runners: req.runners,
       runnerModes: req.runnerModes,
       autonomousDefault: req.autonomousDefault,
@@ -465,7 +494,7 @@ export class CliAgentAiService implements IAiService {
     // the process by contract. Either way the adapter cannot be sent to again —
     // `dispose()` is terminal — so drop it and let the next turn restart from
     // the session id rather than throwing into a dead stdin.
-    if (error || signal?.aborted) { adapter.dispose(); this.adapter = null; }
+    if (error || signal?.aborted) this.disposeAdapter();
 
     return { text, researchLog, error, aborted: signal?.aborted, backgroundAgents };
   }
@@ -477,12 +506,53 @@ export class CliAgentAiService implements IAiService {
    * type: the read-only boundary (ADR-0008/0009) cannot be crossed into task
    * mode from here without changing this signature.
    */
-  private async startAdapter(opts: PlannerStartOptions): Promise<AgentAdapter> {
+  private async startAdapter(opts: PlannerStartOptions, tools?: PlannerTools): Promise<AgentAdapter> {
     const adapter = this.makeAdapter(this.runner, this.processDeps);
     if (!adapter) throw new Error(`No planner adapter is available for "${this.runner}".`);
+    this.toolsAttached = false;
+    if (tools && this.mcpServer && adapter.mcpAttached) {
+      if (await this.startWithTools(adapter, opts, tools, this.mcpServer)) return adapter;
+      // Not connected: this process was told to submit through tools it
+      // cannot reach, so a fresh one is spawned with the envelopes instead.
+      return this.startAdapter(opts);
+    }
     await adapter.start(opts);
     this.adapter = adapter;
     return adapter;
+  }
+
+  /** Spawn with the Ordewell server injected. False, with nothing left running, when it did not connect. */
+  private async startWithTools(adapter: AgentAdapter, opts: PlannerStartOptions, tools: PlannerTools, server: OrdewellMcpServer): Promise<boolean> {
+    let credential: McpCredential;
+    try {
+      credential = await server.issuePlannerToken({ sessionId: tools.offer.sessionId }, tools.offer.handler);
+    } catch {
+      return false;
+    }
+    try {
+      await adapter.start({ ...opts, systemPrompt: tools.systemPrompt, mcp: mcpClientConfig(credential) });
+      if (await adapter.mcpAttached!()) {
+        this.adapter = adapter;
+        this.plannerToken = credential.token;
+        this.toolsAttached = true;
+        return true;
+      }
+    } catch (err) {
+      adapter.dispose();
+      server.revoke(credential.token);
+      throw err;
+    }
+    adapter.dispose();
+    server.revoke(credential.token);
+    return false;
+  }
+
+  /** Kill the planner process, and with it the token it was spawned with. */
+  private disposeAdapter(): void {
+    this.adapter?.dispose();
+    this.adapter = null;
+    if (this.plannerToken) this.mcpServer?.revoke(this.plannerToken);
+    this.plannerToken = null;
   }
 
   /**
@@ -495,7 +565,7 @@ export class CliAgentAiService implements IAiService {
     if (this.adapter) return this.adapter;
     const conversation = this.conversation;
     if (!conversation) throw new Error('No active planner conversation.');
-    await this.startAdapter({ ...conversation.startOptions, resumeSessionId: this.lastNativeSessionId ?? undefined });
+    await this.startAdapter({ ...conversation.startOptions, resumeSessionId: this.lastNativeSessionId ?? undefined }, conversation.tools);
     return this.adapter!;
   }
 
@@ -517,7 +587,9 @@ export class CliAgentAiService implements IAiService {
     const previous = this.adapter;
     const previousConversation = this.conversation;
     const previousSessionId = this.lastNativeSessionId;
+    const previousTools = { token: this.plannerToken, attached: this.toolsAttached };
     this.adapter = null;
+    this.plannerToken = null;
 
     const startOptions: PlannerStartOptions = {
       kind: 'planner',
@@ -552,6 +624,8 @@ export class CliAgentAiService implements IAiService {
       // anything to dispose.
       oneShotAdapter?.dispose();
       this.adapter = previous;
+      this.plannerToken = previousTools.token;
+      this.toolsAttached = previousTools.attached;
       this.conversation = previousConversation;
       // The one-shot's own agent session must not become the conversation's
       // resume hint: restarting the chat into a plan-generation session would

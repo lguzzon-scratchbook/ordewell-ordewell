@@ -1,7 +1,10 @@
 import { createAiService, type IAiService } from './AiService';
-import { applyTaskOps, canMergeTasks, canSplitTask } from './TaskOps';
+import { applyTaskOps, canMergeTasks, canSplitTask, type TaskOp } from './TaskOps';
+import type { TaskQueryCatalog } from './TaskQuery';
+import { plannerToolHandler, runnersOf, type PlanEditOutcome } from './plannerTools';
+import { sharedMcpServer, type OrdewellMcpServer, type PlannerToolHandler } from './mcp';
 import { validateTaskEdit, type EditCatalog } from './TaskEditValidator';
-import { ConversationEditError, PlannerConversation, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type RewindTarget } from './PlannerConversation';
+import { ConversationEditError, PlannerConversation, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type PlannerSubmission, type RewindTarget } from './PlannerConversation';
 import { forkPlanState, type ForkedDialogue } from './conversationFork';
 import { Planner } from './Planner';
 import { createTaskOrchestrator } from './TaskOrchestrator';
@@ -74,6 +77,8 @@ export interface SessionRuntimeSettings {
   modelAllowlist?: Record<string, string[]>;
   /** Read once as a run starts, never per spawn (ADR-0018, S1). Absent means terminal. */
   runnerTransport?: RunnerTransport;
+  /** Absent means the user never chose, and `config.enabledRunners` (the host's defaults) decides. */
+  enabledRunners?: RunnerId[];
 }
 
 /**
@@ -96,7 +101,12 @@ function lastAttemptDigest(location: TaskLogLocation, taskId: string): string | 
 }
 
 export function sessionRuntimeSettings(settings: UserSettings): SessionRuntimeSettings {
-  return { ...plannerRuntimeToggles(settings), modelAllowlist: settings.modelAllowlist, runnerTransport: settings.runnerTransport };
+  return {
+    ...plannerRuntimeToggles(settings),
+    modelAllowlist: settings.modelAllowlist,
+    runnerTransport: settings.runnerTransport,
+    enabledRunners: settings.enabledRunners,
+  };
 }
 
 /**
@@ -168,10 +178,10 @@ export type SaveSession = (plan: LegacyPlanState, goal: string, workspace: strin
 
 /**
  * Everything a delivery surface constructs to host a session. Structural config
- * (enabledRunners, orchestratorModel, providerModelLists) is snapshotted inside
- * `config` at construction and never re-read from the environment. Runtime
- * settings (tdd, verification) are read live via the `settings` callback so a toggle
- * between generate and execute takes effect.
+ * (orchestratorModel, providerModelLists) is snapshotted inside `config` at
+ * construction and never re-read from the environment. Runtime settings (tdd,
+ * verification, enabled runners) are read live via the `settings` callback so a
+ * toggle between operations takes effect.
  */
 export interface SessionDeps {
   config: IConfig;
@@ -188,7 +198,7 @@ export interface SessionDeps {
   onNotice?: (notice: SessionNotice) => void;
   /** Shared across sessions — sole producer of model catalogs and routing lists. */
   modelResolver: ModelResolver;
-  /** Live runtime settings (tdd, verification). Read at each operation that needs them. */
+  /** Live runtime settings (tdd, verification, enabled runners). Read at each operation that needs them. */
   settings: () => SessionRuntimeSettings;
   /**
    * Host-assigned session id. When set, every persist writes under this id so
@@ -224,6 +234,8 @@ export interface SessionDeps {
   saveSession?: SaveSession;
   /** Where a structured task's log is saved (ADR-0018, P1). Defaults to a file per attempt beside the session's. */
   openTaskLog?: (location: TaskLogLocation, taskId: string) => TaskLogFile;
+  /** The Ordewell MCP server a harness planner's tools are served from (ADR-0022). Defaults to the process's one. */
+  mcpServer?: OrdewellMcpServer;
 }
 
 /**
@@ -240,14 +252,14 @@ export interface SessionDeps {
  * Switching releases the outgoing service: a harness planner holds an OS
  * process, so dropping the reference without `reset()` leaks an agent.
  */
-function liveAiService(config: IConfig, workspaceRoot: () => string): () => IAiService {
+function liveAiService(config: IConfig, workspaceRoot: () => string, mcpServer: OrdewellMcpServer): () => IAiService {
   let live: IAiService | null = null;
   let liveProvider: AiProvider | null = null;
   return () => {
     const provider = config.aiProvider;
     if (live && liveProvider === provider) return live;
     live?.reset();
-    live = createAiService(config, { workspaceRoot });
+    live = createAiService(config, { workspaceRoot, mcpServer });
     liveProvider = provider;
     return live;
   };
@@ -269,7 +281,7 @@ function isPlannerApproval(request: ApprovalRequest): boolean {
  */
 export function createSession(deps: SessionDeps): Session {
   const pinnedAiService = deps.aiService;
-  const aiService = pinnedAiService ? () => pinnedAiService : liveAiService(deps.config, deps.workspaceRoot);
+  const aiService = pinnedAiService ? () => pinnedAiService : liveAiService(deps.config, deps.workspaceRoot, deps.mcpServer ?? sharedMcpServer());
   const store = new PlanStore();
   const taskLogs = new TaskLogRecorder({
     broadcast: deps.broadcast,
@@ -447,6 +459,16 @@ export class Session {
   private currentSessionId: string;
   private readonly skillsService: Pick<SkillsService, 'findSkill' | 'listSkills'>;
   private readonly conversation: PlannerConversation;
+  private readonly plannerTools: PlannerToolHandler = plannerToolHandler({
+    liveCatalog: () => this.liveCatalog(),
+    coerce: (tasks, runners) => coerceAssignments(tasks, this.allowlist(), runners, this.models()),
+    submitPlan: (tasks, runners) => this.submitPlanFromTool(tasks, runners),
+    editPlan: (ops) => this.editPlanFromTool(ops),
+    tasks: () => this.store.planTasks,
+    read: (signature, answer) => this.conversation.read(signature, answer),
+    liveOutput: (taskId, opts) => this.orchestrator.getLiveOutput(taskId, opts),
+    lastAttempt: (taskId) => lastAttemptDigest(this.taskLogLocation, taskId),
+  });
 
   constructor(parts: SessionParts) {
     this.config = parts.config;
@@ -477,17 +499,7 @@ export class Session {
       aiService: () => this.aiService(),
       onProgress: (p) => this.events.progress(p),
       opening: (runners) => this.conversationOpening(runners),
-      catalog: () => {
-        const runners = this.plan?.runners ?? [];
-        return {
-          runners,
-          // Allowlist-filtered: neither the per-turn block nor a read may offer
-          // a model the planner is forbidden to assign.
-          models: filterModelsForPrompt(this.models(), this.allowlist()),
-          modes: this.runnerModesFor(runners),
-          autonomousDefault: this.config.autonomousMode,
-        };
-      },
+      catalog: () => this.catalogOf(this.plan?.runners ?? []),
       tasks: () => this.store.planTasks,
       liveOutput: (taskId, opts) => this.orchestrator.getLiveOutput(taskId, opts),
       hasLiveWork: () => this.hasLiveWork,
@@ -650,6 +662,29 @@ export class Session {
     this.remintSessionId();
   }
 
+  /**
+   * What a planner may assign right now: every enabled runner, its modes, and
+   * its allowlisted models — read as of this call, so a runner enabled or an
+   * allowlist edited since planning started is in it (#69). Discovers a
+   * runner's models the first time it is asked for.
+   */
+  async liveCatalog(): Promise<TaskQueryCatalog> {
+    const runners = this.enabledRunners();
+    this.modelsCache = { ...this.modelsCache, ...await this.modelResolver.modelsForRunners(runners) };
+    return this.catalogOf(runners);
+  }
+
+  private catalogOf(runners: RunnerId[]): TaskQueryCatalog {
+    return {
+      runners,
+      // Allowlist-filtered: neither the per-turn block nor a read may offer
+      // a model the planner is forbidden to assign.
+      models: filterModelsForPrompt(this.models(), this.allowlist()),
+      modes: this.runnerModesFor(runners),
+      autonomousDefault: this.config.autonomousMode,
+    };
+  }
+
   private runnerModesFor(runners: RunnerId[]): Record<RunnerId, RunnerModeInfo[]> {
     return runnerModesFrom(this.registry, runners);
   }
@@ -662,12 +697,17 @@ export class Session {
    * allowlist here — {@link checkModelAndModeValidity} narrows by
    * allowlist itself, the same way `coerceAssignments` does.
    */
-  private editCatalog(): EditCatalog {
+  private editCatalog(runners: RunnerId[] = this.plan?.runners ?? []): EditCatalog {
     return {
       modelsByRunner: this.models(),
-      runnerModes: this.runnerModesFor(this.plan?.runners ?? []),
+      runnerModes: this.runnerModesFor(runners),
       perRunnerAllowlist: this.allowlist(),
     };
+  }
+
+  /** The runners enabled right now — a toggle made since the session was built counts (#69). */
+  private enabledRunners(): RunnerId[] {
+    return this.settingsFn().enabledRunners ?? this.config.enabledRunners;
   }
 
   /**
@@ -765,7 +805,7 @@ export class Session {
     this.goal = goal;
     this.remintSessionId();
     this.beginFreshPlan();
-    const enabled = this.config.enabledRunners;
+    const enabled = this.enabledRunners();
     const chosenRunners = runners.filter((r) => enabled.includes(r));
     if (chosenRunners.length === 0) throw new Error('None of the requested runners are enabled');
 
@@ -817,7 +857,7 @@ export class Session {
     this.goal = this.resolveSkillInvocation(goal);
     this.remintSessionId();
     this.beginFreshPlan();
-    const enabled = this.config.enabledRunners;
+    const enabled = this.enabledRunners();
     const chosenRunners = runners.filter((r) => enabled.includes(r));
     if (chosenRunners.length === 0) throw new Error('None of the requested runners are enabled');
 
@@ -906,6 +946,55 @@ export class Session {
     return this.conversation.rewindTargets();
   }
 
+  /**
+   * Hand the planner turn in flight a validated plan or a task edit; the turn
+   * commits it as it would the same JSON in the planner's reply. False when
+   * no turn is open.
+   */
+  submitToTurn(submission: PlannerSubmission): boolean {
+    return this.conversation.submit(submission);
+  }
+
+  /**
+   * A plan the planner submitted through its tool, already checked against the
+   * live catalog. Its runners join `plan.runners` here, so a runner enabled
+   * since planning started is not snapped back by the commit (#69).
+   */
+  private submitPlanFromTool(tasks: Task[], runners: RunnerId[]): boolean {
+    if (!this.plan || !this.conversation.submit({ kind: 'plan', tasks })) return false;
+    for (const runner of runners) this.admitRunner(runner, this.modelsCache[runner] ?? []);
+    return true;
+  }
+
+  /**
+   * A task edit the planner made through its tool. Checked against the live
+   * catalog, then handed to the open turn, which commits it as it would the
+   * same ops in a taskOps reply — including parking it behind a running batch,
+   * which the envelope does before any check, so a queued edit is not checked
+   * here either. Edits made in one reply join one batch.
+   */
+  private async editPlanFromTool(ops: TaskOp[]): Promise<PlanEditOutcome> {
+    const refuse = (message: string): PlanEditOutcome => ({ ok: false, errors: [message] });
+    // The held batch is read after this await, so two calls made in parallel
+    // join one batch instead of one replacing the other.
+    const catalog = await this.liveCatalog();
+    if (!this.plan || this.store.planTasks.length === 0) return refuse('There is no plan to edit yet: submit one with submit_plan.');
+    const held = this.conversation.pendingOps();
+    if (!held) return refuse('A whole plan was submitted in this reply and replaces the plan when it ends: make the edit in your next reply.');
+
+    const batch = [...held, ...ops];
+    const queued = this.conversation.editWouldQueue(batch);
+    let summary: string[] = [];
+    if (!queued) {
+      const result = applyTaskOps(this.store.planTasks, batch, catalog.runners, this.editCatalog(catalog.runners));
+      if (!result.ok) return { ok: false, errors: result.errors };
+      summary = result.summary;
+      for (const runner of runnersOf(result.tasks)) this.admitRunner(runner, this.modelsCache[runner] ?? []);
+    }
+    if (!this.conversation.submit({ kind: 'task_ops', ops: batch })) return refuse('No planning turn is open to take the edit.');
+    return { ok: true, summary, queued };
+  }
+
   /** Whether the planner conversation is live (started and not yet committed to a plan). */
   get isConversationActive(): boolean {
     return this.conversation.isActive;
@@ -955,6 +1044,7 @@ export class Session {
       contextWindow: this.modelResolver.contextWindowFor?.(this.config.orchestratorModel),
       fs: this.fsAdapter,
       fetcher: this.fetcher,
+      plannerTools: { sessionId: this.sessionId, handler: this.plannerTools },
     };
   }
 
@@ -1099,7 +1189,7 @@ export class Session {
     );
 
     try {
-      const modelsByRunner = await this.modelResolver.modelsForRunners(this.config.enabledRunners);
+      const modelsByRunner = await this.modelResolver.modelsForRunners(this.enabledRunners());
       const runnerModes = this.runnerModesFor(this.plan?.runners ?? ['claude-code']);
       const { modelAllowlist } = this.settingsFn();
 
@@ -1503,7 +1593,7 @@ export class Session {
     if (!this.plan) throw new Error('No active plan state');
     const check = canMergeTasks(this.store.planTasks, taskIds);
     if (!check.ok) throw new Error(check.error ?? 'These tasks cannot be merged');
-    const prompt = buildMergePrompt(taskIds, this.store.planTasks);
+    const prompt = buildMergePrompt(taskIds, this.store.planTasks, this.aiService().plannerToolsAttached?.());
     return this.continueConversation(prompt, options);
   }
 
@@ -1516,7 +1606,7 @@ export class Session {
     if (!this.plan) throw new Error('No active plan state');
     const check = canSplitTask(this.store.planTasks, taskId);
     if (!check.ok) throw new Error(check.error ?? 'This task cannot be split');
-    const prompt = buildSplitPrompt(taskId, this.store.planTasks);
+    const prompt = buildSplitPrompt(taskId, this.store.planTasks, this.aiService().plannerToolsAttached?.());
     return this.continueConversation(prompt, options);
   }
 
