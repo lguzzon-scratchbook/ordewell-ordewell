@@ -271,3 +271,4 @@ planner tools are recorded here as an explicit entry against both:
 
 - 2026-10-05 — proposed.
 - 2026-10-05 — V5 amended: checked against Claude Code 2.1.289, its hard cap on a tool call is 1e8 ms, but an HTTP call silent for 300s is aborted. Progress notifications reset that, so the server heartbeats instead of the configuration raising a timeout.
+- 2026-10-05 — OpenCode checked against 1.18.34: the server and an allow rule for `ordewell_*` go in `OPENCODE_CONFIG_CONTENT`, deep-merged over what is already there. A tool is named `ordewell_<tool>`. A `checkpoint` call held for 130s returned its answer, past the 5s `timeout` a remote entry defaults to and the MCP client's 60s request timeout, so no timeout is configured.
