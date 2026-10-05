@@ -3,7 +3,8 @@ import { OpenCodeAdapter } from '../OpenCodeAdapter';
 import type { AgentEvent, AgentProcessDeps, AgentStartOptions, TaskStartOptions } from '../AgentAdapter';
 import type { SpawnFn } from '../../HeadlessRunner';
 import { mcpClientConfig } from '../../mcp';
-import { fakeSpawn } from '../../__tests__/harnessTestKit';
+import { OPENCODE_MANIFEST } from '../../../plugins/builtin/opencode.manifest';
+import { modeIds, fakeSpawn } from '../../__tests__/harnessTestKit';
 
 /**
  * OpenCode's task mode (ADR-0018, #55): `opencode serve` driven over HTTP
@@ -424,12 +425,12 @@ const ask = (id: string, extra: Record<string, unknown> = {}) => ({
 });
 
 async function turnWith(server: ReturnType<typeof fakeServer>, opts: TaskStartOptions) {
-  const { adapter } = await startTask(server, opts);
+  const { adapter, env } = await startTask(server, opts);
   const events: AgentEvent[] = [];
   const turn = adapter.send('do the task', (e) => events.push(e));
   const stream = await server.stream();
   stream.push(status('busy'));
-  return { adapter, events, turn, stream };
+  return { adapter, events, turn, stream, env };
 }
 
 const planMode = taskStart({ mode: 'plan', flags: { permissionMode: 'plan', modeSettings: {} } });
@@ -621,6 +622,20 @@ describe('OpenCodeAdapter with the Ordewell MCP server (ADR-0022)', () => {
 
     expect(configOf(env)).toEqual({ mcp: { ordewell }, permission: { 'ordewell_*': 'allow' } });
     expect(spawned.lastArgs().join(' ')).not.toContain('tok-secret');
+    adapter.dispose();
+  });
+
+  it.each(modeIds(OPENCODE_MANIFEST))('allows the Ordewell tools by rule and by answer under %s', async (mode) => {
+    const server = fakeServer();
+    const opts = taskStart({ mode, flags: { permissionMode: mode, modeSettings: {} }, mcp });
+    const { adapter, events, turn, stream, env } = await turnWith(server, opts);
+    stream.push(ask('per_t', { permission: 'ordewell_checkpoint', patterns: ['*'], metadata: {} }));
+    await until(() => server.requests.some((r) => r.path === '/permission/per_t/reply'));
+    stream.push(status('idle'));
+    await turn;
+
+    expect((configOf(env) as { permission: Record<string, string> }).permission['ordewell_*']).toBe('allow');
+    expect(events).toContainEqual(expect.objectContaining({ type: 'permission_request', id: 'per_t', decided: { decision: 'allow' } }));
     adapter.dispose();
   });
 

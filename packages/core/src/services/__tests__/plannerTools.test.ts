@@ -142,6 +142,20 @@ describe('the Claude Code planner with the Ordewell server injected', () => {
   });
 });
 
+describe('the planner token, in what the planner is told', () => {
+  it('appears in no message sent to the planner, its system prompt included', async () => {
+    const server = newServer();
+    const spawned = fakeClaude();
+    await service(spawned, server).startConversation(request());
+
+    const token = bearer(injectedServer(spawned.lastArgs())!);
+    expect(token.length).toBeGreaterThan(20);
+    expect(spawned.processes[0].written.length).toBeGreaterThan(0);
+    expect(spawned.processes[0].written.join('')).not.toContain(token);
+    expect(spawned.lastArgs().join(' ')).not.toContain(token);
+  });
+});
+
 describe('the planner token', () => {
   it('is refused, and its config file gone, once the session resets', async () => {
     const server = newServer();
