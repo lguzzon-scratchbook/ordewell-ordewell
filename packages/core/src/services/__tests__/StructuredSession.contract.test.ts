@@ -8,7 +8,7 @@ import { isStructuredSession, type ITerminalSession, type StructuredEvent, type 
 import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter } from '../harness/AgentAdapter';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import { FakeStructuredSession, FakeTerminalSession } from '../../testing';
-import { OrdewellMcpServer, type McpClientConfig } from '../mcp';
+import { OrdewellMcpServer, type CheckpointAnswer, type McpClientConfig } from '../mcp';
 import { fakeSpawn, fixture, type ScriptedReply } from './harnessTestKit';
 
 /**
@@ -533,6 +533,56 @@ describe('the Ordewell task tools (ADR-0022)', () => {
     expect(result.isError).toBe(false);
     expect(reports).toEqual([{ status: 'done', summary: 'Built it.' }]);
     session.kill();
+  });
+
+  it('holds a checkpoint call open until the session answers it, and returns the answer', async () => {
+    const { runner, adapters } = served();
+    const session = await runner.spawn(options());
+    if (!isStructuredSession(session)) throw new Error('not a structured session');
+    const asked: string[] = [];
+    let answer!: (a: CheckpointAnswer) => void;
+    session.onToolCheckpoint((question) => {
+      asked.push(question);
+      return new Promise<CheckpointAnswer>((resolve) => { answer = resolve; });
+    });
+
+    const client = await connect(servedConfig(adapters[0]));
+    const call = client.callTool({ name: 'checkpoint', arguments: { question: 'Drop the table?' } });
+    await until(() => asked.length === 1);
+    answer({ kind: 'rejected', reason: 'keep it' });
+
+    expect(asked).toEqual(['Drop the table?']);
+    expect(await call).toMatchObject({ isError: false, content: [{ type: 'text', text: 'rejected: keep it' }] });
+    session.kill();
+  });
+
+  it('answers a checkpoint call that nothing attached to as not available', async () => {
+    const { runner, adapters } = served();
+    const session = await runner.spawn(options());
+
+    const client = await connect(servedConfig(adapters[0]));
+    const result = await client.callTool({ name: 'checkpoint', arguments: { question: 'Drop the table?' } });
+
+    expect(result.isError).toBe(true);
+    session.kill();
+  });
+
+  it('ends a waiting checkpoint call with a refusal when the session is killed', async () => {
+    const { runner, adapters } = served();
+    const session = await runner.spawn(options());
+    if (!isStructuredSession(session)) throw new Error('not a structured session');
+    let asked = false;
+    session.onToolCheckpoint((_question, signal) => new Promise<CheckpointAnswer>((resolve) => {
+      asked = true;
+      signal.addEventListener('abort', () => resolve({ kind: 'withdrawn', why: 'this attempt has ended.' }));
+    }));
+
+    const client = await connect(servedConfig(adapters[0]));
+    const call = client.callTool({ name: 'checkpoint', arguments: { question: 'Drop the table?' } });
+    await until(() => asked);
+    session.kill();
+
+    expect(await call).toMatchObject({ isError: true, content: [{ type: 'text', text: expect.stringContaining('withdrawn') }] });
   });
 
   it('keeps the server across a restart after an ignored interrupt', async () => {

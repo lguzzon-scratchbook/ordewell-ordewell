@@ -153,6 +153,30 @@ describe('OrdewellMcpServer', () => {
     expect((await call).content).toEqual([{ type: 'text', text: 'The attempt ended before the checkpoint was answered.' }]);
   });
 
+  // Claude Code aborts an HTTP tool call that goes silent for its idle timeout;
+  // a progress notification is what resets that clock.
+  it('sends progress notifications while a call is still waiting', async () => {
+    const server = new OrdewellMcpServer({ heartbeatMs: 10 });
+    servers.push(server);
+    let answer!: (reply: McpToolReply) => void;
+    const checkpoint = () => new Promise<McpToolReply>((resolve) => { answer = resolve; });
+    const task = await connect(await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1 }, { checkpoint }));
+    const beats: number[] = [];
+
+    const call = task.callTool({ name: 'checkpoint', arguments: { question: 'Which port?' } }, undefined, {
+      onprogress: ({ progress }) => beats.push(progress),
+    });
+    await vi.waitFor(() => expect(beats.length).toBeGreaterThanOrEqual(3));
+    answer({ text: 'continue' });
+
+    expect((await call).content).toEqual([{ type: 'text', text: 'continue' }]);
+    expect(beats).toEqual([...beats].sort((a, b) => a - b));
+    expect(new Set(beats).size).toBe(beats.length);
+    const settled = beats.length;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(beats).toHaveLength(settled);
+  });
+
   it('refuses a request whose Host is not the bound loopback address, or that carries an Origin', async () => {
     const server = newServer();
     const credential = await server.issueTaskToken({ sessionId: 's1', taskId: 't1', attempt: 1 });

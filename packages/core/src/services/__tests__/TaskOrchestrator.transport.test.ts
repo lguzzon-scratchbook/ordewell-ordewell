@@ -271,3 +271,93 @@ describe('completing through task_complete (ADR-0022)', () => {
     expect(orchestrator.storeInstance.get('t1')!.verdict?.reason).toContain('the schema file is missing');
   });
 });
+
+describe('checkpointing through the checkpoint tool (ADR-0022, V5)', () => {
+  function hitlPlan() {
+    return [createTask({ id: 't1', order: 1, title: 'Migrate', prompt: 'do it', autonomy: 'HITL', completionMarker: 'mk-1' })];
+  }
+
+  async function asking() {
+    const { runner, sessions, requests } = routingRunner();
+    const orchestrator = orchestratorWith({ value: 'structured' }, runner);
+    orchestrator.loadPlan(hitlPlan());
+    const events: Array<{ taskId: string; taskTitle: string; summary: string }> = [];
+    orchestrator.subscribe({ onCheckpoint: (data) => events.push(data) });
+    await orchestrator.forceStartTask('t1');
+    const session = sessions[0] as FakeStructuredSession;
+    return { orchestrator, session, events, requests };
+  }
+
+  it('teaches the tool, with the marker as its fallback', async () => {
+    const { requests } = await asking();
+
+    expect(requests[0].prompt).toContain('Call the `checkpoint` tool');
+    expect(requests[0].prompt).toContain('`<<<ORDEWELL_` immediately followed by `CHECKPOINT:`');
+  });
+
+  it('waits on the user as a marker checkpoint does, then answers the call with continue', async () => {
+    const { orchestrator, session, events } = await asking();
+
+    const answer = session.callCheckpoint('Drop the table?');
+
+    expect(events).toEqual([{ taskId: 't1', taskTitle: 'Migrate', summary: 'Drop the table?' }]);
+    const waiting = orchestrator.storeInstance.get('t1')!;
+    expect(waiting.status).toBe('awaiting_user');
+    expect(waiting.awaitingReason).toBe('checkpoint');
+
+    orchestrator.approveCheckpoint('t1');
+
+    await expect(answer).resolves.toEqual({ kind: 'continue' });
+    expect(orchestrator.storeInstance.get('t1')!.status).toBe('in_progress');
+    expect(session.written).toEqual([]);
+  });
+
+  it('answers the call with the user\'s reason on reject', async () => {
+    const { orchestrator, session } = await asking();
+
+    const answer = session.callCheckpoint('Drop the table?');
+    orchestrator.rejectCheckpoint('t1', 'not on production');
+
+    await expect(answer).resolves.toEqual({ kind: 'rejected', reason: 'not on production' });
+    expect(orchestrator.storeInstance.get('t1')!.status).toBe('in_progress');
+    expect(session.written).toEqual([]);
+  });
+
+  it('withdraws a waiting call when the attempt is retried', async () => {
+    const { orchestrator, session } = await asking();
+
+    const answer = session.callCheckpoint('Drop the table?');
+    await orchestrator.retryTask('t1');
+
+    await expect(answer).resolves.toMatchObject({ kind: 'withdrawn' });
+  });
+
+  it('withdraws a waiting call when the run is stopped', async () => {
+    const { orchestrator, session } = await asking();
+
+    const answer = session.callCheckpoint('Drop the table?');
+    orchestrator.stop();
+
+    await expect(answer).resolves.toMatchObject({ kind: 'withdrawn' });
+  });
+
+  it('puts a task back in progress when its call went away with the attempt still running', async () => {
+    const { orchestrator, session } = await asking();
+    const gone = new AbortController();
+
+    void session.callCheckpoint('Drop the table?', gone.signal);
+    expect(orchestrator.storeInstance.get('t1')!.status).toBe('awaiting_user');
+    gone.abort();
+
+    expect(orchestrator.storeInstance.get('t1')!.status).toBe('in_progress');
+  });
+
+  it('keeps the marker path writing its answer into the session', async () => {
+    const { orchestrator, session } = await asking();
+
+    session.emitOutput('<<<ORDEWELL_CHECKPOINT: need review>>>');
+    orchestrator.approveCheckpoint('t1');
+
+    expect(session.written.join('')).toContain('ORDEWELL_CONTINUE');
+  });
+});

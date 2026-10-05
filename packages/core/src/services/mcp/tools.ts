@@ -108,6 +108,25 @@ export interface McpToolReply {
   isError?: boolean;
 }
 
+/**
+ * How a checkpoint call ended. `withdrawn` is the attempt going away under it
+ * (verdict, cancel, retry, stop) or the call being refused, not a verdict on
+ * the question.
+ */
+export type CheckpointAnswer =
+  | { kind: 'continue' }
+  | { kind: 'rejected'; reason: string }
+  | { kind: 'withdrawn'; why: string };
+
+/** The checkpoint call's result: the answer as the runner reads it (ADR-0022, V5). */
+export function checkpointReply(answer: CheckpointAnswer): McpToolReply {
+  switch (answer.kind) {
+    case 'continue': return { text: 'continue' };
+    case 'rejected': return { text: `rejected: ${answer.reason}` };
+    case 'withdrawn': return { text: `The checkpoint was withdrawn: ${answer.why}`, isError: true };
+  }
+}
+
 export interface McpToolContext {
   /** Aborts when the token is revoked or the caller cancels — a waiting handler must stop. */
   signal: AbortSignal;
