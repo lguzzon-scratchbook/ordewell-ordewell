@@ -136,6 +136,7 @@ export { continuability, canContinue } from './services/continuation';
 export type { Continuability } from './services/continuation';
 export { TaskLogRecorder } from './services/TaskLogRecorder';
 export type { TaskLogRecorderDeps } from './services/TaskLogRecorder';
+export * from './services/mcp';
 export * from './utils/shell';
 export {
   planDirectLaunch,
