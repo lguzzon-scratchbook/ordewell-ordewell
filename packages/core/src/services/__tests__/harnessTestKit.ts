@@ -42,6 +42,8 @@ export interface FakeSpawnResult {
   /** The argv of the most recent spawn — how the read-only flags are asserted. */
   lastArgs(): string[];
   lastCommand(): string;
+  /** The environment of the most recent spawn. */
+  lastEnv(): NodeJS.ProcessEnv;
   /** The argv of each sandbox probe, in order — see {@link FakeSpawnOptions.probe}. */
   probeArgs(): string[][];
 }
@@ -124,9 +126,10 @@ export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = 
   const probes: string[][] = [];
   let command = '';
   let args: string[] = [];
+  let env: NodeJS.ProcessEnv = {};
   const queue = [...replies];
 
-  const spawn: SpawnFn = (cmd, argv) => {
+  const spawn: SpawnFn = (cmd, argv, spawnOptions) => {
     // The sandbox probe is a short-lived side process, not the agent's
     // transport: it is kept out of `processes` and `lastArgs` so that adding it
     // does not shift the indices every other scenario asserts on.
@@ -143,6 +146,7 @@ export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = 
 
     command = cmd;
     args = argv;
+    env = spawnOptions?.env ?? {};
     const proc = makeProcess();
     processes.push(proc);
     proc.on('__written', (chunk: string) => {
@@ -159,6 +163,7 @@ export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = 
     processes,
     lastArgs: () => args,
     lastCommand: () => command,
+    lastEnv: () => env,
     probeArgs: () => probes,
   };
 }
@@ -180,7 +185,7 @@ export function respondingSpawn(onWrite: (written: string, proc: FakeAgentProces
     proc.on('__written', (chunk: string) => onWrite(chunk, proc, argv));
     return proc as unknown as ChildProcess;
   };
-  return { spawn, processes, lastArgs: () => args, lastCommand: () => command, probeArgs: () => [] };
+  return { spawn, processes, lastArgs: () => args, lastCommand: () => command, lastEnv: () => ({}), probeArgs: () => [] };
 }
 
 /**

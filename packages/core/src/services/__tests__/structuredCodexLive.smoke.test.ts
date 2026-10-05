@@ -5,6 +5,9 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { StructuredRunner } from '../StructuredRunner';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { isStructuredSession, type ITerminalSession, type StructuredEvent, type StructuredTurnEnd } from '../../interfaces/ITerminalRunner';
+import { VerdictEngine } from '../VerdictEngine';
+import { composeAugmentedPrompt } from '../promptAugment';
+import { createTask, type Verdict } from '../../models/Task';
 
 /**
  * The opt-in live check for the Codex task connector on the structured
@@ -12,6 +15,9 @@ import { isStructuredSession, type ITerminalSession, type StructuredEvent, type 
  * the same reasons: real quota, real latency, no credentials in CI.
  *
  *   ORDEWELL_LIVE_AGENTS=codex npx vitest run --root packages/core structuredCodexLive
+ *
+ * `task_complete` and `checkpoint` go through the Ordewell MCP server Codex is
+ * given for the thread (ADR-0022).
  *
  * Every case runs in a throwaway directory with dummy work. A Codex sandbox
  * that cannot start here fails the write cases with the connector's own
@@ -148,5 +154,75 @@ describe.runIf(live)('structured transport, Codex — live smoke', () => {
       expect(again.ends, resumed.getOutput()).toEqual(['completed']);
       expect(resumed.getOutput()).toContain('hello.txt');
     } finally { first.stopAll(); second.stopAll(); }
+  }, TIMEOUT_MS * 2);
+
+  it('completes a task through task_complete, with nothing asked of a person (ADR-0022)', async () => {
+    const dir = dirFor();
+    const runner = new StructuredRunner();
+    const task = createTask({ id: 'live-codex-tool', title: 'Multiply', prompt: 'Work out 17 * 23 and state the result.', taskMode: 'fullAccess', completionMarker: 'live-codex-tool' });
+    const engine = new VerdictEngine();
+    const verdict = new Promise<Verdict>((resolve) => engine.onVerdict((_taskId, v) => resolve(v)));
+    try {
+      const session = await runner.spawn({
+        taskId: task.id,
+        runner: 'codex',
+        prompt: composeAugmentedPrompt(task, [task], { completionTool: true }),
+        modelId: model,
+        thinkingEffort: 'low',
+        mode: 'fullAccess',
+        cwd: dir,
+        registry: new RunnerRegistry(),
+        attempt: 1,
+      });
+      const turns = turnEnds(session);
+      engine.watch(task, session);
+
+      const decided = await verdict;
+      expect(decided.outcome).toBe('pass');
+      expect(decided.checks[0].name, session.getOutput()).toBe('task_complete');
+      await turns.next();
+      const call = turns.events.find((e) => e.type === 'tool_call' && e.name === 'mcp__ordewell__task_complete');
+      expect(call).toBeDefined();
+      expect(turns.events.find((e) => e.type === 'tool_result' && call?.type === 'tool_call' && e.id === call.id)).toMatchObject({ success: true });
+      expect(turns.events.filter((e) => e.type === 'permission_request')).toEqual([]);
+      console.error(`[live] task_complete verdict for Codex thread ${turns.session.nativeSessionId()}`);
+      session.kill();
+    } finally { runner.stopAll(); }
+  }, TIMEOUT_MS);
+
+  it('holds a checkpoint tool call open past Codex\'s default tool timeout, and returns the answer (ADR-0022, V5)', async () => {
+    const dir = dirFor();
+    const runner = new StructuredRunner();
+    const task = createTask({ id: 'live-codex-checkpoint', title: 'Ask', prompt: 'Your task: call the checkpoint tool with the question "Shall I proceed with the migration?", then state exactly what the result was. Do not call the checkpoint tool a second time.', taskMode: 'fullAccess', completionMarker: 'live-codex-checkpoint', autonomy: 'HITL' });
+    const engine = new VerdictEngine();
+    const verdict = new Promise<Verdict>((resolve) => engine.onVerdict((_taskId, v) => resolve(v)));
+    const asked: string[] = [];
+    engine.onCheckpoint((taskId, question) => {
+      asked.push(question);
+      // Longer than the 60s Codex gives a tool call that reports no result.
+      setTimeout(() => engine.rejectCheckpoint(taskId, 'not today'), 75_000);
+    });
+    try {
+      const session = await runner.spawn({
+        taskId: task.id,
+        runner: 'codex',
+        prompt: composeAugmentedPrompt(task, [task], { completionTool: true }),
+        modelId: model,
+        thinkingEffort: 'low',
+        mode: 'fullAccess',
+        cwd: dir,
+        registry: new RunnerRegistry(),
+        attempt: 1,
+      });
+      const turns = turnEnds(session);
+      engine.watch(task, session);
+
+      await verdict;
+      const call = turns.events.find((e) => e.type === 'tool_call' && e.name === 'mcp__ordewell__checkpoint');
+      expect(call, session.getOutput()).toBeDefined();
+      expect(asked).toHaveLength(1);
+      expect(turns.events.find((e) => e.type === 'tool_result' && call?.type === 'tool_call' && e.id === call.id)).toMatchObject({ success: true, output: 'rejected: not today' });
+      session.kill();
+    } finally { runner.stopAll(); }
   }, TIMEOUT_MS * 2);
 });

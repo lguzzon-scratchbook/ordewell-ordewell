@@ -6,8 +6,11 @@ import type { UsageRecord } from '../../models/Usage';
 import { StdioAgentAdapter, type SpawnSpec } from './StdioAgentAdapter';
 import { markedLines } from './fileDiff';
 import { probeCodexSandbox, codexSandboxUnavailableMessage, type CodexSandboxDecision } from './codexSandbox';
+import { ORDEWELL_MCP_SERVER_NAME, type McpClientConfig } from '../mcp';
 
 const HANDSHAKE_TIMEOUT_MS = 30000;
+/** Codex starts a thread's MCP servers as the thread opens; one that is not up by now is not coming. */
+const MCP_ATTACH_TIMEOUT_MS = 10_000;
 
 interface RpcMessage {
   id?: number | string;
@@ -154,6 +157,58 @@ interface TaskApproval {
   answer(decision: ApprovalDecision['decision'], params: Record<string, unknown>): Record<string, unknown>;
 }
 
+/**
+ * The name Codex shows an Ordewell tool under, as Claude Code's CLI does, so
+ * the task log and the planner's research steps read the same on every runner.
+ */
+function shownToolName(item: ThreadItem): string {
+  const tool = item.tool ?? 'mcp_tool';
+  return item.server === ORDEWELL_MCP_SERVER_NAME ? `mcp__${ORDEWELL_MCP_SERVER_NAME}__${tool}` : tool;
+}
+
+/**
+ * The environment variables that carry the server's headers to Codex, by
+ * header name. Codex reads the value from its own environment, so a token is
+ * in no argument and in no config Codex could write to disk (ADR-0022, A5).
+ * `TOKEN` in the name keeps Codex's default shell policy from handing the
+ * value to the commands the model runs.
+ */
+function mcpHeaderEnv(mcp: McpClientConfig): Record<string, string> {
+  return Object.fromEntries(Object.keys(mcp.headers).map((header, i) => [header, `ORDEWELL_MCP_TOKEN_${i}`]));
+}
+
+/**
+ * `mcp_servers.ordewell` as Codex's config takes it (keys checked against
+ * codex-cli 0.160.0: `codex mcp add --url`, and its config loader rejecting a
+ * bad `default_tools_approval_mode`). `approve` pre-authorizes every tool of
+ * this server and no other, in every sandbox and approval policy.
+ */
+function ordewellServerConfig(mcp: McpClientConfig): Record<string, unknown> {
+  return {
+    url: mcp.url,
+    env_http_headers: mcpHeaderEnv(mcp),
+    default_tools_approval_mode: 'approve',
+  };
+}
+
+/**
+ * Codex 0.160 keeps MCP tools out of the model's tool list: they are reached
+ * through its `exec` tool, which lists them in `ALL_TOOLS`. Told only to "call
+ * the task_complete tool" a model answers with the marker and never looks, so
+ * the thread's instructions say where to look. Checked live: without this,
+ * three of three tasks finished by marker.
+ */
+const TASK_TOOLS_NOTE = [
+  'This task has two tools from the `ordewell` MCP server: `task_complete` and `checkpoint`.',
+  'They are not in your tool list up front. Find them with the tool discovery you have (the `exec` tool\'s `ALL_TOOLS` list) and call them by their full names, `mcp__ordewell__task_complete` and `mcp__ordewell__checkpoint`.',
+  'Look for them before you finish; the task is reported complete through `task_complete`.',
+].join(' ');
+
+/** An elicitation Codex raises for one of Ordewell's own tools — an approval the grant should have made unnecessary. */
+function isOrdewellElicitation(method: string, params: Record<string, unknown>): boolean {
+  return method === 'mcpServer/elicitation/request' && params.serverName === ORDEWELL_MCP_SERVER_NAME;
+}
+
 const REVIEW_DECISIONS = { allow: 'accept', allowForTask: 'acceptForSession', deny: 'decline' } as const;
 
 const TASK_APPROVALS: Record<string, TaskApproval> = {
@@ -271,6 +326,9 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   private resumeAttempted = false;
   private resumeFallbackSent = false;
   private sandbox: CodexSandboxDecision = 'default';
+  /** The Ordewell server's startup state, as Codex last reported it for this thread. */
+  private mcpStartup: string | null = null;
+  private mcpStartupSettled: (() => void) | null = null;
   /**
    * Subagent threads this session has spawned, keyed by the child thread id.
    * Codex runs a subagent in its own thread and replays both threads' events on
@@ -280,7 +338,9 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
 
   protected spawnSpec(opts: AgentStartOptions): SpawnSpec {
     this.startOpts = opts;
-    return { command: 'codex', args: ['app-server'] };
+    const headers = opts.mcp ? mcpHeaderEnv(opts.mcp) : {};
+    const env = Object.fromEntries(Object.entries(headers).map(([header, name]) => [name, opts.mcp!.headers[header]]));
+    return { command: 'codex', args: ['app-server'], ...(opts.mcp ? { env } : {}) };
   }
 
   /**
@@ -346,9 +406,11 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
       cwd: opts?.cwd,
       ...(opts?.model ? { model: opts.model } : {}),
     };
-    const legacyLandlock = this.sandbox === 'legacy-landlock'
-      ? { config: { features: { use_legacy_landlock: true } } }
-      : {};
+    const config = {
+      ...(this.sandbox === 'legacy-landlock' ? { features: { use_legacy_landlock: true } } : {}),
+      ...(opts?.mcp ? { mcp_servers: { [opts.mcp.name]: ordewellServerConfig(opts.mcp) } } : {}),
+    };
+    const threadConfig = Object.keys(config).length ? { config } : {};
     if (opts?.kind === 'task') {
       // What the mode means is the manifest's (ADR-0001); this only spells it
       // in the protocol. No `developerInstructions`: the task prompt is the
@@ -359,14 +421,15 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
         sandbox: opts.flags.permissionMode,
         ...(approvalPolicy ? { approvalPolicy } : {}),
         ...(approvalsReviewer ? { approvalsReviewer } : {}),
-        ...legacyLandlock,
+        ...(opts.mcp ? { developerInstructions: TASK_TOOLS_NOTE } : {}),
+        ...threadConfig,
       };
     }
     return {
       ...common,
       sandbox: 'read-only',
       approvalPolicy: 'never',
-      ...legacyLandlock,
+      ...threadConfig,
       // `developerInstructions` layers on top of Codex's own base prompt, the
       // way Claude Code's `--append-system-prompt` does. `baseInstructions`
       // replaces it — which takes Codex's description of its own tools with
@@ -374,6 +437,28 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
       // answers from a web search instead.
       developerInstructions: opts?.systemPrompt,
     };
+  }
+
+  /**
+   * Codex's own startup report for the server, which it sends once the thread
+   * has tried to connect (ADR-0022, S4). A report that came before this was
+   * asked is kept, so asking late still gets the answer.
+   */
+  async mcpAttached(): Promise<boolean> {
+    if (!this.startOpts?.mcp || !this.process) return false;
+    const deadline = Date.now() + MCP_ATTACH_TIMEOUT_MS;
+    while (this.mcpStartup === null || this.mcpStartup === 'starting') {
+      const left = deadline - Date.now();
+      if (left <= 0) return false;
+      const ended = await Promise.race([
+        new Promise<false>((resolve) => { this.mcpStartupSettled = () => resolve(false); }),
+        this.processEnded.then(() => true),
+        new Promise<false>((resolve) => { const t = setTimeout(() => resolve(false), left); t.unref?.(); }),
+      ]);
+      this.mcpStartupSettled = null;
+      if (ended) return false;
+    }
+    return this.mcpStartup === 'ready';
   }
 
   private effort(): string | undefined {
@@ -564,6 +649,13 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
         if (this.openPermissions.delete(id)) emit({ type: 'permission_cancelled', id });
         return;
       }
+      case 'mcpServer/startupStatus/updated': {
+        const startup = msg.params as { name?: string; status?: string } | undefined;
+        if (startup?.name !== ORDEWELL_MCP_SERVER_NAME || !startup.status) return;
+        this.mcpStartup = startup.status;
+        this.mcpStartupSettled?.();
+        return;
+      }
       case 'thread/tokenUsage/updated':
         this.emitUsage(msg.params as ThreadTokenUsageParams | undefined, emit);
         return;
@@ -712,6 +804,10 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
     const method = msg.method!;
     const params = msg.params ?? {};
     const approval = TASK_APPROVALS[method];
+    if (isOrdewellElicitation(method, params)) {
+      this.writeLine({ jsonrpc: '2.0', id: msg.id, result: { action: 'accept', content: {} } });
+      return;
+    }
     if (approval && (method !== 'mcpServer/elicitation/request' || isYesNoElicitation(params))) {
       const id = String(msg.id);
       const input = this.approvalInput(method, params);
@@ -754,6 +850,10 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
    */
   private answerServerRequest(msg: RpcMessage, emit: (e: AgentEvent) => void): void {
     const method = msg.method!;
+    if (isOrdewellElicitation(method, msg.params ?? {})) {
+      this.writeLine({ jsonrpc: '2.0', id: msg.id, result: { action: 'accept', content: {} } });
+      return;
+    }
     const result = DECLINE_RESULTS[method];
     if (result) {
       this.writeLine({ jsonrpc: '2.0', id: msg.id, result });
@@ -781,7 +881,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
         emit({ type: 'tool_call', id: item.id, name: 'shell', args: { command: item.command, cwd: item.cwd }, ...(subagentId ? { subagentId } : {}) });
         return;
       case 'mcpToolCall':
-        emit({ type: 'tool_call', id: item.id, name: item.tool ?? 'mcp_tool', args: item.arguments ?? {}, ...(subagentId ? { subagentId } : {}) });
+        emit({ type: 'tool_call', id: item.id, name: shownToolName(item), args: item.arguments ?? {}, ...(subagentId ? { subagentId } : {}) });
         return;
       case 'dynamicToolCall':
         emit({ type: 'tool_call', id: item.id, name: item.tool ?? 'tool', args: item.arguments ?? {}, ...(subagentId ? { subagentId } : {}) });
@@ -845,7 +945,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
       case 'mcpToolCall':
       case 'dynamicToolCall':
         emit({
-          type: 'tool_result', id, name: item.tool ?? 'tool',
+          type: 'tool_result', id, name: item.type === 'mcpToolCall' ? shownToolName(item) : item.tool ?? 'tool',
           output: item.error ?? flattenText(item.result) ?? '',
           success: item.status !== 'error' && item.success !== false && !item.error,
           ...(subagentId ? { subagentId } : {}),

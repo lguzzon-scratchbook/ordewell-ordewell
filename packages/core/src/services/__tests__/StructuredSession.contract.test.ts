@@ -628,7 +628,9 @@ describe('the Ordewell task tools (ADR-0022)', () => {
 
   it('gives a runner whose connector cannot inject it no server', async () => {
     const { runner, adapters } = served();
-    const session = await runner.spawn(options({ runner: 'codex' }));
+    // Every built-in runner is given the server, so this is a plugin runner.
+    const plugin = { get: () => registry.get('claude-code') } as unknown as RunnerRegistry;
+    const session = await runner.spawn(options({ runner: 'other-runner', registry: plugin }));
 
     expect(adapters[0].starts[0]).not.toHaveProperty('mcp');
     session.kill();
