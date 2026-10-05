@@ -1,6 +1,7 @@
 import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { AgentEvent, PlannerStartOptions, TaskStartOptions } from './AgentAdapter';
+import { isOrdewellTool, ordewellToolPrefix } from './openCodeOrdewell';
 
 /** How long a turn waits for `/api/event` before posting anyway. */
 const STREAM_CONNECT_TIMEOUT_MS = 5000;
@@ -211,11 +212,16 @@ export class OpenCodeV2 {
     const created = await this.host.json<{ data?: { id?: string } }>('POST', '/api/session', {
       agent: this.agent,
       ...(this.model ? { model: this.model } : {}),
-      permissions: this.role === 'planner' ? PLANNER_RULES : TASK_RULES,
+      permissions: [...(this.role === 'planner' ? PLANNER_RULES : TASK_RULES), ...this.ordewellRules()],
     });
     if (!created?.data?.id) throw new Error(`The OpenCode ${this.role} server did not return a session id.`);
     this.sessionId = created.data.id;
     await this.applyInstructions();
+  }
+
+  /** Allow the Ordewell server's tools, so a call never waits on a person (ADR-0022, S3). */
+  private ordewellRules(): SessionRule[] {
+    return this.opts.mcp ? [{ action: `${ordewellToolPrefix(this.opts.mcp)}*`, resource: '*', effect: 'allow' }] : [];
   }
 
   /** The planner's system prompt rides on the session as an instruction entry — a prompt has no system field. */
@@ -609,6 +615,10 @@ export class OpenCodeV2 {
     const request = this.permissionRequest(ask);
     if (!request || state.seen.has(`perm:${request.id}`)) return;
     state.seen.add(`perm:${request.id}`);
+    if (isOrdewellTool(this.opts.mcp, request.name)) {
+      void this.replyPermission(request.id, session, { decision: 'once' }).catch(() => { /* see answerPermission */ });
+      return;
+    }
     onEvent(request);
     void this.replyPermission(request.id, session, { decision: 'reject' })
       .catch(() => { /* see answerPermission */ });
@@ -625,7 +635,7 @@ export class OpenCodeV2 {
     const request = this.permissionRequest(ask);
     if (!request || state.seen.has(`perm:${request.id}`)) return;
     state.seen.add(`perm:${request.id}`);
-    if (this.opts.kind === 'task' && this.opts.flags.modeSettings.approvals === AUTO_APPROVALS) {
+    if (isOrdewellTool(this.opts.mcp, request.name) || (this.opts.kind === 'task' && this.opts.flags.modeSettings.approvals === AUTO_APPROVALS)) {
       onEvent({ ...request, decided: { decision: 'allow' } });
       void this.replyPermission(request.id, session, { decision: 'once' }).catch(() => { /* see answerPermission */ });
       return;

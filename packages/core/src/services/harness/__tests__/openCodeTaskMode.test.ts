@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { OpenCodeAdapter } from '../OpenCodeAdapter';
 import type { AgentEvent, AgentProcessDeps, AgentStartOptions, TaskStartOptions } from '../AgentAdapter';
 import type { SpawnFn } from '../../HeadlessRunner';
+import { mcpClientConfig } from '../../mcp';
 import { fakeSpawn } from '../../__tests__/harnessTestKit';
 
 /**
@@ -118,7 +119,7 @@ function taskStart(overrides: Partial<TaskStartOptions> = {}): TaskStartOptions 
   };
 }
 
-async function startTask(server: ReturnType<typeof fakeServer>, opts: AgentStartOptions = taskStart()) {
+async function startTask(server: ReturnType<typeof fakeServer>, opts: AgentStartOptions = taskStart(), workspaceEnv: Record<string, string> = {}) {
   const spawned = fakeSpawn([]);
   const envs: NodeJS.ProcessEnv[] = [];
   const spawn: SpawnFn = (cmd, argv, options) => {
@@ -132,7 +133,7 @@ async function startTask(server: ReturnType<typeof fakeServer>, opts: AgentStart
     platform: 'linux',
     isDirectory: () => true,
     exists: () => true,
-    workspaceEnv: async () => ({}),
+    workspaceEnv: async () => workspaceEnv,
   };
   const adapter = new OpenCodeAdapter(deps);
   const started = adapter.start(opts);
@@ -607,5 +608,125 @@ describe('OpenCodeAdapter task mode — resume', () => {
     const server = fakeServer({ 'GET /session/ses_gone': () => ({ status: 404 }) });
     await expect(startTask(server, taskStart({ resumeSessionId: 'ses_gone' }))).rejects.toThrow(/could not resume session ses_gone/);
     expect(server.requests.some((r) => r.method === 'POST' && r.path === '/session')).toBe(false);
+  });
+});
+
+describe('OpenCodeAdapter with the Ordewell MCP server (ADR-0022)', () => {
+  const mcp = mcpClientConfig({ url: 'http://127.0.0.1:4555/mcp', token: 'tok-secret' });
+  const ordewell = { type: 'remote', url: 'http://127.0.0.1:4555/mcp', headers: { Authorization: 'Bearer tok-secret' }, enabled: true };
+  const configOf = (env: NodeJS.ProcessEnv) => JSON.parse(env.OPENCODE_CONFIG_CONTENT ?? 'null') as unknown;
+
+  it('hands a task the server and an allow rule for its tools through the environment, never the command line', async () => {
+    const { adapter, spawned, env } = await startTask(fakeServer(), taskStart({ mcp }));
+
+    expect(configOf(env)).toEqual({ mcp: { ordewell }, permission: { 'ordewell_*': 'allow' } });
+    expect(spawned.lastArgs().join(' ')).not.toContain('tok-secret');
+    adapter.dispose();
+  });
+
+  it('hands the planner the same, beside the read-only agent', async () => {
+    const { adapter, env } = await startTask(fakeServer(), { kind: 'planner', cwd: '/repo', systemPrompt: 'plan read-only', mcp });
+
+    expect(configOf(env)).toEqual({ mcp: { ordewell }, permission: { 'ordewell_*': 'allow' } });
+    adapter.dispose();
+  });
+
+  it('adds nothing when no server is given', async () => {
+    const { adapter, env } = await startTask(fakeServer());
+
+    expect(env.OPENCODE_CONFIG_CONTENT).toBeUndefined();
+    adapter.dispose();
+  });
+
+  it('merges into the configuration the workspace already sets, keeping what it carries', async () => {
+    const existing = JSON.stringify({
+      model: 'anthropic/claude-sonnet-4',
+      mcp: { other: { type: 'local', command: ['x'] } },
+      permission: { bash: { '*': 'allow' } },
+      agent: { build: { permission: { edit: 'ask' } } },
+    });
+    const { adapter, env } = await startTask(fakeServer(), taskStart({ mcp }), { OPENCODE_CONFIG_CONTENT: existing });
+
+    expect(configOf(env)).toEqual({
+      model: 'anthropic/claude-sonnet-4',
+      mcp: { other: { type: 'local', command: ['x'] }, ordewell },
+      permission: { bash: { '*': 'allow' }, 'ordewell_*': 'allow' },
+      agent: { build: { permission: { edit: 'ask' } } },
+    });
+    adapter.dispose();
+  });
+
+  it('keeps a blanket permission policy as the rule the allow comes after', async () => {
+    const { adapter, env } = await startTask(fakeServer(), taskStart({ mcp }), { OPENCODE_CONFIG_CONTENT: '{"permission":"ask"}' });
+
+    const config = configOf(env) as { permission: Record<string, string> };
+    expect(Object.entries(config.permission)).toEqual([['*', 'ask'], ['ordewell_*', 'allow']]);
+    adapter.dispose();
+  });
+
+  it('runs without the server rather than overwrite a configuration it cannot read', async () => {
+    const { adapter, env } = await startTask(fakeServer(), taskStart({ mcp }), { OPENCODE_CONFIG_CONTENT: '// mine\n{}' });
+
+    expect(env.OPENCODE_CONFIG_CONTENT).toBe('// mine\n{}');
+    expect(await adapter.mcpAttached()).toBe(false);
+    adapter.dispose();
+  });
+
+  it('allows an Ordewell tool under any mode, shows it decided, and still asks about the rest', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnWith(server, taskStart({ ...planMode, mcp }));
+    stream.push(ask('per_t', { permission: 'ordewell_task_complete', patterns: ['*'], metadata: {} }));
+    await until(() => server.requests.some((r) => r.path === '/permission/per_t/reply'));
+    stream.push(ask('per_b'));
+    await until(() => events.some((e) => e.type === 'permission_request' && e.id === 'per_b'));
+    stream.push(status('idle'));
+    await turn;
+
+    expect(server.requests.find((r) => r.path === '/permission/per_t/reply')?.body).toEqual({ reply: 'once' });
+    expect(events).toContainEqual(expect.objectContaining({ type: 'permission_request', id: 'per_t', decided: { decision: 'allow' } }));
+    expect(events.find((e) => e.type === 'permission_request' && e.id === 'per_b')).not.toHaveProperty('decided');
+    expect(server.requests.some((r) => r.path === '/permission/per_b/reply')).toBe(false);
+    adapter.dispose();
+  });
+
+  it('does not take a tool of another server named alike for its own when it was never given the server', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnWith(server, planMode);
+    stream.push(ask('per_t', { permission: 'ordewell_task_complete' }));
+    await until(() => events.some((e) => e.type === 'permission_request'));
+    stream.push(status('idle'));
+    await turn;
+
+    expect(events.find((e) => e.type === 'permission_request')).not.toHaveProperty('decided');
+    adapter.dispose();
+  });
+
+  it('answers the planner\'s Ordewell tool with an allow and everything else with a refusal', async () => {
+    let settle: (reply: unknown) => void = () => {};
+    const server = fakeServer({ 'POST /session/ses_task/message': () => new Promise((resolve) => { settle = resolve; }) });
+    const { adapter } = await startTask(server, { kind: 'planner', cwd: '/repo', systemPrompt: 'plan read-only', mcp });
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('the goal', (e) => events.push(e));
+    const stream = await server.stream();
+    stream.push(ask('per_s', { permission: 'ordewell_submit_plan', patterns: ['*'], metadata: {} }));
+    stream.push(ask('per_w', { permission: 'edit' }));
+    await until(() => server.requests.some((r) => r.path === '/permission/per_w/reply'));
+    settle({ info: { id: 'msg_a', role: 'assistant' }, parts: [] });
+    await turn;
+
+    expect(server.requests.find((r) => r.path === '/permission/per_s/reply')?.body).toEqual({ reply: 'once' });
+    expect(server.requests.find((r) => r.path === '/permission/per_w/reply')?.body).toEqual({ reply: 'reject' });
+    expect(events.filter((e) => e.type === 'permission_request').map((e) => e.type === 'permission_request' && e.name)).toEqual(['edit']);
+    adapter.dispose();
+  });
+
+  it('reports the server attached once OpenCode lists it as connected, and not when it failed', async () => {
+    const connected = await startTask(fakeServer({ 'GET /mcp': () => ({ ordewell: { status: 'connected' } }) }), taskStart({ mcp }));
+    expect(await connected.adapter.mcpAttached()).toBe(true);
+    connected.adapter.dispose();
+
+    const failed = await startTask(fakeServer({ 'GET /mcp': () => ({ ordewell: { status: 'failed', error: 'refused' } }) }), taskStart({ mcp }));
+    expect(await failed.adapter.mcpAttached()).toBe(false);
+    failed.adapter.dispose();
   });
 });

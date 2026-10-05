@@ -5,6 +5,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { StructuredRunner } from '../StructuredRunner';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { isStructuredSession, type ITerminalSession, type StructuredEvent, type StructuredTurnEnd } from '../../interfaces/ITerminalRunner';
+import { VerdictEngine } from '../VerdictEngine';
+import { composeAugmentedPrompt } from '../promptAugment';
+import { createTask, type Verdict } from '../../models/Task';
 
 /**
  * The opt-in live check for the OpenCode connector on the structured
@@ -14,7 +17,9 @@ import { isStructuredSession, type ITerminalSession, type StructuredEvent, type 
  *   ORDEWELL_LIVE_AGENTS=opencode npx vitest run --root packages/core structuredOpenCodeLive
  *
  * Every task runs in a throwaway directory under `build`, on a cheap model
- * unless ORDEWELL_LIVE_MODEL says otherwise, at its lowest variant.
+ * unless ORDEWELL_LIVE_MODEL says otherwise, at its lowest variant. The
+ * Ordewell tool cases (ADR-0022) run under `plan`, which is not the
+ * `approvals: auto` mode, so a prompt-free call there is the rule at work.
  */
 
 const live = (process.env.ORDEWELL_LIVE_AGENTS ?? '').split(',').map((s) => s.trim()).includes('opencode');
@@ -45,16 +50,17 @@ function harness() {
     return globalThis.fetch(input, init);
   };
   const runner = new StructuredRunner({ process: { fetch: fetchSeen } });
-  const spawn = async (taskId: string, dir: string, prompt: string, resumeSessionId?: string) => {
+  const spawn = async (taskId: string, dir: string, prompt: string, resumeSessionId?: string, mode = 'build') => {
     const session = await runner.spawn({
       taskId,
       runner: 'opencode',
       prompt,
       modelId: model,
       thinkingEffort: 'low',
-      mode: 'build',
+      mode,
       cwd: dir,
       registry: new RunnerRegistry(),
+      attempt: 1,
       ...(resumeSessionId ? { resumeSessionId } : {}),
     });
     const turns = turnEnds(session);
@@ -183,6 +189,61 @@ describe.runIf(live)('structured transport — OpenCode live smoke', () => {
       await second.turns.next();
       expect(second.turns.ends, second.session.getOutput()).toEqual(['completed']);
       expect(second.session.getOutput()).toContain('hello.txt');
+    } finally {
+      runner.stopAll();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, TIMEOUT_MS);
+
+  it('completes a task through task_complete without asking anyone, outside the auto mode (ADR-0022)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-oc-'));
+    const { runner, spawn } = harness();
+    const task = createTask({ id: 'oc-tool', title: 'Multiply', prompt: 'Work out 17 * 23 and state the result.', taskMode: 'plan', completionMarker: 'oc-tool' });
+    const engine = new VerdictEngine();
+    const verdict = new Promise<Verdict>((resolve) => engine.onVerdict((_taskId, v) => resolve(v)));
+    try {
+      const { session, turns, events } = await spawn(task.id, dir, composeAugmentedPrompt(task, [task], { completionTool: true }), undefined, 'plan');
+      engine.watch(task, session);
+
+      const decided = await verdict;
+      expect(decided.outcome, session.getOutput()).toBe('pass');
+      expect(decided.checks[0].name).toBe('task_complete');
+      await turns.next();
+      const call = events.find((e) => e.type === 'tool_call' && e.name === 'ordewell_task_complete');
+      expect(call, session.getOutput()).toBeDefined();
+      expect(events.find((e) => e.type === 'tool_result' && call?.type === 'tool_call' && e.id === call.id)).toMatchObject({ success: true });
+      expect(events.filter((e) => e.type === 'permission_request' && !e.decided)).toEqual([]);
+      console.error(`[live] task_complete verdict for OpenCode session ${session.nativeSessionId()}`);
+      session.kill();
+    } finally {
+      runner.stopAll();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, TIMEOUT_MS);
+
+  it('holds a checkpoint tool call open until it is answered, and returns the answer (ADR-0022, V5)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-oc-'));
+    const { runner, spawn } = harness();
+    const task = createTask({ id: 'oc-checkpoint', title: 'Ask', prompt: 'Your task: call the checkpoint tool with the question "Shall I proceed with the migration?", then state exactly what the result was. Whatever it is, do not call the checkpoint tool a second time.', taskMode: 'plan', completionMarker: 'oc-checkpoint', autonomy: 'HITL' });
+    const engine = new VerdictEngine();
+    const verdict = new Promise<Verdict>((resolve) => engine.onVerdict((_taskId, v) => resolve(v)));
+    const asked: string[] = [];
+    engine.onCheckpoint((taskId, question) => {
+      asked.push(question);
+      // Past the 5s OpenCode gives a remote server by default, and past the MCP SDK's 60s request timeout: the heartbeat is what keeps the call alive.
+      setTimeout(() => (asked.length === 1 ? engine.rejectCheckpoint(taskId, 'not today') : engine.approveCheckpoint(taskId)), 70_000);
+    });
+    try {
+      const { session, events } = await spawn(task.id, dir, composeAugmentedPrompt(task, [task], { completionTool: true }), undefined, 'plan');
+      engine.watch(task, session);
+
+      await verdict;
+      const call = events.find((e) => e.type === 'tool_call' && e.name === 'ordewell_checkpoint');
+      expect(call, session.getOutput()).toBeDefined();
+      expect(asked).toHaveLength(1);
+      expect(events.find((e) => e.type === 'tool_result' && call?.type === 'tool_call' && e.id === call.id)).toMatchObject({ success: true, output: 'rejected: not today' });
+      expect(events.filter((e) => e.type === 'permission_request' && !e.decided)).toEqual([]);
+      session.kill();
     } finally {
       runner.stopAll();
       rmSync(dir, { recursive: true, force: true });
