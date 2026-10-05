@@ -24,7 +24,9 @@
 </p>
 
 <p align="center">
-  <img src="assets/readme/hero-plan-to-run.gif" width="900" alt="Ordewell's terminal UI: a goal is typed, the planner reads the repo and asks whether the limiter should reuse the existing Redis client, then commits a seven task plan, each task showing its runner, model, thinking effort and mode, and runs it to 7/7 complete.">
+  <img src="assets/readme/hero-plan-to-run.gif" width="900" alt="A real run of Ordewell's terminal UI: a goal to add rate limiting, update the tests and document it is typed, the planner reads the repo and commits a four task plan, each task showing its runner, model, thinking effort and mode, then Claude Code, Codex and OpenCode each run one task at the same time and a verify task finishes the plan at 4/4. Sped up stretches are marked.">
+  <br>
+  <sub>A real run, sped up where marked. <a href="https://ordewell.ai/assets/demo.mp4">Watch the full 48 seconds</a>.</sub>
 </p>
 
 Ordewell turns a goal into a plan you can read and change before anything runs. A
@@ -112,6 +114,10 @@ ordewell task-deps 3 1,2            # make it wait for tasks 1 and 2
    you with the conflicting files named.
 5. **Hand off.** When the run finishes, review the diff, then merge it, discard it,
    or clean up its worktrees.
+
+<p align="center">
+  <img src="assets/readme/tui-parallel-loop.gif" width="620" alt="The plan pane during a real run: three independent tasks run at once on Claude Code, Codex and OpenCode, each ticks off as its completion marker appears, then the verify task runs and the plan reaches 4/4. Shown at 15x speed.">
+</p>
 
 Folders containing several repositories are handled as one workspace: each task
 gets a worktree of every repository and lands in all of them or none. See
