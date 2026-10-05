@@ -7,6 +7,8 @@ import { killTree } from '../../utils/processTree';
 import { workspaceEnvOf } from '../workspaceEnv';
 import { runnerEnv } from './runnerEnv';
 import { OpenCodeV2 } from './OpenCodeV2';
+import { isOrdewellTool, mergeOrdewellConfig } from './openCodeOrdewell';
+import type { McpClientConfig } from '../mcp';
 import { hunksOf, markedLines } from './fileDiff';
 import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
@@ -23,6 +25,9 @@ const RECOVERY_TIMEOUT_MS = 900000;
 const STATUS_POLL_INTERVAL_MS = 1000;
 /** The Basic-auth username `serve` defaults to. Set explicitly so a host's own `OPENCODE_SERVER_USERNAME` cannot win. */
 const SERVER_USERNAME = 'opencode';
+/** How long a planner waits for the Ordewell server to show as connected, and how often it asks. */
+const MCP_ATTACH_TIMEOUT_MS = 10_000;
+const MCP_STATUS_POLL_MS = 200;
 
 /**
  * Tools withheld from a planning session (T1). `question` is the load-bearing
@@ -347,6 +352,8 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   private readonly openPermissions = new Map<string, string>();
   /** Set once the server turns out to speak the 2.x API, which then owns the session. */
   private v2: OpenCodeV2 | null = null;
+  /** The Ordewell server this process was configured with; null when none was given or its config could not be merged. */
+  private ordewell: McpClientConfig | null = null;
 
   constructor(private deps: AgentProcessDeps) {}
 
@@ -377,8 +384,19 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     // 2.x answers every `/api` request without credentials with a 401, so a
     // server with no password cannot be spoken to at all.
     const password = randomBytes(24).toString('base64url');
+    // The token rides in the server's environment, not its argv (ADR-0022, A5).
+    const ordewellConfig = opts.mcp ? mergeOrdewellConfig(workspaceEnv.OPENCODE_CONFIG_CONTENT ?? process.env.OPENCODE_CONFIG_CONTENT, opts.mcp) : null;
+    if (opts.mcp && ordewellConfig === null) {
+      console.error('[opencode] OPENCODE_CONFIG_CONTENT is not a JSON object, so the Ordewell tools were not injected.');
+    }
+    this.ordewell = ordewellConfig === null ? null : opts.mcp ?? null;
     this.process = this.deps.spawn(launch.file, launch.args, {
-      env: runnerEnv(PATH, { ...workspaceEnv, OPENCODE_SERVER_USERNAME: SERVER_USERNAME, OPENCODE_SERVER_PASSWORD: password }),
+      env: runnerEnv(PATH, {
+        ...workspaceEnv,
+        ...(ordewellConfig === null ? {} : { OPENCODE_CONFIG_CONTENT: ordewellConfig }),
+        OPENCODE_SERVER_USERNAME: SERVER_USERNAME,
+        OPENCODE_SERVER_PASSWORD: password,
+      }),
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: opts.cwd,
       windowsVerbatimArguments: launch.verbatim,
@@ -429,7 +447,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
         processEnded: this.processEnded,
         isExited: () => this.exited,
         exitMessage: () => this.exitMessage(),
-      }, opts, this.role());
+      }, { ...opts, mcp: this.ordewell ?? undefined }, this.role());
       try {
         await this.v2.start();
       } catch (err) {
@@ -985,6 +1003,12 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     const id = ask.id;
     if (!id || seen.has(`perm:${id}`)) return;
     seen.add(`perm:${id}`);
+    // The planner's own submission path, which the allow rule should already
+    // have settled: the one request it may not be refused (ADR-0022, S3).
+    if (isOrdewellTool(this.ordewell, permissionName(ask))) {
+      void this.replyPermission(id, ask.sessionID ?? this.sessionId ?? '', { reply: 'once' }).catch(() => { /* see answerPermission */ });
+      return;
+    }
     onEvent({ type: 'permission_request', id, name: permissionName(ask), detail: permissionDetail(ask) });
     void this.replyPermission(id, ask.sessionID ?? this.sessionId ?? '', { reply: 'reject' })
       .catch(() => { /* a server that forgot the request will not hang on it either */ });
@@ -1012,7 +1036,8 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
       ...(ask.always?.length ? { suggestions: ask.always } : {}),
       ...(ask.tool?.callID ? { toolUseId: ask.tool.callID } : {}),
     };
-    if (this.task?.flags.modeSettings.approvals === AUTO_APPROVALS) {
+    // Whatever the mode, a completion that waited on a person would hold the verdict hostage (ADR-0022, S3).
+    if (isOrdewellTool(this.ordewell, request.name) || this.task?.flags.modeSettings.approvals === AUTO_APPROVALS) {
       onEvent({ ...request, decided: { decision: 'allow' } });
       void this.replyPermission(id, sessionId, { reply: 'once' }).catch(() => { /* see answerPermission */ });
       return;
@@ -1111,6 +1136,21 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   }
 
   nativeSessionId(): string | null { return this.sessionId; }
+
+  /** Asks the server, which lists every MCP server it has with the state of its connection. */
+  async mcpAttached(): Promise<boolean> {
+    if (!this.ordewell || !this.baseUrl) return false;
+    const deadline = Date.now() + MCP_ATTACH_TIMEOUT_MS;
+    while (Date.now() < deadline && !this.exited) {
+      const servers = await this.json<Record<string, { status?: string } | undefined>>('GET', '/mcp').catch(() => null);
+      const status = servers?.[this.ordewell.name]?.status;
+      if (status === 'connected') return true;
+      // Anything but a connection still in progress will not turn into one.
+      if (status !== undefined && status !== 'pending') return false;
+      await delay(MCP_STATUS_POLL_MS);
+    }
+    return false;
+  }
 
   dispose(): void {
     if (this.disposed) return;

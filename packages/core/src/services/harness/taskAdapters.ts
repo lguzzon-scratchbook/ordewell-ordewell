@@ -11,7 +11,7 @@ const TASK_MODE_ADAPTERS: Record<string, (deps: AgentProcessDeps) => TaskModeAge
 };
 
 /** The connectors that hand their runner the Ordewell MCP server (ADR-0022). */
-const ORDEWELL_TOOL_RUNNERS = new Set(['claude-code', 'codex']);
+const ORDEWELL_TOOL_RUNNERS = new Set(['claude-code', 'codex', 'opencode']);
 
 /** Whether a runner's tasks can run on the structured transport. */
 export function supportsTaskMode(runner: string): boolean {
