@@ -1,7 +1,7 @@
 import { createAiService, type IAiService } from './AiService';
-import { applyTaskOps, canMergeTasks, canSplitTask } from './TaskOps';
+import { applyTaskOps, canMergeTasks, canSplitTask, type TaskOp } from './TaskOps';
 import type { TaskQueryCatalog } from './TaskQuery';
-import { plannerToolHandler } from './plannerTools';
+import { plannerToolHandler, runnersOf, type PlanEditOutcome } from './plannerTools';
 import { sharedMcpServer, type OrdewellMcpServer, type PlannerToolHandler } from './mcp';
 import { validateTaskEdit, type EditCatalog } from './TaskEditValidator';
 import { ConversationEditError, PlannerConversation, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type PlannerSubmission, type RewindTarget } from './PlannerConversation';
@@ -463,6 +463,11 @@ export class Session {
     liveCatalog: () => this.liveCatalog(),
     coerce: (tasks, runners) => coerceAssignments(tasks, this.allowlist(), runners, this.models()),
     submitPlan: (tasks, runners) => this.submitPlanFromTool(tasks, runners),
+    editPlan: (ops) => this.editPlanFromTool(ops),
+    tasks: () => this.store.planTasks,
+    read: (signature, answer) => this.conversation.read(signature, answer),
+    liveOutput: (taskId, opts) => this.orchestrator.getLiveOutput(taskId, opts),
+    lastAttempt: (taskId) => lastAttemptDigest(this.taskLogLocation, taskId),
   });
 
   constructor(parts: SessionParts) {
@@ -692,10 +697,10 @@ export class Session {
    * allowlist here — {@link checkModelAndModeValidity} narrows by
    * allowlist itself, the same way `coerceAssignments` does.
    */
-  private editCatalog(): EditCatalog {
+  private editCatalog(runners: RunnerId[] = this.plan?.runners ?? []): EditCatalog {
     return {
       modelsByRunner: this.models(),
-      runnerModes: this.runnerModesFor(this.plan?.runners ?? []),
+      runnerModes: this.runnerModesFor(runners),
       perRunnerAllowlist: this.allowlist(),
     };
   }
@@ -959,6 +964,35 @@ export class Session {
     if (!this.plan || !this.conversation.submit({ kind: 'plan', tasks })) return false;
     for (const runner of runners) this.admitRunner(runner, this.modelsCache[runner] ?? []);
     return true;
+  }
+
+  /**
+   * A task edit the planner made through its tool. Checked against the live
+   * catalog, then handed to the open turn, which commits it as it would the
+   * same ops in a taskOps reply — including parking it behind a running batch,
+   * which the envelope does before any check, so a queued edit is not checked
+   * here either. Edits made in one reply join one batch.
+   */
+  private async editPlanFromTool(ops: TaskOp[]): Promise<PlanEditOutcome> {
+    const refuse = (message: string): PlanEditOutcome => ({ ok: false, errors: [message] });
+    // The held batch is read after this await, so two calls made in parallel
+    // join one batch instead of one replacing the other.
+    const catalog = await this.liveCatalog();
+    if (!this.plan || this.store.planTasks.length === 0) return refuse('There is no plan to edit yet: submit one with submit_plan.');
+    const held = this.conversation.pendingOps();
+    if (!held) return refuse('A whole plan was submitted in this reply and replaces the plan when it ends: make the edit in your next reply.');
+
+    const batch = [...held, ...ops];
+    const queued = this.conversation.editWouldQueue(batch);
+    let summary: string[] = [];
+    if (!queued) {
+      const result = applyTaskOps(this.store.planTasks, batch, catalog.runners, this.editCatalog(catalog.runners));
+      if (!result.ok) return { ok: false, errors: result.errors };
+      summary = result.summary;
+      for (const runner of runnersOf(result.tasks)) this.admitRunner(runner, this.modelsCache[runner] ?? []);
+    }
+    if (!this.conversation.submit({ kind: 'task_ops', ops: batch })) return refuse('No planning turn is open to take the edit.');
+    return { ok: true, summary, queued };
   }
 
   /** Whether the planner conversation is live (started and not yet committed to a plan). */
@@ -1559,7 +1593,7 @@ export class Session {
     if (!this.plan) throw new Error('No active plan state');
     const check = canMergeTasks(this.store.planTasks, taskIds);
     if (!check.ok) throw new Error(check.error ?? 'These tasks cannot be merged');
-    const prompt = buildMergePrompt(taskIds, this.store.planTasks);
+    const prompt = buildMergePrompt(taskIds, this.store.planTasks, this.aiService().plannerToolsAttached?.());
     return this.continueConversation(prompt, options);
   }
 
@@ -1572,7 +1606,7 @@ export class Session {
     if (!this.plan) throw new Error('No active plan state');
     const check = canSplitTask(this.store.planTasks, taskId);
     if (!check.ok) throw new Error(check.error ?? 'This task cannot be split');
-    const prompt = buildSplitPrompt(taskId, this.store.planTasks);
+    const prompt = buildSplitPrompt(taskId, this.store.planTasks, this.aiService().plannerToolsAttached?.());
     return this.continueConversation(prompt, options);
   }
 

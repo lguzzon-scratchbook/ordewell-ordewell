@@ -8,7 +8,9 @@ import { OrdewellMcpServer } from '../mcp';
 import type { SessionRuntimeSettings } from '../createSession';
 import type { DiscoveredModel } from '../../models/Task';
 import type { SessionMessage } from '../SessionMessage';
-import { fakeConfig, makeSession } from './sessionTestKit';
+import { createTask } from '../../models/Task';
+import type { ITerminalRunner } from '../../interfaces/ITerminalRunner';
+import { FakeTerminalSession, fakeConfig, makeSession } from './sessionTestKit';
 
 /**
  * The opt-in live check for the Claude Code planner's Ordewell tools
@@ -73,5 +75,85 @@ describe.runIf(live)('Claude Code planner tools — live', () => {
     expect(toolCalls).toEqual(expect.arrayContaining(['mcp__ordewell__list_runners', 'mcp__ordewell__submit_plan']));
     expect(session.planTasks.map((t) => t.assignedRunner).sort()).toEqual(['claude-code', 'codex']);
     expect(session.planState?.runners).toEqual(['claude-code', 'codex']);
+  }, 600_000);
+
+  /** A real planner, a real Session and a plan of two tasks, `a` running behind `sessions[0]`. */
+  async function plannedRun() {
+    const workspace = mkdtempSync(join(tmpdir(), 'ordewell-planner-tools-'));
+    cleanup.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const server = new OrdewellMcpServer();
+    cleanup.push(() => server.dispose());
+    const config = fakeConfig({ aiProvider: 'claude-code', orchestratorModel: 'sonnet' });
+    const ai = new CliAgentAiService(config, { spawn, workspaceRoot: () => workspace, mcpServer: server });
+    cleanup.push(() => ai.reset());
+
+    const toolCalls: string[] = [];
+    const sessions: FakeTerminalSession[] = [];
+    const runner = {
+      spawn: vi.fn(async ({ taskId }: { taskId: string }) => {
+        const session = new FakeTerminalSession(`s-${taskId}`, taskId);
+        sessions.push(session);
+        return session;
+      }),
+      stop: vi.fn(),
+      stopAll: vi.fn(),
+      activeCount: 0,
+    } as unknown as ITerminalRunner;
+    const session = makeSession({
+      config,
+      aiService: ai,
+      mcpServer: server,
+      runner,
+      workspaceRoot: () => workspace,
+      modelResolver: { modelsForRunners: vi.fn(async (runners: string[]) => Object.fromEntries(runners.map((r) => [r, CATALOG[r] ?? []]))) },
+      settings: () => ({ tddEnabled: false, enabledRunners: ['claude-code'] }),
+      broadcast: (msg: SessionMessage) => {
+        if (msg.type === 'research_step' && msg.toolLabel) toolCalls.push(msg.toolLabel);
+      },
+    });
+    const task = (id: string, order: number, title: string, dependencies: string[] = []) => createTask({
+      id, order, title, prompt: `do ${title}`, dependencies, assignedRunner: 'claude-code', assignedModel: { modelId: 'sonnet', modelLabel: 'Sonnet' },
+    });
+    session.loadPlan({
+      tasks: [task('a', 1, 'Write the greeting script'), task('b', 2, 'Test the greeting script', ['a'])],
+      generatedAt: new Date().toISOString(),
+      lastUpdated: new Date().toISOString(),
+      status: 'approved',
+      runners: ['claude-code'],
+      conversationHistory: [{ role: 'user', content: 'Greeting script and a test', timestamp: new Date().toISOString() }],
+    }, 'Greeting script and a test', workspace, { persist: false });
+    return { session, sessions, toolCalls };
+  }
+
+  const lastReply = (session: ReturnType<typeof makeSession>) => session.planState?.conversationHistory?.at(-1)?.content ?? '';
+
+  it('edits a task that is not running through edit_plan, while another runs', async () => {
+    const { session, sessions, toolCalls } = await plannedRun();
+    await session.executePlan();
+    expect(sessions).toHaveLength(1);
+
+    await session.continueConversation(
+      'Do not explore anything. Task 2 should be titled "Test the greeting script with bats". Make that edit now.',
+    );
+
+    console.log('planner tool calls:', toolCalls.join(', '));
+    console.log('titles:', JSON.stringify(session.planTasks.map((t) => t.title)), 'reply:', lastReply(session));
+    expect(toolCalls).toContain('mcp__ordewell__edit_plan');
+    expect(session.planTasks.map((t) => t.title)).toEqual(['Write the greeting script', 'Test the greeting script with bats']);
+  }, 600_000);
+
+  it('reads the live output of a running task through task_output', async () => {
+    const { session, sessions, toolCalls } = await plannedRun();
+    await session.executePlan();
+    sessions[0].emitOutput('$ bash greet.sh\nhello from the runner\nbuild marker: sentinel-7391\n');
+
+    await session.continueConversation(
+      'Do not explore anything and do not change the plan. Read the latest output of task 1 and tell me, quoting it, what its last line says.',
+    );
+
+    console.log('planner tool calls:', toolCalls.join(', '));
+    console.log('reply:', lastReply(session));
+    expect(toolCalls).toContain('mcp__ordewell__task_output');
+    expect(lastReply(session)).toContain('sentinel-7391');
   }, 600_000);
 });

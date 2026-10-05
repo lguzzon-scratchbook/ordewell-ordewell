@@ -1,5 +1,5 @@
 import { z } from 'zod/v4';
-import { TASK_QUERY_FIELDS, OUTPUT_LINES_MAX } from '../TaskQuery';
+import { TASK_QUERY_TASK_FIELDS, OUTPUT_LINES_MAX } from '../TaskQuery';
 
 /**
  * The tools of the Ordewell MCP server, per token role (ADR-0022), and the
@@ -28,7 +28,7 @@ const listModelsInput = z.object({
   runner: z.string().min(1).describe('A runner id from list_runners.'),
 });
 
-const taskRef = z.string().min(1).describe('A task id, "#order", a bare order, or a title.');
+const taskRef = z.union([z.string().min(1), z.number().int().min(0)]).describe('A task id, "#order", a bare order, or a title.');
 
 const modelAssignment = z.looseObject({
   modelId: z.string(),
@@ -79,18 +79,16 @@ const editPlanInput = z.object({
   ops: z.array(taskOp).min(1).describe('Applied as one batch; every ref resolves against the plan before any op runs.'),
 });
 
-// `output` has its own tool, task_output, so it is not a field here.
-const queryFields = TASK_QUERY_FIELDS.filter((f): f is Exclude<typeof f, 'output'> => f !== 'output');
-
 const taskQueryInput = z.object({
-  tasks: z.array(taskRef).min(1),
-  fields: z.array(z.enum(queryFields)).optional().describe('Omit to read every field.'),
-});
+  tasks: z.array(taskRef).optional(),
+  fields: z.array(z.enum(TASK_QUERY_TASK_FIELDS)).optional().describe('Omit to read every field. A task\'s output is read with task_output.'),
+  catalog: z.boolean().optional().describe('Also return every runner with its models, thinking-effort variants and modes.'),
+}).refine((q) => (q.tasks?.length ?? 0) > 0 || q.catalog === true, { message: 'Name at least one task, or set catalog: true.' });
 
 const taskOutputInput = z.object({
   task: taskRef,
-  lines: z.number().int().min(1).max(OUTPUT_LINES_MAX).optional(),
-  since: z.number().int().min(0).optional().describe("A previous answer's next offset: return only what came after it."),
+  lines: z.number().int().min(1).optional().describe(`How many lines to return; the default is 80 and anything over ${OUTPUT_LINES_MAX} is cut to ${OUTPUT_LINES_MAX}.`),
+  since: z.number().int().min(0).optional().describe("A previous answer's nextOffset: return only what came after it."),
 });
 
 export type TaskCompleteArgs = z.infer<typeof taskCompleteInput>;
@@ -185,8 +183,8 @@ export const PLANNER_TOOLS: readonly McpTool<PlannerToolHandler>[] = [
     submitPlanInput, (h) => h.submitPlan?.bind(h), PLANNER_READ_ONLY),
   tool('edit_plan', 'Change the current plan with task operations: update, add, remove, reorder, merge, split or rearm.',
     editPlanInput, (h) => h.editPlan?.bind(h), PLANNER_READ_ONLY),
-  tool('task_query', 'Read the long fields of plan tasks that the plan summary leaves out.',
+  tool('task_query', 'Read the long fields of plan tasks that the plan summary leaves out (prompt, user steps, verdict, output summary), and optionally the live runner catalog. Read a task before you rewrite it.',
     taskQueryInput, (h) => h.taskQuery?.bind(h), PLANNER_READ_ONLY),
-  tool('task_output', "Read the tail of a task's captured output.",
+  tool('task_output', "Read the recent output of a running task, to check what its runner is doing; paged by offset. A task that is not running answers with its verdict, output summary and a digest of its last attempt.",
     taskOutputInput, (h) => h.taskOutput?.bind(h), PLANNER_READ_ONLY),
 ];

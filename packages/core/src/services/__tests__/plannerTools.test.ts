@@ -1,5 +1,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { existsSync, readFileSync, statSync } from 'fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { CliAgentAiService } from '../harness/CliAgentAiService';
@@ -7,9 +9,11 @@ import { OrdewellMcpServer } from '../mcp';
 import type { ConversationRequest } from '../AiService';
 import type { SessionRuntimeSettings } from '../createSession';
 import type { SessionMessage } from '../SessionMessage';
-import type { DiscoveredModel } from '../../models/Task';
-import { makeSession } from './sessionTestKit';
-import { buildConversationSystemPrompt } from '../PlanPrompts';
+import { createTask, type DiscoveredModel, type Task } from '../../models/Task';
+import { openTaskLog } from '../../utils/taskLogStore';
+import { FakeTerminalSession, makeSession } from './sessionTestKit';
+import type { ITerminalRunner } from '../../interfaces/ITerminalRunner';
+import { buildConversationSystemPrompt, buildMergePrompt, buildSplitPrompt } from '../PlanPrompts';
 import { runnerModesFrom } from '../ModeResolver';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { fakeConfig, fakeFileSystem } from '../../testing';
@@ -183,7 +187,7 @@ describe('a planner the server did not reach', () => {
 });
 
 /** A planning session on a real harness planner, whose settings the test rewrites the way a settings write would. */
-function plannerSession(claude: FakeSpawnResult, initial: Partial<SessionRuntimeSettings> = {}, { inject = true } = {}) {
+function plannerSession(claude: FakeSpawnResult, initial: Partial<SessionRuntimeSettings> = {}, { inject = true, runner }: { inject?: boolean; runner?: ITerminalRunner } = {}) {
   const server = newServer();
   let settings: SessionRuntimeSettings = { tddEnabled: false, enabledRunners: ['claude-code'], ...initial };
   const ai = service(claude, inject ? server : undefined);
@@ -191,6 +195,7 @@ function plannerSession(claude: FakeSpawnResult, initial: Partial<SessionRuntime
   const session = makeSession({
     aiService: ai,
     mcpServer: server,
+    runner,
     modelResolver: {
       modelsForRunners: vi.fn(async (runners: string[]) => Object.fromEntries(runners.map((r) => [r, CATALOG[r] ?? []]))),
     },
@@ -381,6 +386,55 @@ describe('what the planner is told', () => {
     expect(messages[1]).toMatch(/list_runners/);
   });
 
+  describe('about reading and editing the plan', () => {
+    /** The system prompt, and the message of the first turn after the plan exists. */
+    async function afterPlan(inject: boolean) {
+      const messages: string[] = [];
+      let planned = false;
+      const claude = fakeClaude({
+        turn: async (_mcp, message) => {
+          messages.push(message);
+          if (planned) return 'Ok.';
+          planned = true;
+          return JSON.stringify({ tasks: TWO_TASKS });
+        },
+      });
+      const { session } = plannerSession(claude, {}, { inject });
+      await session.startPlanning('add a cache', ['claude-code']);
+      await session.continueConversation('rename the first task');
+      return { prompt: systemPrompt(claude), perTurn: messages[1] };
+    }
+
+    it('with the tools: to read through task_query and task_output and edit through edit_plan, not the envelopes', async () => {
+      const { prompt, perTurn } = await afterPlan(true);
+
+      expect(prompt).toMatch(/task_query/);
+      expect(prompt).toMatch(/task_output/);
+      expect(prompt).not.toContain('"taskQuery"');
+      expect(perTurn).toMatch(/call edit_plan/);
+      expect(perTurn).toMatch(/call task_query or task_output/);
+      expect(perTurn).not.toMatch(/"taskOps"|"taskQuery"|reply with ONLY/);
+    });
+
+    it('merge and split ask for an edit_plan call with the tools, and for the envelope without', () => {
+      const tasks = TWO_TASKS as unknown as Task[];
+
+      expect(buildMergePrompt(['a', 'b'], tasks, true)).toMatch(/Call edit_plan with a single "merge" op:\n {2}\{"ops":\[/);
+      expect(buildSplitPrompt('a', tasks, true)).toMatch(/Call edit_plan with a single "split" op:\n {2}\{"ops":\[/);
+      expect(buildMergePrompt(['a', 'b'], tasks)).toMatch(/Reply with ONLY a taskOps JSON object using a single "merge" op:\n {2}\{"taskOps":\[/);
+      expect(buildSplitPrompt('a', tasks)).toMatch(/Reply with ONLY a taskOps JSON object using a single "split" op:\n {2}\{"taskOps":\[/);
+    });
+
+    it('without them: the envelopes, unchanged', async () => {
+      const { prompt, perTurn } = await afterPlan(false);
+
+      expect(prompt).toContain('{"taskQuery":{"tasks":');
+      expect(perTurn).toContain('{"taskOps": [');
+      expect(perTurn).toContain('{"taskQuery":{"tasks":["<id or #order>"],"catalog":true}}');
+      expect(`${prompt}\n${perTurn}`).not.toMatch(/edit_plan|task_query|task_output/);
+    });
+  });
+
   it('without them: today\'s prompt and per-turn catalog, unchanged', async () => {
     const { claude, messages, attached } = await twoTurns(false);
 
@@ -391,5 +445,378 @@ describe('what the planner is told', () => {
     ));
     expect(messages[1]).toContain('<available_models>\nclaude-code: claude-sonnet-4, claude-opus-4\n</available_models>');
     expect(messages[1]).not.toMatch(/list_runners|submit_plan/);
+  });
+});
+
+const TWO_TASKS = [
+  planTask('a', 1, 'claude-code', 'claude-sonnet-4'),
+  planTask('b', 2, 'claude-code', 'claude-sonnet-4', { dependencies: ['a'] }),
+];
+
+/** A conversation with a committed two-task plan, whose every later reply is `second`. */
+async function planThen(second: (mcp: Client | null, message: string) => Promise<string>, opts: { inject?: boolean; runner?: ITerminalRunner } & Partial<SessionRuntimeSettings> = {}) {
+  const { inject = true, runner, ...settings } = opts;
+  let planned = false;
+  const planner = plannerSession(fakeClaude({
+    turn: async (mcp, message) => {
+      if (planned) return second(mcp, message);
+      planned = true;
+      return JSON.stringify({ tasks: TWO_TASKS });
+    },
+  }), settings, { inject, runner });
+  await planner.session.startPlanning('add a cache', ['claude-code']);
+  return planner;
+}
+
+const landed = ({ session, broadcast }: ReturnType<typeof plannerSession>) => ({
+  tasks: session.planTasks.map(({ id: _id, completionMarker: _marker, ...rest }) => rest),
+  runners: session.planState?.runners,
+  last: session.planState?.conversationHistory?.at(-1)?.content,
+  planBroadcasts: broadcast.mock.calls.filter(([m]) => m.type === 'plan_generated').length,
+});
+
+/** A started run on a plan of two tasks: `a` running behind `sessions[0]`, `b` waiting on it. */
+async function runningPlan(second: Parameters<typeof planThen>[0], opts: { inject?: boolean; sessions?: FakeTerminalSession[] } = {}) {
+  const { sessions = [], ...rest } = opts;
+  const runner = {
+    spawn: vi.fn(async ({ taskId }: { taskId: string }) => {
+      const session = new FakeTerminalSession(`s-${taskId}`, taskId);
+      sessions.push(session);
+      return session;
+    }),
+    stop: vi.fn(),
+    stopAll: vi.fn(),
+    activeCount: 0,
+  } as unknown as ITerminalRunner;
+  const planner = await planThen(second, { ...rest, runner });
+  await planner.session.executePlan();
+  return planner;
+}
+
+describe('edit_plan', () => {
+  const ops = [
+    { op: 'update', taskId: '#2', changes: { title: 'Wire it in', prompt: 'wire the cache in' } },
+    { op: 'add', task: { title: 'Docs', dependencies: ['#2'], assignedRunner: 'claude-code', assignedModel: { modelId: 'claude-sonnet-4', modelLabel: 'Claude Sonnet 4' } } },
+  ];
+
+  it('commits the same edit as the same ops in a taskOps reply', async () => {
+    const viaTool = await planThen(async (mcp) => {
+      expect(await call(mcp!, 'edit_plan', { ops })).toEqual({ isError: false, body: expect.objectContaining({ ok: true }) });
+      return 'Done.';
+    });
+    const viaEnvelope = await planThen(async () => JSON.stringify({ taskOps: ops }), { inject: false });
+
+    await viaTool.session.continueConversation('EDIT NOW');
+    await viaEnvelope.session.continueConversation('EDIT NOW');
+
+    expect(viaTool.session.planTasks.map((t) => t.title)).toEqual(['Task a', 'Wire it in', 'Docs']);
+    expect(landed(viaTool)).toEqual(landed(viaEnvelope));
+  });
+
+  it('names what is wrong with each op and changes nothing', async () => {
+    let refused: { isError: boolean; body: unknown } | undefined;
+    const planner = await planThen(async (mcp) => {
+      refused = await call(mcp!, 'edit_plan', {
+        ops: [
+          { op: 'update', taskId: '#2', changes: { title: 'Fine' } },
+          { op: 'update', taskId: '#2', changes: { assignedRunner: 'codex' } },
+        ],
+      });
+      return 'That did not work.';
+    });
+    const before = landed(planner);
+
+    await planner.session.continueConversation('EDIT NOW');
+
+    expect(refused).toEqual({
+      isError: true,
+      body: {
+        ok: false,
+        errors: [{ op: 2, kind: 'update', message: 'runner "codex" is not in this plan\'s runner set [claude-code]' }],
+      },
+    });
+    expect(planner.session.planTasks.map((t) => t.title)).toEqual(['Task a', 'Task b']);
+    expect({ ...landed(planner), last: undefined }).toEqual({ ...before, last: undefined });
+    expect(landed(planner).planBroadcasts).toBe(before.planBroadcasts);
+  });
+
+  it('takes a task onto a runner enabled since planning started (#69)', async () => {
+    const planner = await planThen(async (mcp) => {
+      await call(mcp!, 'edit_plan', {
+        ops: [{ op: 'update', taskId: '#2', changes: { assignedRunner: 'codex', assignedModel: { modelId: 'gpt-5', modelLabel: 'GPT-5' } } }],
+      });
+      return 'Moved it to codex.';
+    });
+
+    planner.settings({ enabledRunners: ['claude-code', 'codex'] });
+    await planner.session.continueConversation('EDIT NOW');
+
+    expect(planner.session.planTasks.map((t) => t.assignedRunner)).toEqual(['claude-code', 'codex']);
+    expect(planner.session.planState?.runners).toEqual(['claude-code', 'codex']);
+  });
+
+  it('joins the edits of one reply into a single batch, and the second call is checked with the first', async () => {
+    let second: { isError: boolean; body: unknown } | undefined;
+    const planner = await planThen(async (mcp) => {
+      await call(mcp!, 'edit_plan', { ops: [{ op: 'update', taskId: '#1', changes: { title: 'First' } }] });
+      second = await call(mcp!, 'edit_plan', { ops: [{ op: 'update', taskId: '#2', changes: { title: 'Second' } }] });
+      return 'Renamed both.';
+    });
+
+    await planner.session.continueConversation('EDIT NOW');
+
+    expect(second?.body).toEqual(expect.objectContaining({ ok: true, summary: ['Updated "Task a" (title)', 'Updated "Task b" (title)'] }));
+    expect(planner.session.planTasks.map((t) => t.title)).toEqual(['First', 'Second']);
+  });
+
+  it('refuses before a plan exists, pointing at submit_plan', async () => {
+    let refused: { isError: boolean; body: unknown } | undefined;
+    const { session } = plannerSession(fakeClaude({
+      turn: async (mcp) => {
+        refused = await call(mcp!, 'edit_plan', { ops: [{ op: 'add', task: { title: 'Too early' } }] });
+        return 'Hm.';
+      },
+    }));
+
+    await session.startPlanning('add a cache', ['claude-code']);
+
+    expect(refused).toEqual({ isError: true, body: { ok: false, errors: [{ message: expect.stringContaining('submit_plan') }] } });
+    expect(session.planTasks).toEqual([]);
+  });
+
+  describe('while a task of the plan is running', () => {
+    it('queues an edit that reaches it, exactly as the envelope does, and says so', async () => {
+      const edit = [{ op: 'update', taskId: '#1', changes: { title: 'Setup, renamed' } }];
+      let answered: { isError: boolean; body: unknown } | undefined;
+      const viaTool = await runningPlan(async (mcp) => {
+        answered = await call(mcp!, 'edit_plan', { ops: edit });
+        return 'Queued.';
+      });
+      const viaEnvelope = await runningPlan(async () => JSON.stringify({ taskOps: edit }), { inject: false });
+
+      await viaTool.session.continueConversation('EDIT NOW');
+      await viaEnvelope.session.continueConversation('EDIT NOW');
+
+      expect(answered).toEqual({ isError: false, body: expect.objectContaining({ ok: true, queued: true }) });
+      expect(viaTool.session.getQueuedMessages().map((m) => m.text)).toEqual(['EDIT NOW']);
+      expect(landed(viaTool)).toEqual(landed(viaEnvelope));
+      expect(viaTool.session.planTasks[0].title).toBe('Task a');
+    });
+  });
+});
+
+describe('the read budget of a user message', () => {
+  const read = (n: number) => ({ tasks: [`#${(n % 2) + 1}`], fields: ['description'], catalog: n > 1 });
+  const LAND = /Do not read again this turn/;
+  const noteOf = (r: { body: unknown }) => (r.body as { note?: string }).note;
+
+  it('is shared by the tools: told to land after three reads, refused after six, and fresh for the next message', async () => {
+    const answers: { isError: boolean; body: unknown }[] = [];
+    const { session } = await planThen(async (mcp, message) => {
+      if (message.includes('SECOND')) answers.push(await call(mcp!, 'task_query', { tasks: ['#1'] }));
+      else {
+        for (let n = 0; n < 6; n++) answers.push(await call(mcp!, n % 2 ? 'task_query' : 'task_output', n % 2 ? read(n) : { task: '#1', lines: n + 1 }));
+        answers.push(await call(mcp!, 'task_query', { tasks: ['#2'] }));
+      }
+      return 'Read.';
+    });
+
+    await session.continueConversation('EDIT NOW');
+    await session.continueConversation('EDIT NOW, SECOND');
+
+    expect(answers.slice(0, 3).map(noteOf)).toEqual([undefined, undefined, undefined]);
+    expect(answers.slice(3, 6).map(noteOf)).toEqual([expect.stringMatching(LAND), expect.stringMatching(LAND), expect.stringMatching(LAND)]);
+    expect(answers[6]).toEqual({ isError: true, body: { ok: false, error: expect.stringContaining('every read this message allows') } });
+    expect(noteOf(answers[7])).toBeUndefined();
+  });
+
+  it('is shared with the taskQuery envelope: reads made either way are counted together', async () => {
+    const envelope = (ref: string) => JSON.stringify({ taskQuery: { tasks: [ref], fields: ['description'] } });
+    const answers: { isError: boolean; body: unknown }[] = [];
+    const envelopeAnswers: string[] = [];
+    let step = 0;
+    const { session } = await planThen(async (mcp, message) => {
+      step++;
+      if (step > 1) envelopeAnswers.push(message);
+      if (step === 1) return envelope('#1');
+      if (step === 2) return envelope('#2');
+      // Two envelope reads are spent: the third read, by tool, is the last that is not told to land.
+      answers.push(await call(mcp!, 'task_query', { tasks: ['#1'], fields: ['prompt'] }));
+      answers.push(await call(mcp!, 'task_query', { tasks: ['#2'], fields: ['prompt'] }));
+      return 'Read.';
+    });
+
+    await session.continueConversation('EDIT NOW');
+
+    expect(envelopeAnswers[0]).not.toMatch(/You have now read everything/);
+    expect(answers.map(noteOf)).toEqual([undefined, expect.stringMatching(LAND)]);
+  });
+
+  it('is shared the other way: tool reads leave the envelope\'s answer told to land', async () => {
+    const envelopeAnswers: string[] = [];
+    let step = 0;
+    const { session } = await planThen(async (mcp, message) => {
+      step++;
+      if (step === 1) {
+        for (let n = 0; n < 3; n++) await call(mcp!, 'task_query', { tasks: [`#${n + 1}`] });
+        return JSON.stringify({ taskQuery: { tasks: ['#1'], fields: ['description'] } });
+      }
+      envelopeAnswers.push(message);
+      return 'Read.';
+    });
+
+    await session.continueConversation('EDIT NOW');
+
+    expect(envelopeAnswers).toHaveLength(1);
+    expect(envelopeAnswers[0]).toMatch(/You have now read everything you asked for\. Do not send another taskQuery/);
+  });
+});
+
+describe('task_query', () => {
+  const longPlan = [
+    planTask('a', 1, 'claude-code', 'claude-sonnet-4', { prompt: 'create the cache module in src/cache.ts', description: 'The cache' }),
+    planTask('b', 2, 'claude-code', 'claude-sonnet-4', { dependencies: ['a'], userStoriesCovered: ['As a dev I want it fast'] }),
+  ];
+
+  async function planAndRead(read: (mcp: Client) => Promise<void>) {
+    const planner = plannerSession(fakeClaude({
+      turn: async (mcp, message) => {
+        if (!message.includes('READ NOW')) return JSON.stringify({ tasks: longPlan });
+        await read(mcp!);
+        return 'Read it.';
+      },
+    }));
+    await planner.session.startPlanning('add a cache', ['claude-code']);
+    return planner;
+  }
+
+  it('answers with the long fields of the tasks it is asked for, and nothing it was not', async () => {
+    let answer: { isError: boolean; body: unknown } | undefined;
+    const { session } = await planAndRead(async (mcp) => {
+      answer = await call(mcp, 'task_query', { tasks: ['#1', 'b', 'nope'], fields: ['prompt', 'userStoriesCovered'] });
+    });
+
+    await session.continueConversation('READ NOW');
+
+    expect(answer).toEqual({
+      isError: false,
+      body: {
+        tasks: [
+          { id: 'a', order: 1, title: 'Task a', status: 'approved', type: 'ai', prompt: 'create the cache module in src/cache.ts', userStoriesCovered: null },
+          { id: 'b', order: 2, title: 'Task b', status: 'approved', type: 'ai', prompt: 'do b', userStoriesCovered: ['As a dev I want it fast'] },
+          { ref: 'nope', error: 'no task matches this reference in the current plan.' },
+        ],
+      },
+    });
+  });
+
+  it('with catalog: true, adds the live runners, models and modes', async () => {
+    let answer: { body: unknown } | undefined;
+    const { session, settings } = await planAndRead(async (mcp) => {
+      answer = await call(mcp, 'task_query', { tasks: ['#1'], fields: ['description'], catalog: true });
+    });
+
+    settings({ enabledRunners: ['claude-code', 'codex'] });
+    await session.continueConversation('READ NOW');
+
+    const { catalog } = answer!.body as { catalog: { runners: { id: string; models: { modelId: string }[]; modes: { id: string }[] }[] } };
+    expect(catalog.runners.map((r) => [r.id, r.models.map((m) => m.modelId)])).toEqual([
+      ['claude-code', ['claude-sonnet-4', 'claude-opus-4']],
+      ['codex', ['gpt-5']],
+    ]);
+    expect(catalog.runners[0].modes.length).toBeGreaterThan(0);
+  });
+});
+
+describe('task_output', () => {
+  it('reads the live tail of a running task, and pages on from the offset it reports', async () => {
+    const sessions: FakeTerminalSession[] = [];
+    const answers: unknown[] = [];
+    const { session } = await runningPlan(async (mcp) => {
+      answers.push((await call(mcp!, 'task_output', { task: '#1', lines: 2 })).body);
+      sessions[0].emitOutput('line 4\nline 5\n');
+      answers.push((await call(mcp!, 'task_output', { task: 'a', since: (answers[0] as { nextOffset: number }).nextOffset })).body);
+      return 'It is progressing.';
+    }, { sessions });
+    sessions[0].emitOutput('line 1\nline 2\nline 3\n');
+
+    await session.continueConversation('how is it going?');
+
+    const task = { id: 'a', order: 1, title: 'Task a', status: 'in_progress' };
+    expect(answers).toEqual([
+      { task, running: true, output: 'line 2\nline 3', nextOffset: 21 },
+      { task, running: true, output: 'line 4\nline 5', nextOffset: 35 },
+    ]);
+  });
+
+  it('cuts a count above the cap to the cap, as the envelope does', async () => {
+    const sessions: FakeTerminalSession[] = [];
+    let answer: { output: string } | undefined;
+    const { session } = await runningPlan(async (mcp) => {
+      answer = (await call(mcp!, 'task_output', { task: '#1', lines: 5000 })).body as { output: string };
+      return 'Read it.';
+    }, { sessions });
+    sessions[0].emitOutput(Array.from({ length: 450 }, (_, i) => `row ${i + 1}`).join('\n') + '\n');
+
+    await session.continueConversation('how is it going?');
+
+    const rows = answer!.output.trimEnd().split('\n');
+    expect(rows).toHaveLength(400);
+    expect(rows[0]).toBe('row 51');
+  });
+
+  it('answers a task that is not running with its verdict, output summary and last attempt', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'ordewell-task-output-'));
+    let answer: { isError: boolean; body: unknown } | undefined;
+    const { session } = plannerSession(fakeClaude({
+      turn: async (mcp) => {
+        answer = await call(mcp!, 'task_output', { task: 'Setup' });
+        return 'I see.';
+      },
+    }));
+    try {
+      const failed = createTask({
+        id: 'a', order: 1, title: 'Setup', prompt: 'p', assignedRunner: 'claude-code', status: 'completed',
+        verdict: { outcome: 'pass', reason: 'Completion marker found', decidedAt: '2026-10-05T10:00:00Z', checks: [{ name: 'completion_marker', passed: true, skipped: false, detail: '' }] },
+        outputSummary: { reviewReason: 'It finished cleanly', logTail: 'added src/cache.ts', capturedAt: '2026-10-05T10:00:00Z' },
+      });
+      session.loadPlan({
+        tasks: [failed], generatedAt: '2026-10-05T09:00:00Z', lastUpdated: '2026-10-05T09:00:00Z', status: 'approved', runners: ['claude-code'],
+        conversationHistory: [{ role: 'user', content: 'set it up', timestamp: '2026-10-05T09:00:00Z' }],
+      }, 'set it up', workspace, { persist: false });
+      openTaskLog({ baseDir: workspace, sessionId: session.sessionId }, 'a').append([
+        { type: 'tool_call', id: 't1', name: 'Bash', args: '{"command":"npm test"}' },
+        { type: 'tool_result', id: 't1', output: 'ok', success: true },
+        { type: 'text', text: 'The cache is in place.' },
+      ]);
+
+      await session.continueConversation('what did it do?');
+
+      expect(answer).toEqual({
+        isError: false,
+        body: {
+          task: { id: 'a', order: 1, title: 'Setup', status: 'completed' },
+          running: false,
+          reason: expect.stringContaining('not running'),
+          verdict: { outcome: 'pass', reason: 'Completion marker found', checks: [{ name: 'completion_marker', result: 'pass' }] },
+          outputSummary: { reviewReason: 'It finished cleanly', logTail: 'added src/cache.ts' },
+          lastAttempt: '- Bash {"command":"npm test"} → ok\n\nIts last message:\n  The cache is in place.',
+        },
+      });
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('names a task that is not in the plan', async () => {
+    let answer: { isError: boolean; body: unknown } | undefined;
+    const { session } = await planThen(async (mcp) => {
+      answer = await call(mcp!, 'task_output', { task: '#9' });
+      return 'Hm.';
+    });
+
+    await session.continueConversation('look at #9');
+
+    expect(answer).toEqual({ isError: true, body: { ok: false, error: 'No task matches "#9" in the current plan.' } });
   });
 });

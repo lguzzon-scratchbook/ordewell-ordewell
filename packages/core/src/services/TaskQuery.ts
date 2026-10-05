@@ -25,6 +25,9 @@ export const TASK_QUERY_FIELDS = [
 
 export type TaskQueryField = typeof TASK_QUERY_FIELDS[number];
 
+/** What `task_query` reads: every field but `output`, which has its own tool (ADR-0022). */
+export const TASK_QUERY_TASK_FIELDS = TASK_QUERY_FIELDS.filter((f): f is Exclude<TaskQueryField, 'output'> => f !== 'output');
+
 /** Lines a `output` read returns when the query sets no count. */
 export const OUTPUT_LINES_DEFAULT = 80;
 /** Hard cap on `outputLines` — the tail read is bounded however the planner asks. */
@@ -39,6 +42,8 @@ export const OUTPUT_LINES_MAX = 400;
 export const TASK_QUERY_ANSWER_MAX_CHARS = 20_000;
 /** Room for the closing instruction and whatever follows a task's tail. */
 const ANSWER_TAIL_RESERVE = 4_000;
+/** The most an output read returns; what a read of one task's tail gets when nothing else is in the answer. */
+export const OUTPUT_TAIL_MAX_CHARS = TASK_QUERY_ANSWER_MAX_CHARS - ANSWER_TAIL_RESERVE;
 
 export interface TaskQuery {
   /** Task references to read in full — an id, "#order", a bare order, or a title. */
@@ -164,6 +169,11 @@ export const TASK_QUERY_ANSWER_OR_OPS =
   'You have now read everything you asked for. Do not send another taskQuery this turn: ' +
   'answer the user in prose, or emit the taskOps JSON for the change you came to make.';
 
+/** {@link TASK_QUERY_ANSWER_OR_OPS} for a planner that reads and edits through tools. */
+export const TASK_READ_ANSWER_OR_EDIT =
+  'You have now read everything you asked for. Do not read again this turn: ' +
+  'answer the user in prose, or call edit_plan for the change you came to make.';
+
 /**
  * The protocol as the planner is taught it, owned here beside the parser so the
  * two cannot drift. Both planner backends get these lines verbatim (ADR-0009):
@@ -181,12 +191,29 @@ export const TASK_QUERY_PROTOCOL: string[] = [
   'Three queries per user message; after that every answer also tells you to land the turn. Do not ask the same question twice.',
 ];
 
+/**
+ * {@link TASK_QUERY_PROTOCOL} for a planner that has Ordewell's tools (ADR-0022):
+ * the same reads, as calls, with the same budget.
+ */
+export const TASK_READ_TOOLS_PROTOCOL: string[] = [
+  'READING A TASK BEFORE YOU EDIT IT:',
+  'The plan block you are shown each turn carries only short fields — it never contains a task\'s prompt, its user steps, or a completed task\'s verdict. Never rewrite a field you have not read. Read with these tools; they change nothing:',
+  '- task_query: "tasks" are one or more task references ("<id or #order>"). Ask for everything you need in ONE call. "fields" is optional (omit it to get description, prompt, userSteps, verdict, outputSummary and userStoriesCovered). "catalog": true also returns every runner with its models, thinking-effort variants and modes.',
+  '- task_output: the recent output of a task that is running right now — the way to diagnose a task that looks stuck mid-execution. "lines" (default 80, at most 400) sets how many; pass an answer\'s "nextOffset" back as "since" to read only what follows. A task that is not running answers with its verdict, output summary and a digest of its last attempt.',
+  'Three reads per user message; after that every answer also tells you to land the turn, and after six they are refused. Do not ask the same question twice.',
+  'Once a plan exists, change it with edit_plan — every turn shows you its operations. Never reply with taskOps or taskQuery JSON.',
+];
+
 /** The one-line reminder the per-turn plan block carries, so the protocol has a single owner. */
 export const TASK_QUERY_REMINDER =
   `- To READ a task in full (prompt, user steps, verdict, output, user stories) or the whole model/mode catalog before editing, reply with ONLY {"${TASK_QUERY_ENVELOPE_KEY}":{"tasks":["<id or #order>"],"catalog":true}} — it changes nothing, and you then reply again with your ops.`;
 
+/** {@link TASK_QUERY_REMINDER} for a planner that has Ordewell's tools. */
+export const TASK_READ_TOOLS_REMINDER =
+  '- To READ a task in full (prompt, user steps, verdict, user stories), a running task\'s output, or the whole model/mode catalog before editing, call task_query or task_output — they change nothing — and then call edit_plan with your ops.';
+
 /** Resolve a query reference — an id, "#order", a bare order, or an exact title. */
-function findTask(tasks: readonly Task[], ref: string): Task | undefined {
+export function findTask(tasks: readonly Task[], ref: string): Task | undefined {
   const byId = tasks.find((t) => t.id === ref);
   if (byId) return byId;
   const orderStr = ref.startsWith('#') ? ref.slice(1) : ref;
@@ -213,7 +240,7 @@ interface OutputRenderContext {
 }
 
 /** Keep the newest of an over-long tail, dropping whole lines from the front. */
-function fitTail(text: string, budget: number): { text: string; trimmed: boolean } {
+export function fitTail(text: string, budget: number): { text: string; trimmed: boolean } {
   if (text.length <= budget) return { text, trimmed: false };
   if (budget <= 0) return { text: '', trimmed: true };
   const lines = text.split('\n');
