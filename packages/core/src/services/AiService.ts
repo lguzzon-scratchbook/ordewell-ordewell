@@ -9,6 +9,17 @@ import { OpenAiService } from './OpenAiService';
 import { isCliProvider } from './ProviderRegistry';
 import { CliAgentAiService, type CliAgentAiServiceDeps } from './harness/CliAgentAiService';
 import type { IsolatedExecution, PlannerModes } from './plannerModes';
+import type { PlannerToolHandler } from './mcp';
+
+/**
+ * The planner tools a session offers its conversation (ADR-0022). A backend
+ * that can inject the Ordewell MCP server into its planner issues a planner
+ * token bound to `sessionId` and these handlers; any other ignores the offer.
+ */
+export interface PlannerToolsOffer {
+  sessionId: string;
+  handler: PlannerToolHandler;
+}
 
 /**
  * Everything the conversation loop needs to start planning (ADR-0002).
@@ -46,6 +57,7 @@ export interface ConversationRequest {
    * carries the user's new message.
    */
   initialMessage?: string;
+  plannerTools?: PlannerToolsOffer;
 }
 
 /**
@@ -102,6 +114,14 @@ export interface IAiService {
    * `continueConversation`, restart instead so the new model takes effect.
    */
   conversationMatchesConfig?(): boolean;
+
+  /**
+   * Whether the planner reads the catalog and submits plans through Ordewell's
+   * MCP tools (ADR-0022). Optional, and false when absent: only a harness
+   * planner the server attached to has them, and every other planner keeps
+   * the per-turn catalog and the envelopes.
+   */
+  plannerToolsAttached?(): boolean;
 
   /**
    * Optional: prune bulky raw tool output out of the live conversation, in

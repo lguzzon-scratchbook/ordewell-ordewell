@@ -149,7 +149,7 @@ export class OrdewellMcpServer {
 
 function serveTools<H>(mcp: McpProtocolServer, tools: readonly McpTool<H>[], handler: H, revoked: AbortSignal): void {
   mcp.setRequestHandler(ListToolsRequestSchema, () => ({
-    tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+    tools: tools.map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, ...(annotations ? { annotations } : {}) })),
   }));
   mcp.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const tool = tools.find((t) => t.name === request.params.name);
