@@ -33,8 +33,10 @@ Ordewell turns a goal into a plan you can read and change before anything runs. 
 planner researches your repository and asks about whatever you left vague. It then
 hands back a dependency graph of tasks, and each task names the coding agent, model
 and thinking effort it will use. Independent tasks run in parallel, each in its own
-git worktree. A task only counts as done when its completion marker appears in the
-agent's output, and nothing reaches your branch until you have reviewed the result.
+git worktree. A task only counts as done when the agent reports it done — through
+Ordewell's own tool on the structured transport, or its completion marker in the
+output as the fallback — and nothing reaches your branch until you have reviewed
+the result.
 
 Claude Code, Codex and OpenCode are supported out of the box, and can be mixed
 freely within one plan.
@@ -51,8 +53,9 @@ freely within one plan.
 - **Operations in the right place and order.** A deploy, a cloud CLI call or a
   push runs as an ops task in your own checkout, and waits until the change it
   depends on is merged into your branch.
-- **Verdicts from evidence.** Completion is decided by a marker in the runner's
-  output, never by a model's opinion of its own work.
+- **Verdicts from evidence.** Completion is decided by the runner's own done
+  signal — a tool call on the structured transport, or its completion marker as
+  the fallback — never by a model's opinion of its own work.
 - **A planner that cannot write.** It reads, asks, and plans. Commands that would
   change your repository are refused.
 - **No extra API key.** A coding agent you already pay for can be the planner. An API
@@ -107,8 +110,9 @@ ordewell task-deps 3 1,2            # make it wait for tasks 1 and 2
    worktree, or in your checkout for an ops task — given the results of the tasks
    it depends on. Independent tasks run concurrently,
    three at a time by default.
-3. **Verify.** A task passes when its unique completion marker appears in the
-   agent's output. The exit code is kept as supporting evidence.
+3. **Verify.** A task passes when the agent reports it done — through Ordewell's
+   own tool on the structured transport, or its unique completion marker in the
+   output as the fallback. The exit code is kept as supporting evidence.
 4. **Land.** A passing task is merged into the run's integration branch. If the
    merge conflicts, the task gets a chance to resolve it; if that fails, it waits for
    you with the conflicting files named.

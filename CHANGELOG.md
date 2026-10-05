@@ -8,6 +8,29 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **A task reports done and asks its questions through Ordewell's own tools.**
+  On the structured transport, a Claude Code, Codex or OpenCode task can finish
+  by calling `task_complete` and ask you something by calling `checkpoint`,
+  instead of printing the `<<<ORDEWELL_DONE_…>>>` and
+  `<<<ORDEWELL_CHECKPOINT: …>>>` markers itself. Call and marker are the same
+  evidence: whichever arrives first settles the attempt. Only a done call
+  passes; a blocked or failed call ends the task with the reason the agent
+  gave, and a call's summary is the output its dependents receive. The printed
+  marker stays as the fallback for the terminal transport, plugin runners, and
+  any session where the server did not attach. Nothing extra to install — the
+  server ships with Ordewell and is injected into the runner it starts (#46).
+- **A structured planner reads the live catalog and submits its work through
+  tools.** A Claude Code, Codex or OpenCode planner lists the enabled runners
+  and models with `list_runners` and `list_models`, reads tasks with
+  `task_query` and `task_output`, and submits or edits the plan with
+  `submit_plan` and `edit_plan`. The catalog is read when the call is made, so
+  a runner you enable, or a model you allowlist, while the conversation is open
+  now reaches the plan; a plan naming a runner that is switched off is refused
+  by name. The plan and the `taskOps`/`taskQuery` JSON envelopes stay as the
+  fallback (#69).
+
 ### Changed
 
 - **A task's file edits read as diffs, on every runner.** An edit row in the

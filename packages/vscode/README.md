@@ -18,8 +18,9 @@ runs, then review the result before it reaches your branch.
 - **Isolated execution.** Each task works in its own git worktree, and passing work
   lands on one integration branch. A handoff card at the end lets you review the
   diff, merge it, or discard it.
-- **Verdicts from evidence.** A task completes only when its completion marker
-  appears in the runner's output.
+- **Verdicts from evidence.** A task completes when the runner reports it done —
+  through Ordewell's own tool, or its completion marker in the output as the
+  fallback.
 - **No extra API key.** Claude Code, Codex or OpenCode can be the planner, using the
   subscription you already have.
 
