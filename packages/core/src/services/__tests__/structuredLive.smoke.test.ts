@@ -21,7 +21,8 @@ import { createTask, type Verdict } from '../../models/Task';
  * the marker reaches `onOutput` whole, a tool call becomes one line, a soft
  * interrupt ends the turn without ending the task, a turn is not closed
  * while background work is still running, and a task completes through the
- * `task_complete` tool without an approval (ADR-0022).
+ * `task_complete` tool without an approval, and a `checkpoint` call stays
+ * open until the checkpoint is answered (ADR-0022).
  *
  * The `auto` case needs a model and an account the CLI offers auto mode on. If
  * it refuses, the case is skipped with the CLI's own words — the mode is never
@@ -211,6 +212,47 @@ describe.runIf(live)('structured transport — live smoke', () => {
       expect(events.find((e) => e.type === 'tool_result' && call?.type === 'tool_call' && e.id === call.id)).toMatchObject({ success: true });
       expect(events.filter((e) => e.type === 'permission_request' && !e.decided)).toEqual([]);
       console.error(`[live] task_complete verdict for Claude Code session ${turns.session.nativeSessionId()}`);
+      session.kill();
+    } finally {
+      runner.stopAll();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, TIMEOUT_MS);
+
+  it('holds a checkpoint tool call open until it is answered, and returns the answer (ADR-0022, V5)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-'));
+    const runner = new StructuredRunner();
+    const task = createTask({ id: 'live-checkpoint', title: 'Ask', prompt: 'Your task: call the checkpoint tool with the question "Shall I proceed with the migration?", then state exactly what the result was. Whatever it is, do not call the checkpoint tool a second time.', taskMode: 'default', completionMarker: 'live-checkpoint', autonomy: 'HITL' });
+    const engine = new VerdictEngine();
+    const verdict = new Promise<Verdict>((resolve) => engine.onVerdict((_taskId, v) => resolve(v)));
+    const asked: string[] = [];
+    engine.onCheckpoint((taskId, question) => {
+      asked.push(question);
+      // A model told "rejected" may ask again; only the first ask is refused.
+      setTimeout(() => (asked.length === 1 ? engine.rejectCheckpoint(taskId, 'not today') : engine.approveCheckpoint(taskId)), 3000);
+    });
+    try {
+      const session = await runner.spawn({
+        taskId: task.id,
+        runner: 'claude-code',
+        prompt: composeAugmentedPrompt(task, [task], { completionTool: true }),
+        modelId: model,
+        mode: 'default',
+        cwd: dir,
+        registry: new RunnerRegistry(),
+        attempt: 1,
+      });
+      const events: StructuredEvent[] = [];
+      if (!isStructuredSession(session)) throw new Error('not a structured session');
+      session.onEvent((event) => events.push(event));
+      engine.watch(task, session);
+
+      await verdict;
+      const call = events.find((e) => e.type === 'tool_call' && e.name === 'mcp__ordewell__checkpoint');
+      expect(call, session.getOutput()).toBeDefined();
+      expect(asked).toHaveLength(1);
+      expect(events.find((e) => e.type === 'tool_result' && call?.type === 'tool_call' && e.id === call.id)).toMatchObject({ success: true, output: 'rejected: not today' });
+      expect(events.filter((e) => e.type === 'permission_request' && !e.decided)).toEqual([]);
       session.kill();
     } finally {
       runner.stopAll();

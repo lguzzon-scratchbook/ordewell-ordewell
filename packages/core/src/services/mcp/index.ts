@@ -11,6 +11,7 @@ export type {
   McpToolContext,
   TaskCompleteArgs,
   CheckpointArgs,
+  CheckpointAnswer,
   ListRunnersArgs,
   ListModelsArgs,
   SubmitPlanArgs,

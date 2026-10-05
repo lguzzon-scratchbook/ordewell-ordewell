@@ -1,5 +1,5 @@
 import type { AgentEvent } from '../services/harness/AgentAdapter';
-import type { TaskCompleteArgs } from '../services/mcp/tools';
+import type { CheckpointAnswer, TaskCompleteArgs } from '../services/mcp/tools';
 import type { ApprovalDecision } from './IApproval';
 
 export interface ITerminalSession {
@@ -100,6 +100,12 @@ export interface StructuredSessionCapability {
    * completion evidence beside the marker, for `VerdictEngine` to weigh.
    */
   onTaskComplete(listener: (report: TaskCompleteArgs) => void): void;
+  /**
+   * Answers the runner's `checkpoint` calls (ADR-0022, V5): the call stays
+   * open until the returned promise settles, and its result is the answer.
+   * `signal` aborts when the caller goes away.
+   */
+  onToolCheckpoint(handler: (question: string, signal: AbortSignal) => Promise<CheckpointAnswer>): void;
 }
 
 export function isStructuredSession(session: ITerminalSession): session is ITerminalSession & StructuredSessionCapability {

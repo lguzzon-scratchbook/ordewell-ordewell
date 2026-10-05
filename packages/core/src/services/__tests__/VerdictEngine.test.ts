@@ -166,6 +166,122 @@ describe('VerdictEngine', () => {
     });
   });
 
+  describe('the checkpoint tool (ADR-0022, V5)', () => {
+    function watched() {
+      const engine = new VerdictEngine();
+      const raised: Array<{ taskId: string; summary: string }> = [];
+      engine.onCheckpoint((taskId, summary) => raised.push({ taskId, summary }));
+      const session = new FakeStructuredSession();
+      const attempt = engine.watch(buildTask(), session);
+      return { engine, raised, session, attempt };
+    }
+
+    it('raises the same checkpoint event as the marker, and settles with continue on approve', async () => {
+      const { engine, raised, session } = watched();
+
+      const answer = session.callCheckpoint('  Drop the table?  ');
+      expect(raised).toEqual([{ taskId: 't1', summary: 'Drop the table?' }]);
+
+      engine.approveCheckpoint('t1');
+      await expect(answer).resolves.toEqual({ kind: 'continue' });
+      expect(session.written).toEqual([]);
+    });
+
+    it('settles with the reason on reject, writing nothing into the session', async () => {
+      const { engine, session } = watched();
+
+      const answer = session.callCheckpoint('Drop the table?');
+      engine.rejectCheckpoint('t1', 'keep the data');
+
+      await expect(answer).resolves.toEqual({ kind: 'rejected', reason: 'keep the data' });
+      expect(session.written).toEqual([]);
+    });
+
+    it('is withdrawn when the attempt is cleared for a retry', async () => {
+      const { engine, session } = watched();
+
+      const answer = session.callCheckpoint('Drop the table?');
+      engine.clear(buildTask());
+
+      await expect(answer).resolves.toMatchObject({ kind: 'withdrawn' });
+    });
+
+    it('is withdrawn when the verdict settles the attempt', async () => {
+      const { engine, session, attempt } = watched();
+
+      const answer = session.callCheckpoint('Drop the table?');
+      engine.signalComplete('t1', attempt, { status: 'failed', summary: 'x', reason: 'gave up' });
+
+      await expect(answer).resolves.toMatchObject({ kind: 'withdrawn' });
+    });
+
+    it('is withdrawn when the verifier is reset', async () => {
+      const { engine, session } = watched();
+
+      const answer = session.callCheckpoint('Drop the table?');
+      engine.reset();
+
+      await expect(answer).resolves.toMatchObject({ kind: 'withdrawn' });
+    });
+
+    it('refuses a call from an attempt that is no longer the task\'s current one', async () => {
+      const { engine, raised, session } = watched();
+      engine.watch(buildTask(), new FakeStructuredSession('s2'));
+
+      await expect(session.callCheckpoint('late')).resolves.toMatchObject({ kind: 'withdrawn' });
+      expect(raised).toEqual([]);
+    });
+
+    it('refuses a second call while one still waits, leaving the first to be answered', async () => {
+      const { engine, raised, session } = watched();
+
+      const first = session.callCheckpoint('first');
+      await expect(session.callCheckpoint('second')).resolves.toMatchObject({ kind: 'withdrawn' });
+      engine.approveCheckpoint('t1');
+
+      await expect(first).resolves.toEqual({ kind: 'continue' });
+      expect(raised).toHaveLength(1);
+    });
+
+    it('is withdrawn when its call goes away, telling the host nothing is left to answer', async () => {
+      const { engine, session } = watched();
+      const withdrawn: string[] = [];
+      engine.onCheckpointWithdrawn((taskId) => withdrawn.push(taskId));
+      const gone = new AbortController();
+
+      const answer = session.callCheckpoint('Drop the table?', gone.signal);
+      gone.abort();
+
+      await expect(answer).resolves.toMatchObject({ kind: 'withdrawn' });
+      expect(withdrawn).toEqual(['t1']);
+      engine.approveCheckpoint('t1');
+      expect(session.written).toEqual([]);
+    });
+
+    it('asks again after a withdrawn call', async () => {
+      const { engine, session } = watched();
+      const gone = new AbortController();
+      void session.callCheckpoint('first', gone.signal);
+      gone.abort();
+
+      const second = session.callCheckpoint('second');
+      engine.approveCheckpoint('t1');
+
+      await expect(second).resolves.toEqual({ kind: 'continue' });
+    });
+
+    it('leaves the marker path writing its answer into the session', () => {
+      const engine = new VerdictEngine();
+      const session = new FakeStructuredSession();
+      engine.watch(buildTask(), session);
+
+      session.emitOutput('<<<ORDEWELL_CHECKPOINT: need review>>>');
+      engine.approveCheckpoint('t1');
+
+      expect(session.written.join('')).toContain('ORDEWELL_CONTINUE');
+    });
+  });
+
   describe('checkpoint markers', () => {
     it('detects a checkpoint marker and emits event without killing the session', async () => {
       const engine = new VerdictEngine();

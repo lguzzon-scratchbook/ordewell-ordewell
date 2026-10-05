@@ -286,6 +286,11 @@ export class TaskOrchestrator {
       this.emit('onTaskSettled', { taskId });
       this.emit('onCheckpoint', { taskId, taskTitle: task.title, summary });
     });
+    this.verifier.onCheckpointWithdrawn((taskId) => {
+      if (!this.atCheckpoint(taskId)) return;
+      this.store.markInProgress(taskId);
+      this.emit('onTaskChanged');
+    });
     // idleSince is advisory UI state, not a store mutation — broadcast it
     // through the same onTaskChanged seam without touching PlanStore.
     this.verifier.onIdleChange(() => this.emit('onTaskChanged'));

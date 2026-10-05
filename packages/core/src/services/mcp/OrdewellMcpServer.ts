@@ -14,6 +14,22 @@ import { PLANNER_TOOLS, TASK_TOOLS, type McpTool, type PlannerToolHandler, type 
 
 export const ORDEWELL_MCP_PATH = '/mcp';
 
+/**
+ * Claude Code aborts an HTTP MCP tool call that has sent neither a response nor
+ * a progress notification for CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT (300s unless
+ * set; a per-server `timeout` or the variable raises it, 0 disables), and
+ * no other limit bites a person-length wait — its hard cap on a call defaults
+ * to 1e8 ms. A progress notification resets the idle clock, so a call that
+ * waits on a person heartbeats well inside that default instead of asking
+ * every user to reconfigure their runner (checked against Claude Code 2.1.289).
+ */
+const DEFAULT_HEARTBEAT_MS = 30_000;
+
+export interface OrdewellMcpServerOptions {
+  /** How often a call that is still waiting tells its caller so. */
+  heartbeatMs?: number;
+}
+
 export interface TaskTokenScope {
   sessionId: string;
   taskId: string;
@@ -41,6 +57,11 @@ export class OrdewellMcpServer {
   private listening: Promise<string> | undefined;
   private boundUrl: string | undefined;
   private boundHost: string | undefined;
+  private readonly heartbeatMs: number;
+
+  constructor(options: OrdewellMcpServerOptions = {}) {
+    this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  }
 
   /** The listener's URL, once the first token has started it. */
   get url(): string | undefined {
@@ -135,8 +156,8 @@ export class OrdewellMcpServer {
     // Stateless: a fresh server per request, built from the grant, so the tool
     // list and every call are fixed by the token on that very request.
     const mcp = new McpProtocolServer({ name: 'ordewell', version: '1' }, { capabilities: { tools: {} } });
-    if (grant.role === 'task') serveTools(mcp, TASK_TOOLS, grant.handler, grant.revoked.signal);
-    else serveTools(mcp, PLANNER_TOOLS, grant.handler, grant.revoked.signal);
+    if (grant.role === 'task') serveTools(mcp, TASK_TOOLS, grant.handler, grant.revoked.signal, this.heartbeatMs);
+    else serveTools(mcp, PLANNER_TOOLS, grant.handler, grant.revoked.signal, this.heartbeatMs);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on('close', () => {
       void transport.close();
@@ -147,18 +168,26 @@ export class OrdewellMcpServer {
   }
 }
 
-function serveTools<H>(mcp: McpProtocolServer, tools: readonly McpTool<H>[], handler: H, revoked: AbortSignal): void {
+function serveTools<H>(mcp: McpProtocolServer, tools: readonly McpTool<H>[], handler: H, revoked: AbortSignal, heartbeatMs: number): void {
   mcp.setRequestHandler(ListToolsRequestSchema, () => ({
     tools: tools.map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, ...(annotations ? { annotations } : {}) })),
   }));
   mcp.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const tool = tools.find((t) => t.name === request.params.name);
     if (!tool) throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${request.params.name}`);
+    const progressToken = request.params._meta?.progressToken;
+    let beats = 0;
+    const heartbeat = progressToken === undefined ? undefined : setInterval(() => {
+      beats += 1;
+      extra.sendNotification({ method: 'notifications/progress', params: { progressToken, progress: beats } }).catch(() => undefined);
+    }, heartbeatMs);
     try {
       const result = await tool.call(handler, request.params.arguments, { signal: AbortSignal.any([revoked, extra.signal]) });
       return { content: [{ type: 'text', text: result.text }], isError: result.isError ?? false };
     } catch (err) {
       return { content: [{ type: 'text', text: err instanceof Error ? err.message : String(err) }], isError: true };
+    } finally {
+      clearInterval(heartbeat);
     }
   });
 }

@@ -150,10 +150,11 @@ on the same mechanism.
 - **`checkpoint` waits for the answer (V5).** The call stays open until the
   checkpoint is answered through the existing checkpoint path, and the answer
   is its result. The task is `awaiting_user` with reason `checkpoint` while it
-  waits, with the idle timer paused as for any other wait (ADR-0018, W1). The
-  injected configuration raises the runner's tool-call timeout where the
-  runner has one, so a checkpoint can wait for a person. Cancel, stop and retry
-  end the call with a refusal, as they deny a pending runner approval.
+  waits, with the idle timer paused as for any other wait (ADR-0018, W1). A
+  waiting call sends MCP progress notifications, so a runner that aborts a
+  silent call (Claude Code, 300s by default) does not end a checkpoint that
+  waits for a person; no runner setting is raised. Cancel, stop and retry end
+  the call with a refusal, as they deny a pending runner approval.
 
 ### Planner: the envelope's security boundary holds
 
@@ -269,3 +270,4 @@ planner tools are recorded here as an explicit entry against both:
 ## History
 
 - 2026-10-05 — proposed.
+- 2026-10-05 — V5 amended: checked against Claude Code 2.1.289, its hard cap on a tool call is 1e8 ms, but an HTTP call silent for 300s is aborted. Progress notifications reset that, so the server heartbeats instead of the configuration raising a timeout.

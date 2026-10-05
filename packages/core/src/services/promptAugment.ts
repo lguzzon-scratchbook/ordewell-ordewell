@@ -155,7 +155,7 @@ export interface ComposeOptions {
   tddEnabled?: boolean;
   /** An ops task's last attempt, as its output ended (ADR-0020); absent on a first attempt. */
   previousAttempt?: string;
-  /** The runner is given the `task_complete` tool (ADR-0022); the marker stays as its fallback. */
+  /** The runner is given the `task_complete` and `checkpoint` tools (ADR-0022); the markers stay as their fallback. */
   completionTool?: boolean;
 }
 
@@ -215,7 +215,21 @@ function renderTddInstruction(): string {
  */
 const CHECKPOINT_MARKER_HOWTO = 'Build it by writing `<<<ORDEWELL_` immediately followed by `CHECKPOINT:` — no space, quote, or any other character between those two parts — then a brief summary of what you are about to do and why human input is needed, closed with `>>>`';
 
-function renderCheckpointInstruction(): string {
+function renderCheckpointInstruction(checkpointTool = false): string {
+  if (checkpointTool) {
+    return [
+      '## Human-in-the-loop checkpoints',
+      '',
+      'When you reach a decision point that requires human judgment — before destructive',
+      'operations, after major design decisions, or when multiple viable paths exist — pause',
+      'and request input:',
+      '',
+      '1. Call the `checkpoint` tool with a brief summary of what you are about to do and why human input is needed. The call waits for the human, and its result is their answer',
+      '2. If the result is `continue`: proceed with the action you described',
+      '3. If the result starts with `rejected:`: the rest is why. Adjust your approach and call `checkpoint` again if needed',
+      `4. If the \`checkpoint\` tool is not available to you, or the call fails, fall back to the marker: print one line holding only the checkpoint marker and wait for ORDEWELL_CONTINUE or ORDEWELL_REJECT. ${CHECKPOINT_MARKER_HOWTO}`,
+    ].join('\n');
+  }
   return [
     '## Human-in-the-loop checkpoints',
     '',
@@ -254,7 +268,7 @@ export function composeAugmentedPrompt(task: Task, allTasks: readonly Task[], op
   }
 
   if (isHitlTask(task)) {
-    blocks.push(renderCheckpointInstruction());
+    blocks.push(renderCheckpointInstruction(opts?.completionTool));
   }
 
   const marker = renderCompletionMarker(task, opts?.completionTool);
@@ -276,7 +290,9 @@ export function composeContinuationPrompt(task: Task, message: string, opts: { o
       : '(Ordewell) You are continuing this task in the same session. Your working directory was recreated from the integration branch: work from your earlier attempt is there only if it landed, so check the files before relying on them.',
   ];
   if (isHitlTask(task)) {
-    reminder.push(`If you reach a decision that needs human judgment, print one line holding only the checkpoint marker and wait for ORDEWELL_CONTINUE or ORDEWELL_REJECT. ${CHECKPOINT_MARKER_HOWTO}.`);
+    reminder.push(opts.completionTool
+      ? `If you reach a decision that needs human judgment, call the \`checkpoint\` tool: its result is \`continue\` or \`rejected: <why>\`. Only if the tool is not available to you, print one line holding only the checkpoint marker and wait for ORDEWELL_CONTINUE or ORDEWELL_REJECT. ${CHECKPOINT_MARKER_HOWTO}.`
+      : `If you reach a decision that needs human judgment, print one line holding only the checkpoint marker and wait for ORDEWELL_CONTINUE or ORDEWELL_REJECT. ${CHECKPOINT_MARKER_HOWTO}.`);
   }
   return `${message.trim()}\n\n---\n${reminder.join('\n\n')}${renderCompletionMarker(task, opts.completionTool)}`;
 }
