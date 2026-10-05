@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { ConversationRequest, ConversationTurn, IAiService } from './AiService';
 import { repairLoop, taskOpsRejectedPrompt } from './PlanRepair';
-import { renderTaskQueryAnswer, taskQuerySignature, TASK_QUERY_ANSWER_OR_OPS, TASK_QUERY_REMINDER, type LiveOutputLookup, type TaskQuery, type TaskQueryCatalog } from './TaskQuery';
+import { renderTaskQueryAnswer, taskQuerySignature, TASK_QUERY_ANSWER_OR_OPS, TASK_QUERY_REMINDER, TASK_READ_TOOLS_REMINDER, type LiveOutputLookup, type TaskQuery, type TaskQueryCatalog } from './TaskQuery';
 import { taskOpsProtocol, refMatchesTask, taskOpRefs, type ApplyTaskOpsResult, type TaskOp } from './TaskOps';
 import { resolveDefaultMode } from './ModeResolver';
 import type { PlannerTurnOutcome, SessionBroadcaster } from './SessionMessage';
@@ -60,6 +60,9 @@ interface UserTurn {
   /** Handed in since the backend last answered; see {@link PlannerConversation.submit}. */
   submitted?: PlannerSubmission;
 }
+
+/** A read made through a planner tool: refused once the turn's budget is gone, else answered, told to land when the budget asks it to. */
+export type ToolRead<T> = { status: 'refused' } | { status: 'answered'; value: T; landNow: boolean };
 
 /** A plan or task edit handed to the open turn over a channel other than its reply (ADR-0022). */
 export type PlannerSubmission =
@@ -230,6 +233,39 @@ export class PlannerConversation {
     if (!this.openTurn) return false;
     this.openTurn.submitted = submission;
     return true;
+  }
+
+  /**
+   * The edit the open turn already holds, for a further edit in the same reply
+   * to join rather than replace. Empty when it holds nothing; null when it holds
+   * a whole plan, which an edit cannot be layered on.
+   */
+  pendingOps(): TaskOp[] | null {
+    const held = this.openTurn?.submitted;
+    if (!held) return [];
+    return held.kind === 'task_ops' ? held.ops : null;
+  }
+
+  /** Whether the turn would park this edit until a batch boundary instead of applying it as it settles. */
+  editWouldQueue(ops: TaskOp[]): boolean {
+    return this.editTouchesLiveWork({ kind: 'task_ops', ops, text: '', researchLog: [] });
+  }
+
+  /**
+   * A read the planner makes through a tool. It spends the same per-turn budget
+   * as an envelope read, so a planner cannot read more by switching channels:
+   * past the soft limit, or on a repeated question, the answer still comes but
+   * is told to land the turn; at the hard limit it is refused. `signature`
+   * names the question, for the repeat check.
+   */
+  async read<T>(signature: string, answer: () => Promise<T>): Promise<ToolRead<T>> {
+    const reads = this.openTurn?.reads;
+    if (!reads) return { status: 'answered', value: await answer(), landNow: false };
+    if (reads.answered >= MAX_TASK_QUERIES_HARD) return { status: 'refused' };
+    const landNow = reads.seen.has(signature) || reads.answered >= MAX_TASK_QUERIES;
+    reads.seen.add(signature);
+    reads.answered++;
+    return { status: 'answered', value: await answer(), landNow };
   }
 
   /** Whether the model still holds this conversation in memory. */
@@ -857,6 +893,7 @@ export class PlannerConversation {
     const tasks = this.host.tasks();
     const lines = this.currentPlanLines();
     if (!lines) return null;
+    const tools = this.host.aiService().plannerToolsAttached?.() ?? false;
     // Gated on live runners, not on an armed scheduler: a paused-but-armed run
     // takes edits immediately, so promising a queue there is a lie the model
     // plans around (it stops emitting ops and asks the user to wait).
@@ -870,8 +907,8 @@ export class PlannerConversation {
       '</current_plan>',
       'The block above is the CURRENT task plan — short fields only. Choose how to respond:',
       '- To answer a question or discuss, reply in plain prose (no JSON).',
-      TASK_QUERY_REMINDER,
-      ...taskOpsProtocol(execNote),
+      tools ? TASK_READ_TOOLS_REMINDER : TASK_QUERY_REMINDER,
+      ...taskOpsProtocol(execNote, tools),
     ].filter(Boolean).join('\n');
   }
 

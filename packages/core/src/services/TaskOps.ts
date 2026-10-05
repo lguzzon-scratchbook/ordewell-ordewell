@@ -32,13 +32,13 @@ export const UPDATABLE_FIELDS: (keyof Task)[] = [
  * `executionNote` rides on the ordering rule because that is the rule a
  * running execution changes.
  */
-export function taskOpsProtocol(executionNote = ''): string[] {
+export function taskOpsProtocol(executionNote = '', tools = false): string[] {
   const updateChanges = UPDATABLE_FIELDS
     .map((f) => (f === 'dependencies' ? '"dependencies"?:["<id or #order>"]' : `"${f}"?`))
     .join(',');
   return [
-    '- To modify specific tasks, reply with ONLY this JSON object:',
-    '  {"taskOps": [',
+    tools ? '- To modify specific tasks, call edit_plan, never a JSON reply. Its argument is:' : '- To modify specific tasks, reply with ONLY this JSON object:',
+    tools ? '  {"ops": [' : '  {"taskOps": [',
     `    {"op":"update","taskId":"<id or #order>","changes":{${updateChanges}}},`,
     '    {"op":"add","task":{"title","description","prompt","dependencies":["<id or #order>"],"assignedRunner"?,"assignedModel"?,"ops"?},"handle"?:"<name>"},',
     '    {"op":"remove","taskId":"<id or #order>"},',
@@ -47,11 +47,12 @@ export function taskOpsProtocol(executionNote = ''): string[] {
     '    {"op":"split","taskId":"<id or #order>","parts":[{"title","description","prompt"?,"assignedRunner"?,"assignedModel"?,...}, ...],"handle"?:"<name>"},',
     `    {"op":"rearm","taskId":"<id or #order>","changes"?:{${updateChanges}}}`,
     '  ]}',
-    '- For sweeping changes, you may instead emit a full {"tasks":[...]} plan JSON.',
+    tools ? '- For sweeping changes, you may instead call submit_plan with the full plan.' : '- For sweeping changes, you may instead emit a full {"tasks":[...]} plan JSON.',
     'Every "<id or #order>" ref in a batch resolves against the plan shown above, before any op in the batch runs — an earlier remove/merge/split never shifts what a later "#N" means.',
     'Give "add", "merge", or "split" a "handle" (any name you choose, unused elsewhere in this batch) to let a LATER op in the same batch reference the task it produces — for "split", the handle names its last part. A handle used before its defining op is rejected.',
-    'When creating or changing tasks, set "assignedRunner" and "assignedModel" ({"modelId","modelLabel","thinkingEffort"?}) using only the runners and models listed in <available_models>.',
+    `When creating or changing tasks, set "assignedRunner" and "assignedModel" ({"modelId","modelLabel","thinkingEffort"?}) using only the runners and models ${tools ? 'list_runners and list_models return' : 'listed in <available_models>'}.`,
     'Keep dependencies consistent: no cycles, no references to removed tasks, and never touch running or completed tasks — "rearm" is the one exception, below.',
+    ...(tools ? ['edit_plan checks the batch when you call it and answers with what it will change, or with the error to fix — call it again in the same reply. The edit is applied when your reply ends; edits you make in one reply join one batch.'] : []),
     'Just declare the dependencies you want — display order is repaired for you afterwards, so a rewire or a newly added prerequisite never needs a "reorder" op. Only a task that is running or completed cannot be shifted, so an edit that would need one to move is rejected.' + executionNote,
     'Flipping "type" between "ai" and "user" is a content change, not just a label: an update to "user" needs "userSteps" in the SAME op, and an update to "ai" needs "prompt" in the SAME op — the model/mode/effort/autonomy fields (flipping to "user") or the userSteps (flipping to "ai") are cleared automatically.',
     '"rearm" puts a failed OR completed task back to pending — verdict and output summary are cleared, any dependents it had blocked are released, and it may carry field changes (e.g. a corrected "prompt") applied in the same op. A running task cannot be re-armed. Never rearm a task just to relabel it — only when it should actually run again.',
