@@ -30,8 +30,10 @@ compile against.
 
 - **No `any`.** The codebase was deliberately swept clean of it. Use `unknown`
   and narrow.
-- **Verdicts come from evidence.** A task completes only when its completion
-  marker appears in the runner's output. Never make the model the tie-breaker.
+- **Verdicts come from evidence.** A task completes when the runner reports it
+  done: a `task_complete` call bound to the attempt's token on the structured
+  transport, or its completion marker in the output as the fallback. Never make
+  the model the tie-breaker.
 - **The plan is the source of truth.** Modes and models are never silently
   rewritten at spawn time ([ADR-0001](docs/adr/0001-autonomous-mode-resolution.md)).
 - **Comment *why*, never *what*.** Match the comment density of the file you're
