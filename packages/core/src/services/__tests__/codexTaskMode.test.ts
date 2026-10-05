@@ -8,7 +8,7 @@ import { StructuredRunner } from '../StructuredRunner';
 import { isStructuredSession, type StructuredEvent } from '../../interfaces/ITerminalRunner';
 import { mcpClientConfig } from '../mcp';
 import { takesOrdewellTools } from '../harness/taskAdapters';
-import { fakeSpawn, fixture, type FakeSpawnOptions, type ScriptedReply } from './harnessTestKit';
+import { modeIds, fakeSpawn, fixture, type FakeSpawnOptions, type ScriptedReply } from './harnessTestKit';
 
 /**
  * Codex's task mode (ADR-0018, #54) over `codex app-server`. The traffic is
@@ -702,6 +702,17 @@ describe('CodexAdapter with the Ordewell MCP server (ADR-0022)', () => {
     expect(spawned.lastArgs()).toEqual(['app-server']);
     expect(spawned.lastEnv().ORDEWELL_MCP_TOKEN_0).toBe('Bearer tok-secret');
     expect(JSON.stringify(spawned.processes[0].written)).not.toContain('tok-secret');
+    adapter.dispose();
+  });
+
+  it.each(modeIds(CODEX_MANIFEST))('pre-approves the server on a task thread under %s, whatever the approval policy', async (mode) => {
+    const { spawned, processDeps } = deps(handshake());
+    const adapter = new CodexAdapter(processDeps);
+    await adapter.start(taskStart(mode, { mcp }));
+
+    const [threadStart] = sentNamed(spawned.processes[0].written, 'thread/start');
+    expect(threadStart.params?.config).toMatchObject({ mcp_servers: { ordewell: { default_tools_approval_mode: 'approve' } } });
+    expect(spawned.lastArgs().join(' ')).not.toContain('tok-secret');
     adapter.dispose();
   });
 

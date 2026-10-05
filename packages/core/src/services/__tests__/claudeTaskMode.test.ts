@@ -8,7 +8,7 @@ import { supportsTaskMode, createTaskAdapter } from '../harness/taskAdapters';
 import { resolveArgs, resolveTaskRunnerFlags } from '../../plugins/resolveArgs';
 import { CLAUDE_CODE_MANIFEST } from '../../plugins/builtin/claude-code.manifest';
 import { mcpClientConfig } from '../mcp';
-import { fakeSpawn, fixture, type ScriptedReply } from './harnessTestKit';
+import { modeIds, fakeSpawn, fixture, type ScriptedReply } from './harnessTestKit';
 
 /**
  * The adapter's task mode (ADR-0018, C1), against transcripts recorded from
@@ -41,8 +41,8 @@ function taskStart(overrides: Partial<TaskStartOptions> = {}): TaskStartOptions 
 }
 
 /** A task in the mode a fixture was recorded under: the adapter holds the CLI to the mode asked for. */
-function taskIn(permissionMode: string): TaskStartOptions {
-  return taskStart({ mode: permissionMode, flags: { permissionMode, modeSettings: {} } });
+function taskIn(permissionMode: string, overrides: Partial<TaskStartOptions> = {}): TaskStartOptions {
+  return taskStart({ mode: permissionMode, flags: { permissionMode, modeSettings: {} }, ...overrides });
 }
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -603,6 +603,27 @@ describe('ClaudeCodeAdapter with the Ordewell MCP server (ADR-0022)', () => {
     if (process.platform !== 'win32') expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(args.some((arg) => arg.includes('tok-secret'))).toBe(false);
     expect(args.flatMap((arg, i) => (arg === '--allowedTools' ? [args[i + 1]] : []))).toEqual(['mcp__ordewell__task_complete,mcp__ordewell__checkpoint']);
+    adapter.dispose();
+  });
+
+  it.each(modeIds(CLAUDE_CODE_MANIFEST))('pre-approves the Ordewell tools and auto-allows their requests under %s', async (mode) => {
+    const request = {
+      type: 'control_request',
+      request_id: 'req-m',
+      request: { subtype: 'can_use_tool', tool_name: 'mcp__ordewell__checkpoint', input: { question: 'ok?' }, tool_use_id: 'tu-m' },
+    };
+    const { spawned, processDeps } = deps([`${JSON.stringify(request)}\n`]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskIn(mode, { mcp }));
+    const events: AgentEvent[] = [];
+    void adapter.send('Do it', (e) => events.push(e));
+    await until(() => spawned.processes[0].written.length === 2);
+    const args = spawned.lastArgs();
+
+    expect(args.flatMap((arg, i) => (arg === '--allowedTools' ? [args[i + 1]] : []))).toEqual(['mcp__ordewell__task_complete,mcp__ordewell__checkpoint']);
+    expect(args.some((arg) => arg.includes('tok-secret'))).toBe(false);
+    expect(JSON.parse(spawned.processes[0].written[1]).response.response.behavior).toBe('allow');
+    expect(events.find((e) => e.type === 'permission_request')).toMatchObject({ decided: { decision: 'allow' } });
     adapter.dispose();
   });
 

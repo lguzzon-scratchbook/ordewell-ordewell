@@ -4,6 +4,7 @@ import { join } from 'path';
 import type { ChildProcess } from 'child_process';
 import type { SpawnFn } from '../HeadlessRunner';
 import type { AgentAdapterFactory, AgentEvent } from '../harness/AgentAdapter';
+import type { RunnerPluginManifest } from '../../plugins/types';
 
 /**
  * The one test seam for harness planners (ADR-0009): a fake process boundary,
@@ -262,4 +263,11 @@ export function openCodeFixture(name: string): { sessionId: string; frames: stri
     .filter((line) => line.trim())
     .map((line) => `data: ${line}\n\n`);
   return { sessionId: response.info.sessionID, frames, response };
+}
+
+/** Every mode a runner offers, so a per-mode test cannot quietly run over none. */
+export function modeIds(manifest: RunnerPluginManifest): string[] {
+  const ids = (manifest.modes ?? []).map((mode) => mode.id);
+  if (ids.length === 0) throw new Error(`${manifest.name} lists no modes`);
+  return ids;
 }
