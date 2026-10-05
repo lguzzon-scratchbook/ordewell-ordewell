@@ -114,6 +114,64 @@ describe('CommandRow', () => {
     fireEvent.click(container.querySelector('.cmd-row-head')!);
     expect(container.querySelector('.cmd-row-output')).toBeNull();
   });
+
+  it('lets a path argument give way from the left, keeping the whole path in its tooltip', () => {
+    const path = '/home/dev/app/.ordewell/worktrees/3c3de77a/2-a-task/src/conversation/taskLog.ts';
+    const { container } = render(<CommandRow block={tool({ headline: { name: 'Read', keyArg: path } })} expanded={false} />);
+    const arg = container.querySelector('.cmd-row-arg')!;
+    expect(arg.classList.contains('path')).toBe(true);
+    expect(arg.getAttribute('title')).toBe(path);
+    expect(container.querySelector('code.cmd-row-head')!.textContent).toBe(`Read(${path})`);
+    const { container: command } = render(<CommandRow block={tool()} expanded={false} />);
+    expect(command.querySelector('.cmd-row-arg')!.classList.contains('path')).toBe(false);
+  });
+});
+
+describe('CommandRow for a file edit', () => {
+  const SUM = '@@ -1,3 +1,3 @@\n export function sum(a, b) {\n-  return a - b;\n+  return a + b;\n }\n';
+  const edit = (output = SUM, over: Partial<ToolBlock> = {}) => tool({
+    tool: 'agent_tool', toolLabel: 'Update', headline: { name: 'Update', keyArg: 'src/sum.ts' }, args: '{"path":"src/sum.ts"}',
+    output, outputLineCount: output.split('\n').length, diff: { added: 1, removed: 1 }, ...over,
+  });
+  const rows = (container: HTMLElement) => Array.from(container.querySelectorAll('.diff-line')).map((row) => [
+    row.getAttribute('data-kind'), row.querySelector('.diff-num')!.textContent, row.querySelector('.diff-sign')!.textContent, row.querySelector('.diff-text')!.textContent,
+  ]);
+
+  it('says what the edit changed, then its lines numbered and marked, an addition and a removal told apart', () => {
+    const { container } = render(<CommandRow block={edit()} expanded={false} />);
+    expect(container.querySelector('.diff-summary')!.textContent).toBe('Added 1 line, removed 1 line');
+    expect(rows(container)).toEqual([
+      ['context', '1', ' ', 'export function sum(a, b) {'],
+      ['removed', '2', '-', '  return a - b;'],
+      ['added', '2', '+', '  return a + b;'],
+      ['context', '3', ' ', '}'],
+    ]);
+    expect(container.querySelector('.cmd-row-preview')).toBeNull();
+  });
+
+  it('previews ten lines of a long diff and counts the rest, showing all of it when expanded', () => {
+    const output = Array.from({ length: 30 }, (_, i) => `+line ${i + 1}`).join('\n');
+    const block = edit(output, { diff: { added: 30, removed: 0 } });
+    const { container } = render(<CommandRow block={block} expanded={false} />);
+    expect(rows(container)).toHaveLength(10);
+    expect(container.querySelector('.cmd-row-more')!.textContent).toBe('+20 lines');
+
+    const { container: open } = render(<CommandRow block={block} expanded />);
+    expect(rows(open)).toHaveLength(30);
+    expect(open.querySelector('.cmd-row-more')).toBeNull();
+    expect(open.querySelector('.cmd-row-output')).toBeNull();
+  });
+
+  it('marks the lines between two hunks', () => {
+    const { container } = render(<CommandRow block={edit('@@ -1 +1 @@\n-a\n+A\n@@ -40 +40 @@\n-b\n+B\n')} expanded={false} />);
+    expect(container.querySelectorAll('.diff-gap')).toHaveLength(1);
+  });
+
+  it('draws an edit that reported no diff as an ordinary row', () => {
+    const { container } = render(<CommandRow block={edit('The file was updated.', { diff: undefined })} expanded={false} />);
+    expect(container.querySelector('.diff-summary')).toBeNull();
+    expect(container.querySelector('.cmd-row-preview')!.textContent).toBe('The file was updated.');
+  });
 });
 
 describe('SubagentCard', () => {

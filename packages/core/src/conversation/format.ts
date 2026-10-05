@@ -137,3 +137,50 @@ export function diffStat(output: string): DiffStat | null {
   }
   return added + removed > 0 ? { added, removed } : null;
 }
+
+/** `gap` stands between two hunks, for the lines a diff leaves out. */
+export type DiffRowKind = 'added' | 'removed' | 'context' | 'gap';
+
+export interface DiffRow {
+  kind: DiffRowKind;
+  /** The line in the file: the old file's for a removal, the new file's otherwise. */
+  line?: number;
+  text: string;
+}
+
+const HUNK_RANGE = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+
+/** A diff as the rows a surface draws, numbered as an editor would number them. */
+export function diffRows(output: string): DiffRow[] {
+  const rows: DiffRow[] = [];
+  let oldLine = 1;
+  let newLine = 1;
+  for (const line of outputLines(output)) {
+    const range = HUNK_RANGE.exec(line);
+    if (range) {
+      if (rows.length > 0) rows.push({ kind: 'gap', text: '' });
+      oldLine = Number(range[1]);
+      newLine = Number(range[2]);
+    } else if (line.startsWith('+')) {
+      rows.push({ kind: 'added', line: newLine++, text: line.slice(1) });
+    } else if (line.startsWith('-')) {
+      rows.push({ kind: 'removed', line: oldLine++, text: line.slice(1) });
+    } else if (!line.startsWith('\\')) {
+      rows.push({ kind: 'context', line: newLine, text: line.slice(1) });
+      oldLine += 1;
+      newLine += 1;
+    }
+  }
+  return rows;
+}
+
+function lines(count: number): string {
+  return `${count} line${count === 1 ? '' : 's'}`;
+}
+
+/** "Added 2 lines, removed 1 line": the summary every surface puts on an edit's row. */
+export function diffSummary({ added, removed }: DiffStat): string {
+  if (!removed) return `Added ${lines(added)}`;
+  if (!added) return `Removed ${lines(removed)}`;
+  return `Added ${lines(added)}, removed ${lines(removed)}`;
+}

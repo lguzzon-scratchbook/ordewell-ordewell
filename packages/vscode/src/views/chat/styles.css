@@ -369,15 +369,37 @@ body {
 
 /* `flex: 1; min-width: 0` is what makes the ellipsis engage: a nowrap element
    defaults to min-width:auto and refuses to shrink below its text, pushing the
-   outcome out of the row instead of clipping the argument. */
+   outcome out of the row instead of clipping the argument. The name and the
+   closing parenthesis never shrink, so only the argument gives way. */
 .cmd-row-head {
+  display: flex;
   flex: 1;
   min-width: 0;
   font-family: var(--font-mono);
   color: var(--text-primary);
   white-space: nowrap;
+}
+
+.cmd-row-name {
+  flex-shrink: 0;
+}
+
+.cmd-row-arg {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* A path is cut from the left, so the file it names stays in view: in a
+   right-to-left box the ellipsis takes the start, and the isolated
+   left-to-right text inside still reads the right way round. */
+.cmd-row-arg.path {
+  direction: rtl;
+}
+
+.cmd-row-arg > bdi {
+  direction: ltr;
+  unicode-bidi: isolate;
 }
 
 /* Refused / denied / failed / cut-short calls read as an exception, not a
@@ -5294,4 +5316,76 @@ body {
 
 .task-ops-note.warn {
   color: var(--orange);
+}
+
+/* A file edit's diff: what it changed, then its lines numbered and marked —
+   an addition green, a removal red, as the editor's own diff view tints them. */
+.diff-summary,
+.diff-view {
+  margin: 2px 0 0 17px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border-muted);
+  font-size: 11px;
+}
+
+.diff-summary {
+  color: var(--text-secondary);
+}
+
+.diff-view {
+  margin-top: 0;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+}
+
+.diff-line {
+  display: flex;
+  color: var(--text-secondary);
+}
+
+.diff-num,
+.diff-sign {
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.diff-num {
+  min-width: 3ch;
+  padding-right: 1ch;
+  text-align: right;
+  color: var(--text-muted);
+}
+
+.diff-sign {
+  width: 2ch;
+}
+
+.diff-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.diff-line[data-kind='added'] {
+  background: var(--vscode-diffEditor-insertedLineBackground, var(--green-subtle));
+}
+
+.diff-line[data-kind='added'] .diff-sign,
+.diff-line[data-kind='added'] .diff-text {
+  color: var(--green);
+}
+
+.diff-line[data-kind='removed'] {
+  background: var(--vscode-diffEditor-removedLineBackground, var(--red-subtle));
+}
+
+.diff-line[data-kind='removed'] .diff-sign,
+.diff-line[data-kind='removed'] .diff-text {
+  color: var(--red);
+}
+
+.diff-gap {
+  padding-left: 4ch;
+  color: var(--text-muted);
 }
