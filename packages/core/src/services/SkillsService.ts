@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { globalDataDir } from '../utils/globalDataDir';
@@ -7,6 +8,19 @@ export const BUILTIN_SKILL_NAMES = ['grilling', 'to-spec', 'improve-codebase-arc
 
 /** Built-in skills that were renamed/removed; their stale seeds are pruned from ~/.ordewell/skills. */
 export const RETIRED_BUILTIN_SKILL_NAMES = ['grill-me'] as const;
+
+/**
+ * SKILL.md hashes of superseded built-ins, for installs seeded before the
+ * seed manifest existed: without a recorded hash, an unedited old seed is
+ * indistinguishable from a user's edit. Seeds written from now on are tracked
+ * by the manifest, so a new built-in revision never needs an entry here.
+ */
+const PRIOR_BUILTIN_HASHES: Readonly<Record<string, readonly string[]>> = {
+  grilling: ['d5d4cb8589fbb4a0f3296bae15033f2297ef682aaf5615a3dee258451f96e5c3'],
+  'improve-codebase-architecture': ['b5154b5e3baca9a5f244634453e83706d742011c31163648c2b8395a2524dd9c'],
+};
+
+const SEED_MANIFEST = '.seeded.json';
 
 export interface SkillMetadata {
   name: string;
@@ -79,6 +93,14 @@ function copyDirSync(src: string, dest: string): void {
   }
 }
 
+function fileHash(file: string): string | undefined {
+  try {
+    return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  } catch {
+    return undefined;
+  }
+}
+
 function readDir(dir: string, source: 'global' | 'local'): SkillInfo[] {
   if (!fs.existsSync(dir)) return [];
   const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -104,21 +126,63 @@ export class SkillsService {
     return path.join(globalDataDir(), 'skills');
   }
 
+  private readSeedManifest(): Record<string, string> {
+    try {
+      const parsed: unknown = JSON.parse(fs.readFileSync(path.join(this.globalDir(), SEED_MANIFEST), 'utf8'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return Object.fromEntries(
+          Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+        );
+      }
+    } catch {
+      // Missing or corrupt: treated as "nothing recorded", which only makes refreshes more conservative.
+    }
+    return {};
+  }
+
+  private recordSeed(name: string, hash: string): void {
+    const manifest = this.readSeedManifest();
+    if (manifest[name] === hash) return;
+    manifest[name] = hash;
+    try {
+      fs.mkdirSync(this.globalDir(), { recursive: true });
+      fs.writeFileSync(path.join(this.globalDir(), SEED_MANIFEST), JSON.stringify(manifest, null, 2));
+    } catch (err) {
+      console.warn(`Could not record seeded skill ${name}: ${String(err)}`);
+    }
+  }
+
+  /** A seed the user never edited: safe to replace with a newer built-in. */
+  private isUntouchedSeed(name: string, currentHash: string | undefined): boolean {
+    if (currentHash === undefined) return false;
+    return this.readSeedManifest()[name] === currentHash || (PRIOR_BUILTIN_HASHES[name] ?? []).includes(currentHash);
+  }
+
   private seed(name: string): boolean {
     const dest = path.join(this.globalDir(), name);
-    if (fs.existsSync(dest)) return false;
+    const exists = fs.existsSync(dest);
     let srcDir: string;
     try {
       srcDir = path.join(builtinSkillsDir(), name);
     } catch (err) {
-      console.warn(`Could not locate built-in skills dir: ${String(err)}`);
+      if (!exists) console.warn(`Could not locate built-in skills dir: ${String(err)}`);
       return false;
     }
     if (!fs.existsSync(srcDir)) {
-      console.warn(`Built-in skill not found in package: ${name}`);
+      if (!exists) console.warn(`Built-in skill not found in package: ${name}`);
       return false;
     }
+    const srcHash = fileHash(path.join(srcDir, 'SKILL.md'));
+    if (exists) {
+      const currentHash = fileHash(path.join(dest, 'SKILL.md'));
+      if (currentHash !== undefined && currentHash === srcHash) {
+        this.recordSeed(name, currentHash);
+        return false;
+      }
+      if (!this.isUntouchedSeed(name, currentHash)) return false;
+    }
     copyDirSync(srcDir, dest);
+    if (srcHash) this.recordSeed(name, srcHash);
     return true;
   }
 
