@@ -2,6 +2,8 @@
 
 **Status:** accepted
 
+*Pending (2026-10-05):* [ADR-0022](0022-ordewell-mcp-server.md) adopts "Ordewell as an MCP server", deferred below, for plan submission and the planner's reads.
+
 Every path into Ordewell's planner runs through an LLM vendor the user must sign
 up for separately. `createAiService` branches on `aiProvider` across 26
 vendor entries, and every one of them resolves an API key. Meanwhile the same
