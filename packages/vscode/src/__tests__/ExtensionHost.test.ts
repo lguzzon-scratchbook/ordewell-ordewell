@@ -7,7 +7,7 @@ import {
   createTask, RunnerRegistry,
   type AiProvider, type DiscoveredModel, type LegacyPlanState,
   type ModelResolver, type PlannerModelMemory, type RunnerInstallation, type RunnerTransport,
-  type Session, type SettingsService,
+  type Session, type SessionDeps, type SettingsService,
 } from '@ordewell/core';
 import { createExtension, type ExtensionServices } from '../ExtensionHost';
 import type { ChatViewProvider } from '../providers/ChatViewProvider';
@@ -216,6 +216,7 @@ function harness(overrides: {
   const config = fakeConfig();
   const session = fakeSession();
   const settings = fakeSettings();
+  const sessionDeps: { current?: SessionDeps } = {};
   const resolver = overrides.modelResolver ?? fakeResolver();
   const installation = overrides.runnerInstallation ?? fakeRunnerInstallation(['claude-code']);
   const pluginRegistry = new RunnerRegistry();
@@ -239,7 +240,7 @@ function harness(overrides: {
     plannerModelMemory: { remember: vi.fn(), recall: vi.fn(() => ({ model: '', effort: '', source: 'default' })) } as unknown as PlannerModelMemory,
     modelResolver: resolver as unknown as ModelResolver,
     chatProvider: chat.provider as unknown as ChatViewProvider,
-    sessionFactory: () => session.session,
+    sessionFactory: (deps) => { sessionDeps.current = deps; return session.session; },
   };
 
   return {
@@ -253,6 +254,7 @@ function harness(overrides: {
     resolver,
     installation,
     services,
+    sessionDeps,
   };
 }
 
@@ -264,6 +266,13 @@ describe('the extension host wires one state, one deps bag and one lifecycle', (
   });
   afterEach(() => {
     fs.rmSync(h.workspace, { recursive: true, force: true });
+  });
+
+  it("hands the session this window's enabled runners, read at each call", async () => {
+    h.settings.getAll.mockReturnValue({ tdd: { enabled: false }, verification: { enabled: false }, runnerTransport: 'structured', enabledRunners: ['opencode'] });
+    await h.config.config.update('enabledRunners', ['claude-code', 'codex']);
+
+    expect(h.sessionDeps.current?.settings().enabledRunners).toEqual(['claude-code', 'codex']);
   });
 
   it('registers the webview, the host commands and the webview listener through the given vscode api', async () => {

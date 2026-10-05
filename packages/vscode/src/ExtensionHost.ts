@@ -153,7 +153,8 @@ export function createExtension(services: ExtensionServices, vscodeApi: typeof v
       handleSessionMessage(msg, managerDeps);
     },
     modelResolver: services.modelResolver,
-    settings: () => sessionRuntimeSettings(services.settingsService.getAll()),
+    // The settings file's runner list is the daemon's; this window's lives in VS Code's own configuration.
+    settings: () => ({ ...sessionRuntimeSettings(services.settingsService.getAll()), enabledRunners: services.config.enabledRunners }),
   });
 
   const planner = new PlannerSelection({

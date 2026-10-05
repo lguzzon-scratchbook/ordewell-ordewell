@@ -1,7 +1,8 @@
 import { createAiService, type IAiService } from './AiService';
 import { applyTaskOps, canMergeTasks, canSplitTask } from './TaskOps';
+import type { TaskQueryCatalog } from './TaskQuery';
 import { validateTaskEdit, type EditCatalog } from './TaskEditValidator';
-import { ConversationEditError, PlannerConversation, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type RewindTarget } from './PlannerConversation';
+import { ConversationEditError, PlannerConversation, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type PlannerSubmission, type RewindTarget } from './PlannerConversation';
 import { forkPlanState, type ForkedDialogue } from './conversationFork';
 import { Planner } from './Planner';
 import { createTaskOrchestrator } from './TaskOrchestrator';
@@ -74,6 +75,8 @@ export interface SessionRuntimeSettings {
   modelAllowlist?: Record<string, string[]>;
   /** Read once as a run starts, never per spawn (ADR-0018, S1). Absent means terminal. */
   runnerTransport?: RunnerTransport;
+  /** Absent means the user never chose, and `config.enabledRunners` (the host's defaults) decides. */
+  enabledRunners?: RunnerId[];
 }
 
 /**
@@ -96,7 +99,12 @@ function lastAttemptDigest(location: TaskLogLocation, taskId: string): string | 
 }
 
 export function sessionRuntimeSettings(settings: UserSettings): SessionRuntimeSettings {
-  return { ...plannerRuntimeToggles(settings), modelAllowlist: settings.modelAllowlist, runnerTransport: settings.runnerTransport };
+  return {
+    ...plannerRuntimeToggles(settings),
+    modelAllowlist: settings.modelAllowlist,
+    runnerTransport: settings.runnerTransport,
+    enabledRunners: settings.enabledRunners,
+  };
 }
 
 /**
@@ -168,10 +176,10 @@ export type SaveSession = (plan: LegacyPlanState, goal: string, workspace: strin
 
 /**
  * Everything a delivery surface constructs to host a session. Structural config
- * (enabledRunners, orchestratorModel, providerModelLists) is snapshotted inside
- * `config` at construction and never re-read from the environment. Runtime
- * settings (tdd, verification) are read live via the `settings` callback so a toggle
- * between generate and execute takes effect.
+ * (orchestratorModel, providerModelLists) is snapshotted inside `config` at
+ * construction and never re-read from the environment. Runtime settings (tdd,
+ * verification, enabled runners) are read live via the `settings` callback so a
+ * toggle between operations takes effect.
  */
 export interface SessionDeps {
   config: IConfig;
@@ -188,7 +196,7 @@ export interface SessionDeps {
   onNotice?: (notice: SessionNotice) => void;
   /** Shared across sessions — sole producer of model catalogs and routing lists. */
   modelResolver: ModelResolver;
-  /** Live runtime settings (tdd, verification). Read at each operation that needs them. */
+  /** Live runtime settings (tdd, verification, enabled runners). Read at each operation that needs them. */
   settings: () => SessionRuntimeSettings;
   /**
    * Host-assigned session id. When set, every persist writes under this id so
@@ -477,17 +485,7 @@ export class Session {
       aiService: () => this.aiService(),
       onProgress: (p) => this.events.progress(p),
       opening: (runners) => this.conversationOpening(runners),
-      catalog: () => {
-        const runners = this.plan?.runners ?? [];
-        return {
-          runners,
-          // Allowlist-filtered: neither the per-turn block nor a read may offer
-          // a model the planner is forbidden to assign.
-          models: filterModelsForPrompt(this.models(), this.allowlist()),
-          modes: this.runnerModesFor(runners),
-          autonomousDefault: this.config.autonomousMode,
-        };
-      },
+      catalog: () => this.catalogOf(this.plan?.runners ?? []),
       tasks: () => this.store.planTasks,
       liveOutput: (taskId, opts) => this.orchestrator.getLiveOutput(taskId, opts),
       hasLiveWork: () => this.hasLiveWork,
@@ -650,6 +648,29 @@ export class Session {
     this.remintSessionId();
   }
 
+  /**
+   * What a planner may assign right now: every enabled runner, its modes, and
+   * its allowlisted models — read as of this call, so a runner enabled or an
+   * allowlist edited since planning started is in it (#69). Discovers a
+   * runner's models the first time it is asked for.
+   */
+  async liveCatalog(): Promise<TaskQueryCatalog> {
+    const runners = this.enabledRunners();
+    this.modelsCache = { ...this.modelsCache, ...await this.modelResolver.modelsForRunners(runners) };
+    return this.catalogOf(runners);
+  }
+
+  private catalogOf(runners: RunnerId[]): TaskQueryCatalog {
+    return {
+      runners,
+      // Allowlist-filtered: neither the per-turn block nor a read may offer
+      // a model the planner is forbidden to assign.
+      models: filterModelsForPrompt(this.models(), this.allowlist()),
+      modes: this.runnerModesFor(runners),
+      autonomousDefault: this.config.autonomousMode,
+    };
+  }
+
   private runnerModesFor(runners: RunnerId[]): Record<RunnerId, RunnerModeInfo[]> {
     return runnerModesFrom(this.registry, runners);
   }
@@ -668,6 +689,11 @@ export class Session {
       runnerModes: this.runnerModesFor(this.plan?.runners ?? []),
       perRunnerAllowlist: this.allowlist(),
     };
+  }
+
+  /** The runners enabled right now — a toggle made since the session was built counts (#69). */
+  private enabledRunners(): RunnerId[] {
+    return this.settingsFn().enabledRunners ?? this.config.enabledRunners;
   }
 
   /**
@@ -765,7 +791,7 @@ export class Session {
     this.goal = goal;
     this.remintSessionId();
     this.beginFreshPlan();
-    const enabled = this.config.enabledRunners;
+    const enabled = this.enabledRunners();
     const chosenRunners = runners.filter((r) => enabled.includes(r));
     if (chosenRunners.length === 0) throw new Error('None of the requested runners are enabled');
 
@@ -817,7 +843,7 @@ export class Session {
     this.goal = this.resolveSkillInvocation(goal);
     this.remintSessionId();
     this.beginFreshPlan();
-    const enabled = this.config.enabledRunners;
+    const enabled = this.enabledRunners();
     const chosenRunners = runners.filter((r) => enabled.includes(r));
     if (chosenRunners.length === 0) throw new Error('None of the requested runners are enabled');
 
@@ -904,6 +930,15 @@ export class Session {
 
   rewindTargets(): RewindTarget[] {
     return this.conversation.rewindTargets();
+  }
+
+  /**
+   * Hand the planner turn in flight a validated plan or a task edit; the turn
+   * commits it as it would the same JSON in the planner's reply. False when
+   * no turn is open.
+   */
+  submitToTurn(submission: PlannerSubmission): boolean {
+    return this.conversation.submit(submission);
   }
 
   /** Whether the planner conversation is live (started and not yet committed to a plan). */
@@ -1099,7 +1134,7 @@ export class Session {
     );
 
     try {
-      const modelsByRunner = await this.modelResolver.modelsForRunners(this.config.enabledRunners);
+      const modelsByRunner = await this.modelResolver.modelsForRunners(this.enabledRunners());
       const runnerModes = this.runnerModesFor(this.plan?.runners ?? ['claude-code']);
       const { modelAllowlist } = this.settingsFn();
 
