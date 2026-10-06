@@ -1,16 +1,27 @@
-import type { McpClientConfig } from '../mcp';
+import { ORDEWELL_MCP_SERVER_NAME, type McpClientConfig } from '../mcp';
+import { prefixedToolNames, type OrdewellToolBinding } from './ordewellBinding';
 
 /**
  * OpenCode names an MCP tool `<server>_<tool>`, and keys its permission rules
  * by that name (checked against 1.18.34).
  */
-export function ordewellToolPrefix(mcp: McpClientConfig): string {
-  return `${mcp.name}_`;
+const NAMES = prefixedToolNames(`${ORDEWELL_MCP_SERVER_NAME}_`);
+
+/** The permission rule that covers every tool of the server. */
+const RULE = NAMES.toolName('*');
+
+/** A 2.x session's permission rule. */
+export interface OpenCodeSessionRule {
+  action: string;
+  resource: string;
+  effect: 'allow' | 'deny' | 'ask';
 }
 
-/** Whether a permission request names one of the injected Ordewell server's tools. */
-export function isOrdewellTool(mcp: McpClientConfig | null | undefined, permission: string | undefined): boolean {
-  return !!mcp && !!permission && permission.startsWith(ordewellToolPrefix(mcp));
+export interface OpenCodeOrdewellBinding extends OrdewellToolBinding<string> {
+  /** The 1.x server's `OPENCODE_CONFIG_CONTENT` with the server added — see {@link mergeOrdewellConfig}. */
+  configContent(existing: string | undefined, mcp: McpClientConfig): string | null;
+  /** The rules a 2.x session is created with so the server's tools never wait on a person (ADR-0022, S3). */
+  sessionRules(): OpenCodeSessionRule[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -34,7 +45,7 @@ function deepMerge(base: Record<string, unknown>, over: Record<string, unknown>)
  * `existing` is not a JSON object — it cannot be merged, and replacing it would
  * silently drop whatever it carried, so the caller runs without the server.
  */
-export function mergeOrdewellConfig(existing: string | undefined, mcp: McpClientConfig): string | null {
+function mergeOrdewellConfig(existing: string | undefined, mcp: McpClientConfig): string | null {
   let base: Record<string, unknown> = {};
   if (existing?.trim()) {
     let parsed: unknown;
@@ -46,7 +57,18 @@ export function mergeOrdewellConfig(existing: string | undefined, mcp: McpClient
   const policy = typeof base.permission === 'string' ? { '*': base.permission } : base.permission;
   const ours = {
     mcp: { [mcp.name]: { type: 'remote', url: mcp.url, headers: mcp.headers, enabled: true } },
-    permission: { [`${ordewellToolPrefix(mcp)}*`]: 'allow' },
+    permission: { [RULE]: 'allow' },
   };
   return JSON.stringify(deepMerge({ ...base, ...(policy === undefined ? {} : { permission: policy }) }, ours));
 }
+
+export const OPENCODE_ORDEWELL: OpenCodeOrdewellBinding = {
+  toolName: NAMES.toolName,
+  toolNames: NAMES.toolNames,
+  /** A permission request's `permission`, which for a tool is its name. */
+  isOrdewellAsk: (permission) => NAMES.hasPrefix(permission),
+  /** `/mcp` lists a server only once it has started connecting, as `pending` until it settles. */
+  attachState: (status) => (status === 'connected' ? 'connected' : status === undefined || status === null || status === 'pending' ? 'pending' : 'failed'),
+  configContent: mergeOrdewellConfig,
+  sessionRules: () => [{ action: RULE, resource: '*', effect: 'allow' }],
+};

@@ -177,8 +177,11 @@ function tool<H, S extends z.ZodObject>(
   };
 }
 
+/** The task tool whose call settles the attempt (ADR-0022, V1). */
+export const TASK_COMPLETE_TOOL = 'task_complete';
+
 export const TASK_TOOLS: readonly McpTool<TaskToolHandler>[] = [
-  tool('task_complete', 'Report that this task has ended, and how. Call it once, as your last action.',
+  tool(TASK_COMPLETE_TOOL, 'Report that this task has ended, and how. Call it once, as your last action.',
     taskCompleteInput, (h) => h.taskComplete?.bind(h)),
   tool('checkpoint', "Ask the user a question and wait for the answer, which is this call's result.",
     checkpointInput, (h) => h.checkpoint?.bind(h)),

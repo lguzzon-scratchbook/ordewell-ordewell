@@ -28,9 +28,7 @@ import { abortScope } from '../../utils/abortScope';
 import { runnerForProvider } from '../ProviderRegistry';
 import { collectResearchContext } from '../ContextCollector';
 import type { AgentAdapter, AgentEvent, AgentProcessDeps, PlannerStartOptions } from './AgentAdapter';
-import { ClaudeCodeAdapter } from './ClaudeCodeAdapter';
-import { CodexAdapter } from './CodexAdapter';
-import { OpenCodeAdapter } from './OpenCodeAdapter';
+import { createPlannerAdapter } from './connectors';
 import { mapAgentTool, normalizeAgentArgs } from './agentTools';
 import { DEFAULT_PLANNER_MODES, type PlannerModes } from '../plannerModes';
 import { mcpClientConfig, type McpCredential, type OrdewellMcpServer } from '../mcp';
@@ -70,15 +68,6 @@ export interface CliAgentAiServiceDeps extends Partial<AgentProcessDeps> {
 interface PlannerTools {
   offer: PlannerToolsOffer;
   systemPrompt: string;
-}
-
-function defaultAdapter(runner: string, deps: AgentProcessDeps): AgentAdapter | null {
-  switch (runner) {
-    case 'claude-code': return new ClaudeCodeAdapter(deps);
-    case 'codex': return new CodexAdapter(deps);
-    case 'opencode': return new OpenCodeAdapter(deps);
-    default: return null;
-  }
 }
 
 /** One completed harness turn, before classification. */
@@ -144,7 +133,7 @@ export class CliAgentAiService implements IAiService {
       isDirectory: deps.isDirectory,
       exists: deps.exists,
     };
-    this.makeAdapter = deps.createAdapter ?? defaultAdapter;
+    this.makeAdapter = deps.createAdapter ?? createPlannerAdapter;
     this.workspaceRoot = deps.workspaceRoot ?? (() => process.cwd());
     this.mcpServer = deps.mcpServer;
   }

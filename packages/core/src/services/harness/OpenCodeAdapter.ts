@@ -7,7 +7,8 @@ import { killTree } from '../../utils/processTree';
 import { workspaceEnvOf } from '../workspaceEnv';
 import { runnerEnv } from './runnerEnv';
 import { OpenCodeV2 } from './OpenCodeV2';
-import { mergeOrdewellConfig } from './openCodeOrdewell';
+import { OPENCODE_ORDEWELL } from './openCodeOrdewell';
+import { awaitAttach } from './ordewellBinding';
 import type { McpClientConfig } from '../mcp';
 import { hunksOf, markedLines } from './fileDiff';
 import {
@@ -310,7 +311,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     // server with no password cannot be spoken to at all.
     const password = randomBytes(24).toString('base64url');
     // The token rides in the server's environment, not its argv (ADR-0022, A5).
-    const ordewellConfig = opts.mcp ? mergeOrdewellConfig(workspaceEnv.OPENCODE_CONFIG_CONTENT ?? process.env.OPENCODE_CONFIG_CONTENT, opts.mcp) : null;
+    const ordewellConfig = opts.mcp ? OPENCODE_ORDEWELL.configContent(workspaceEnv.OPENCODE_CONFIG_CONTENT ?? process.env.OPENCODE_CONFIG_CONTENT, opts.mcp) : null;
     if (opts.mcp && ordewellConfig === null) {
       console.error('[opencode] OPENCODE_CONFIG_CONTENT is not a JSON object, so the Ordewell tools were not injected.');
     }
@@ -923,17 +924,13 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
 
   /** Asks the server, which lists every MCP server it has with the state of its connection. */
   async mcpAttached(): Promise<boolean> {
-    if (!this.ordewell || !this.baseUrl) return false;
-    const deadline = Date.now() + MCP_ATTACH_TIMEOUT_MS;
-    while (Date.now() < deadline && !this.exited) {
+    const ordewell = this.ordewell;
+    if (!ordewell || !this.baseUrl) return false;
+    return awaitAttach(async () => {
+      if (this.exited) return 'failed';
       const servers = await this.json<Record<string, { status?: string } | undefined>>('GET', '/mcp').catch(() => null);
-      const status = servers?.[this.ordewell.name]?.status;
-      if (status === 'connected') return true;
-      // Anything but a connection still in progress will not turn into one.
-      if (status !== undefined && status !== 'pending') return false;
-      await delay(MCP_STATUS_POLL_MS);
-    }
-    return false;
+      return OPENCODE_ORDEWELL.attachState(servers?.[ordewell.name]?.status);
+    }, MCP_ATTACH_TIMEOUT_MS, MCP_STATUS_POLL_MS);
   }
 
   dispose(): void {

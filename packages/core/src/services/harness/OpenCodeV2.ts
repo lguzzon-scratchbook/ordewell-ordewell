@@ -1,6 +1,6 @@
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { AgentEvent, PlannerStartOptions, TaskStartOptions } from './AgentAdapter';
-import { ordewellToolPrefix } from './openCodeOrdewell';
+import { OPENCODE_ORDEWELL, type OpenCodeSessionRule as SessionRule } from './openCodeOrdewell';
 import { hunksOf } from './fileDiff';
 import {
   OpenCodePermissions, autoApproves, delay, interruptAcknowledged, openEventStream, permissionReply, settleTurn, splitModelId, streamTurn,
@@ -23,12 +23,6 @@ const PLANNER_RULES: SessionRule[] = [
 ];
 /** A task asks its user in plain text for now, as it does on every transport. */
 const TASK_RULES: SessionRule[] = [{ action: 'question', resource: '*', effect: 'deny' }];
-
-interface SessionRule {
-  action: string;
-  resource: string;
-  effect: 'allow' | 'deny' | 'ask';
-}
 
 interface V2Model {
   id: string;
@@ -198,7 +192,7 @@ export class OpenCodeV2 {
 
   /** Allow the Ordewell server's tools, so a call never waits on a person (ADR-0022, S3). */
   private ordewellRules(): SessionRule[] {
-    return this.opts.mcp ? [{ action: `${ordewellToolPrefix(this.opts.mcp)}*`, resource: '*', effect: 'allow' }] : [];
+    return this.opts.mcp ? OPENCODE_ORDEWELL.sessionRules() : [];
   }
 
   /** The planner's system prompt rides on the session as an instruction entry — a prompt has no system field. */
