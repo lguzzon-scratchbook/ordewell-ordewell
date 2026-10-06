@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { OpenCodeAdapter } from '../OpenCodeAdapter';
 import type { AgentEvent, AgentProcessDeps } from '../AgentAdapter';
-import { fakeSpawn, openCodeFixture } from '../../__tests__/harnessTestKit';
+import { fakeSpawn, openCodeFixture, sseResponse } from '../../__tests__/harnessTestKit';
 
 /**
  * Replays turns recorded from `opencode serve` 1.18.32 (the fixtures under
@@ -17,19 +17,9 @@ async function replay(name: string): Promise<AgentEvent[]> {
     const path = String(input).replace('http://127.0.0.1:4096', '');
     const method = init?.method ?? 'GET';
     if (path === '/event') {
-      const pending = [...frames];
-      const signal = init?.signal;
-      const reader = {
-        read: () => {
-          if (pending.length) return Promise.resolve({ done: false, value: new TextEncoder().encode(pending.shift()!) });
-          drained();
-          return new Promise<{ done: boolean; value?: Uint8Array }>((resolve) => {
-            if (signal?.aborted) return resolve({ done: true });
-            signal?.addEventListener('abort', () => resolve({ done: true }), { once: true });
-          });
-        },
-      };
-      return { ok: true, status: 200, statusText: 'OK', body: { getReader: () => reader } } as unknown as Response;
+      const { response: events, stream } = sseResponse(init, frames);
+      void stream.drained.then(drained);
+      return events;
     }
     const json = method === 'POST' && path === '/session'
       ? { id: sessionId }

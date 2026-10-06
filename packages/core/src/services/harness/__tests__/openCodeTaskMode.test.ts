@@ -4,7 +4,7 @@ import type { AgentEvent, AgentProcessDeps, AgentStartOptions, TaskStartOptions 
 import type { SpawnFn } from '../../HeadlessRunner';
 import { mcpClientConfig } from '../../mcp';
 import { OPENCODE_MANIFEST } from '../../../plugins/builtin/opencode.manifest';
-import { modeIds, fakeSpawn } from '../../__tests__/harnessTestKit';
+import { modeIds, fakeSpawn, sseResponse, type FakeEventStream } from '../../__tests__/harnessTestKit';
 
 /**
  * OpenCode's task mode (ADR-0018, #55): `opencode serve` driven over HTTP
@@ -24,11 +24,6 @@ interface Recorded {
 
 type Reply = unknown | { status: number; body?: unknown };
 
-/** One open `/event` connection the test pushes frames into. */
-interface EventStream {
-  push(frame: Record<string, unknown>): void;
-}
-
 /**
  * A scripted `opencode serve`. Routes answer by `METHOD /path`; `/event`
  * connections stay open until the adapter aborts them, so frames arrive
@@ -36,7 +31,7 @@ interface EventStream {
  */
 function fakeServer(routes: Record<string, (body: unknown) => Reply | Promise<Reply>> = {}) {
   const requests: Recorded[] = [];
-  const streams: EventStream[] = [];
+  const streams: FakeEventStream[] = [];
   const status: Record<string, { type: string }> = {};
 
   const fetchImpl = async (input: unknown, init?: RequestInit) => {
@@ -47,30 +42,9 @@ function fakeServer(routes: Record<string, (body: unknown) => Reply | Promise<Re
     requests.push({ method, path, authorization: headers.get('authorization'), body });
 
     if (path === '/event') {
-      const queue: Uint8Array[] = [];
-      let wake: (() => void) | null = null;
-      const signal = init?.signal;
-      streams.push({
-        push(frame) {
-          queue.push(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
-          wake?.();
-        },
-      });
-      const reader = {
-        read: async (): Promise<{ done: boolean; value?: Uint8Array }> => {
-          for (;;) {
-            if (signal?.aborted) return { done: true };
-            const next = queue.shift();
-            if (next) return { done: false, value: next };
-            await new Promise<void>((resolve) => {
-              wake = resolve;
-              signal?.addEventListener('abort', () => resolve(), { once: true });
-            });
-            wake = null;
-          }
-        },
-      };
-      return { ok: true, status: 200, statusText: 'OK', body: { getReader: () => reader } } as unknown as Response;
+      const { response, stream } = sseResponse(init);
+      streams.push(stream);
+      return response;
     }
 
     const key = `${method} ${path}`;
@@ -100,7 +74,7 @@ function fakeServer(routes: Record<string, (body: unknown) => Reply | Promise<Re
     requests,
     status,
     /** The `n`th `/event` connection — one per turn — once the adapter has opened it. */
-    async stream(n = 0): Promise<EventStream> {
+    async stream(n = 0): Promise<FakeEventStream> {
       for (let i = 0; i < 200 && streams.length <= n; i++) await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (streams.length <= n) throw new Error(`event stream ${n} never opened`);
       return streams[n];
@@ -530,6 +504,109 @@ describe('OpenCodeAdapter task mode — permissions', () => {
     expect(server.requests.find((r) => r.path === `/session/${SES}/permissions/per_1`)?.body).toEqual({ response: 'reject' });
     stream.push(status('idle'));
     await turn;
+    adapter.dispose();
+  });
+});
+
+describe('OpenCodeAdapter task mode — shared protocol behaviour', () => {
+  it('cancels a request still open when the turn ends, and answers nothing for it', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnWith(server, planMode);
+    stream.push(ask('per_1'));
+    await until(() => events.some((e) => e.type === 'permission_request'));
+    stream.push(status('idle'));
+    await turn;
+
+    expect(events.slice(-2)).toEqual([{ type: 'permission_cancelled', id: 'per_1' }, { type: 'turn_end' }]);
+    expect(adapter.answerPermission('per_1', { decision: 'allow' })).toBe(false);
+    expect(server.requests.some((r) => r.path.startsWith('/permission/'))).toBe(false);
+    adapter.dispose();
+  });
+
+  it('reports an interrupt false when the server exits while it waits', async () => {
+    const server = fakeServer();
+    const { adapter, spawned } = await startTask(server);
+    const turn = adapter.send('do the task', () => {});
+    const stream = await server.stream();
+    stream.push(status('busy'));
+    server.status[SES] = { type: 'busy' };
+    await until(() => server.requests.some((r) => r.path === `/session/${SES}/prompt_async`));
+
+    const acknowledged = adapter.interrupt(5000);
+    await until(() => server.requests.some((r) => r.path === `/session/${SES}/abort`));
+    spawned.processes[0].exit(1);
+    expect(await acknowledged).toBe(false);
+    await turn;
+    adapter.dispose();
+  });
+
+  it('acknowledges an interrupt between turns as soon as the abort is taken', async () => {
+    const server = fakeServer();
+    const { adapter } = await startTask(server);
+    expect(await adapter.interrupt(5000)).toBe(true);
+    expect(server.requests.some((r) => r.method === 'POST' && r.path === `/session/${SES}/abort`)).toBe(true);
+    adapter.dispose();
+  });
+
+  it('reads a frame split across reads, and skips lines that are no frame', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnWith(server, taskStart());
+    const reply = `data: ${JSON.stringify(textPart('prt_1', 'msg_a', 'Split <<<MARKER>>>'))}\n\n`;
+    stream.pushRaw(': keepalive\n\n');
+    stream.pushRaw('event: message\ndata: {not json\n\n');
+    stream.pushRaw(`data: ${JSON.stringify(assistant('msg_a'))}\n\n${reply.slice(0, 20)}`);
+    stream.pushRaw(reply.slice(20, 60));
+    stream.pushRaw(`${reply.slice(60)}data: ${JSON.stringify(status('idle'))}\n\n`);
+    await turn;
+
+    expect(events).toEqual([{ type: 'assistant_text', text: 'Split <<<MARKER>>>' }, { type: 'turn_end' }]);
+    adapter.dispose();
+  });
+
+  it('reports no usage for a call that failed before the provider answered', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnWith(server, taskStart());
+    stream.push(assistant('msg_a', { time: { created: 1, completed: 2 }, cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }));
+    stream.push(status('idle'));
+    await turn;
+
+    expect(events).toEqual([{ type: 'turn_end' }]);
+    adapter.dispose();
+  });
+
+  it('holds a child session\'s frames until the task call names it, then replays them as the subagent\'s', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnWith(server, taskStart());
+    const CHILD = 'ses_child';
+    const taskCall = (state: Record<string, unknown>) => ({
+      type: 'message.part.updated',
+      properties: { sessionID: SES, part: { id: 'prt_t', messageID: 'msg_a', type: 'tool', tool: 'task', callID: 'call_t', state } },
+    });
+    const metadata = { sessionId: CHILD, model: { providerID: 'opencode-go', modelID: 'deepseek-v4-flash' } };
+    stream.push({ type: 'session.created', properties: { info: { id: CHILD, parentID: SES } } });
+    stream.push({ type: 'message.updated', properties: { sessionID: CHILD, info: { id: 'msg_c', role: 'assistant', time: { created: 1, completed: 2 }, tokens: { input: 7, output: 3 } } } });
+    stream.push({
+      type: 'message.part.updated',
+      properties: { sessionID: CHILD, part: { id: 'prt_c', messageID: 'msg_c', type: 'tool', tool: 'read', callID: 'call_c', state: { status: 'completed', input: { filePath: 'a.ts' }, output: 'x' } } },
+    });
+    stream.push(taskCall({ status: 'running', input: { description: 'Look around' }, metadata }));
+    stream.push(taskCall({ status: 'completed', input: { description: 'Look around' }, output: '<task_result>\nfound it\n</task_result>', metadata }));
+    stream.push(status('idle'));
+    await turn;
+
+    expect(events.map((e) => [e.type, 'subagentId' in e ? e.subagentId : undefined])).toEqual([
+      ['tool_call', undefined],
+      ['subagent_started', 'call_t'],
+      ['usage', undefined],
+      ['tool_call', 'call_t'],
+      ['tool_result', 'call_t'],
+      ['subagent_finished', 'call_t'],
+      ['tool_result', undefined],
+      ['turn_end', undefined],
+    ]);
+    expect(events.find((e) => e.type === 'subagent_started')).toEqual({ type: 'subagent_started', subagentId: 'call_t', brief: 'Look around', model: 'opencode-go/deepseek-v4-flash' });
+    expect(events.find((e) => e.type === 'usage')).toMatchObject({ record: { subagentId: 'call_t', inputTokens: 7, outputTokens: 3 } });
+    expect(events.find((e) => e.type === 'subagent_finished')).toMatchObject({ outcome: 'done', digest: 'found it' });
     adapter.dispose();
   });
 });

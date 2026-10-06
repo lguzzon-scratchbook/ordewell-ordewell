@@ -7,17 +7,18 @@ import { killTree } from '../../utils/processTree';
 import { workspaceEnvOf } from '../workspaceEnv';
 import { runnerEnv } from './runnerEnv';
 import { OpenCodeV2 } from './OpenCodeV2';
-import { isOrdewellTool, mergeOrdewellConfig } from './openCodeOrdewell';
+import { mergeOrdewellConfig } from './openCodeOrdewell';
 import type { McpClientConfig } from '../mcp';
 import { hunksOf, markedLines } from './fileDiff';
-import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
+import {
+  OpenCodePermissions, autoApproves, delay, interruptAcknowledged, openEventStream, permissionReply, settleTurn, splitModelId,
+  streamTurn, turnLatch, usageRecord, type PermissionAnswer, type PermissionRequest, type StreamTurn, type TurnLatch,
+} from './openCodeTransport';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { AgentEvent, AgentProcessDeps, AgentStartOptions, PlannerStartOptions, TaskModeAgentAdapter, TaskStartOptions } from './AgentAdapter';
 
 const SERVER_READY_TIMEOUT_MS = 30000;
 const STDERR_TAIL_CHARS = 4000;
-/** How long a turn waits for `/event` before posting anyway. See {@link OpenCodeAdapter.send}. */
-const STREAM_CONNECT_TIMEOUT_MS = 5000;
 /** See {@link OpenCodeAdapter.recoverReply}. */
 const RECOVERY_POLL_INTERVAL_MS = 2000;
 const RECOVERY_TIMEOUT_MS = 900000;
@@ -52,9 +53,6 @@ const DISABLED_TOOLS: Record<string, boolean> = {
  * task's agent decides what it may do.
  */
 const TASK_DISABLED_TOOLS: Record<string, boolean> = { question: false };
-
-/** The `approvals` mode setting that answers every request the way `opencode run --auto` does. */
-const AUTO_APPROVALS = 'auto';
 
 interface OpenCodePart {
   id?: string;
@@ -137,17 +135,10 @@ interface OpenCodeEvent {
  * whether it belongs to the reply — so each is remembered from the frame that
  * announced it.
  */
-interface TurnState {
-  seen: Set<string>;
+interface TurnState extends StreamTurn<OpenCodeEvent> {
   /** Assistant message ids, from `message.updated`. A part of any other message is the user's own words. */
   assistantMessages: Set<string>;
   partTypes: Map<string, string>;
-  /** Reply text parts that have started streaming — see {@link OpenCodeAdapter.onTextDelta}. */
-  textRuns: Map<string, { held: string; lead: string | null }>;
-  /** Child sessions of the planner's, mapped to the `task` call that spawned each once its part names it. */
-  children: Map<string, string | null>;
-  /** Frames from a child session that arrived before its `task` call named it. */
-  heldFrames: Map<string, OpenCodeEvent[]>;
 }
 
 /**
@@ -155,41 +146,19 @@ interface TurnState {
  * so the end is read from the session going idle — the way OpenCode's own
  * `run` reads it (see {@link OpenCodeAdapter.sendTask}).
  */
-interface TaskTurn {
-  /**
-   * This turn's own work has been seen. Until then an idle is the previous
-   * turn's, arriving late, and settles nothing — what upstream's per-turn
-   * counter guards against.
-   */
-  live: boolean;
+interface TaskTurn extends TurnLatch {
   /** The user messages the server echoed back: storing the prompt is not the model working on it. */
   userMessages: Set<string>;
   /** `session.error` for the task's session, in OpenCode's own words. */
   failure: string | null;
   /** The newest assistant message's own error, cleared by a later message that has none. */
   messageError: string | null;
-  done: boolean;
-  finish: () => void;
-  /** Resolves when {@link finish} is called. */
-  ended: Promise<void>;
 }
 
 interface OpenCodeMessageResponse {
   parts?: OpenCodePart[];
   info?: OpenCodeMessageInfo;
   error?: { message?: string } | string;
-}
-
-/**
- * OpenCode addresses a model as `{providerID, modelID}`; discovery and the
- * plan artifact carry the flat `provider/model` id the CLI's `--model` flag
- * takes. Split on the first slash — provider ids never contain one, model ids
- * sometimes do (`openrouter/anthropic/claude-sonnet-4`).
- */
-function splitModelId(id: string): { providerID: string; modelID: string } | null {
-  const slash = id.indexOf('/');
-  if (slash <= 0 || slash === id.length - 1) return null;
-  return { providerID: id.slice(0, slash), modelID: id.slice(slash + 1) };
 }
 
 /**
@@ -230,33 +199,6 @@ function flatModelId(providerID: string | undefined, modelID: string | undefined
   return providerID && modelID ? `${providerID}/${modelID}` : undefined;
 }
 
-/**
- * OpenCode's `input` counts only the uncached prompt — cache reads and writes
- * sit beside it, as with Anthropic ({@link partedPromptUsage}): in the
- * recordings `tokens.total` is input + output + both cache counts. Its `output`
- * excludes `reasoning` (a recorded reply with text reports output 0 beside
- * reasoning 127), and reasoning is billed as output, so it is counted as output.
- */
-function usageRecord(info: OpenCodeMessageInfo, subagentId?: string): UsageRecord | null {
-  const tokens = info.tokens;
-  if (!tokens) return null;
-  const prompt = partedPromptUsage({ uncached: tokens.input, cacheRead: tokens.cache?.read, cacheWrite: tokens.cache?.write });
-  const outputTokens = (tokens.output ?? 0) + (tokens.reasoning ?? 0);
-  // A call that failed before the provider answered reports all zeros. That
-  // is no measurement, and a zero prompt would read as an empty context.
-  if ((prompt.inputTokens ?? 0) + outputTokens === 0) return null;
-  const record: UsageRecord = { source: 'opencode', ...prompt, outputTokens };
-  const model = flatModelId(info.providerID, info.modelID);
-  if (model) record.model = model;
-  // OpenCode prices a call itself, from its model catalog, so a reported 0
-  // means a free model or one the catalog has no price for. Those cannot be
-  // told apart, so 0 is left unreported: a ledger may not claim a bill of
-  // nothing.
-  if (typeof info.cost === 'number' && info.cost > 0) record.reportedCost = { amount: info.cost, currency: 'USD' };
-  if (subagentId) record.subagentId = subagentId;
-  return record;
-}
-
 /** The subagent's report without the `<task>` envelope the tool wraps it in. */
 function taskDigest(output: string): string {
   const inner = output.match(/<task_result>\n?([\s\S]*?)\n?<\/task_result>/);
@@ -286,25 +228,8 @@ function editDiff(tool: string, state: OpenCodePart['state']): string {
   return tool === 'write' && exists === false && typeof content === 'string' ? markedLines(content, '+') : '';
 }
 
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
-    signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
-  });
-}
-
 function newTurnState(): TurnState {
-  return { seen: new Set(), assistantMessages: new Set(), partTypes: new Map(), textRuns: new Map(), children: new Map(), heldFrames: new Map() };
-}
-
-/** OpenCode's three answers to a permission request, from Ordewell's three (ADR-0018, A1). */
-function permissionReply(decision: ApprovalDecision): { reply: 'once' | 'always' | 'reject'; message?: string } {
-  if (decision.decision === 'allow') return { reply: 'once' };
-  if (decision.decision === 'allowForTask') return { reply: 'always' };
-  const note = decision.note?.trim();
-  // With a message OpenCode hands the note to the agent as a correction; without one it is a bare refusal.
-  return note ? { reply: 'reject', message: note } : { reply: 'reject' };
+  return { ...streamTurn<OpenCodeEvent>(), assistantMessages: new Set(), partTypes: new Map() };
 }
 
 /**
@@ -341,15 +266,15 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   private readonly processEnded = new Promise<void>((resolve) => { this.markEnded = resolve; });
   private planner: PlannerStartOptions | null = null;
   private task: TaskStartOptions | null = null;
-  /** Whether this turn has already emitted reply text — see {@link emitPart}. */
-  private turnHasText = false;
   /** The last assistant message already settled — the baseline {@link recoverReply} measures a new reply against. */
   private lastAssistantId: string | null = null;
   private taskTurn: TaskTurn | null = null;
   /** An abort was posted during the current task turn, so the idle that follows ends it as interrupted. */
   private interruptRequested = false;
-  /** A task's requests waiting for an answer, by request id, with the session that asked. */
-  private readonly openPermissions = new Map<string, string>();
+  private readonly permissions = new OpenCodePermissions(
+    (id, sessionId, decision) => this.replyPermission(id, sessionId, permissionReply(decision, 'reply')),
+    () => this.ordewell,
+  );
   /** Set once the server turns out to speak the 2.x API, which then owns the session. */
   private v2: OpenCodeV2 | null = null;
   /** The Ordewell server this process was configured with; null when none was given or its config could not be merged. */
@@ -499,7 +424,6 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     if (this.task) return this.sendTask(this.task, message, onEvent, signal, onActivity);
 
     const turn = newTurnState();
-    this.turnHasText = false;
     const closeStream = await this.openStream(turn, onEvent, onActivity);
 
     try {
@@ -548,11 +472,8 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     onActivity?: () => void,
   ): Promise<void> {
     const state = newTurnState();
-    this.turnHasText = false;
     this.interruptRequested = false;
-    let markDone: () => void = () => {};
-    const ended = new Promise<void>((resolve) => { markDone = resolve; });
-    const turn: TaskTurn = { live: false, userMessages: new Set(), failure: null, messageError: null, done: false, ended, finish: () => { turn.done = true; markDone(); } };
+    const turn: TaskTurn = Object.assign(turnLatch(), { userMessages: new Set<string>(), failure: null, messageError: null });
     this.taskTurn = turn;
     const closeStream = await this.openStream(state, onEvent, onActivity);
     const poll = new AbortController();
@@ -576,25 +497,19 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
       }
 
       void this.pollStatus(turn, poll.signal);
-      const aborted = new Promise<void>((resolve) => {
-        if (signal?.aborted) resolve();
-        signal?.addEventListener('abort', () => resolve(), { once: true });
-      });
-      await Promise.race([turn.ended, aborted, this.processEnded]);
-      if (signal?.aborted) { this.dispose(); return; }
-      if (!turn.done) { onEvent({ type: 'error', message: this.exitMessage() }); return; }
-
-      await this.readBack(state, onEvent);
-      // OpenCode asks only mid-turn and blocks on the answer, so a request
-      // still open now was dropped by the abort that ended the turn.
-      for (const id of [...this.openPermissions.keys()]) {
-        this.openPermissions.delete(id);
-        onEvent({ type: 'permission_cancelled', id });
-      }
-      const failure = turn.failure ?? turn.messageError;
-      if (this.interruptRequested) onEvent({ type: 'turn_end', interrupted: true });
-      else if (failure) onEvent({ type: 'error', message: failure });
-      else onEvent({ type: 'turn_end' });
+      const settled = await settleTurn(turn, {
+        signal,
+        processEnded: this.processEnded,
+        exitMessage: () => this.exitMessage(),
+        readBack: () => this.readBack(state, onEvent),
+        permissions: this.permissions,
+        outcome: () => {
+          const failure = turn.failure ?? turn.messageError;
+          if (this.interruptRequested) return { type: 'turn_end', interrupted: true };
+          return failure ? { type: 'error', message: failure } : { type: 'turn_end' };
+        },
+      }, onEvent);
+      if (!settled) this.dispose();
     } finally {
       this.taskTurn = null;
       poll.abort();
@@ -702,11 +617,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     // Whatever the turn had shown so far, the idle after an abort is its end.
     turn.live = true;
     void this.confirmIdle(turn);
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); timer.unref?.(); });
-    const acknowledged = await Promise.race([turn.ended.then(() => true), this.processEnded.then(() => false), timedOut]);
-    clearTimeout(timer);
-    return acknowledged;
+    return interruptAcknowledged(turn, this.processEnded, timeoutMs);
   }
 
   onProcessExit(listener: (code: number) => void): void {
@@ -715,12 +626,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
 
   answerPermission(id: string, decision: ApprovalDecision): boolean {
     if (this.v2) return this.process ? this.v2.answerPermission(id, decision) : false;
-    const sessionId = this.openPermissions.get(id);
-    if (sessionId === undefined || !this.process) return false;
-    this.openPermissions.delete(id);
-    void this.replyPermission(id, sessionId, permissionReply(decision))
-      .catch(() => { /* a server that forgot the request will not hang on it either */ });
-    return true;
+    return this.process ? this.permissions.answer(id, decision) : false;
   }
 
   /**
@@ -815,17 +721,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     const id = part.id ?? part.callID ?? '';
 
     if (part.type === 'text' && part.text && !subagentId) {
-      if (seen.has(`text:${id}`)) return;
-      seen.add(`text:${id}`);
-      // Some models open a message with a text part of nothing but newlines
-      // before calling a tool. It says nothing, and as a paragraph of its own
-      // it would push the real reply down by a blank one.
-      if (!part.text.trim()) return;
-      // One message can carry text on both sides of a tool call. Concatenated
-      // raw they run together, so each part after the first opens a paragraph.
-      const lead = turn.textRuns.get(id)?.lead ?? (this.turnHasText ? '\n\n' : '');
-      onEvent({ type: 'assistant_text', text: `${lead}${part.text}` });
-      this.turnHasText = true;
+      turn.text.complete(id, part.text, onEvent);
       return;
     }
     if (part.type === 'reasoning' && part.text) {
@@ -871,14 +767,12 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   private trackSubagent(part: OpenCodePart, callId: string, turn: TurnState, onEvent: (e: AgentEvent) => void): void {
     const state = part.state;
     const child = state?.metadata?.sessionId;
-    if (child && !turn.children.get(child)) {
+    const held = child ? turn.children.adopt(child, callId) : null;
+    if (held) {
       const input = state?.input ?? {};
       const brief = typeof input.description === 'string' ? input.description : typeof input.prompt === 'string' ? input.prompt : '';
       const model = flatModelId(state?.metadata?.model?.providerID, state?.metadata?.model?.modelID);
       onEvent({ type: 'subagent_started', subagentId: callId, brief, ...(model ? { model } : {}) });
-      turn.children.set(child, callId);
-      const held = turn.heldFrames.get(child) ?? [];
-      turn.heldFrames.delete(child);
       for (const frame of held) this.onFrame(frame, turn, onEvent);
     }
     const status = state?.status;
@@ -899,7 +793,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   private countUsage(info: OpenCodeMessageInfo, turn: TurnState, onEvent: (e: AgentEvent) => void, subagentId?: string): void {
     if (info.role !== 'assistant' || !info.id || !info.time?.completed || turn.seen.has(`usage:${info.id}`)) return;
     turn.seen.add(`usage:${info.id}`);
-    const record = usageRecord(info, subagentId);
+    const record = usageRecord(info.tokens, { model: flatModelId(info.providerID, info.modelID), cost: info.cost, subagentId });
     if (record) onEvent({ type: 'usage', record });
   }
 
@@ -912,33 +806,26 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     const props = frame.properties;
     if (!props) return;
     if (frame.type === 'session.created') {
-      if (props.info?.parentID === this.sessionId && props.info.id && !turn.children.has(props.info.id)) turn.children.set(props.info.id, null);
+      if (props.info?.parentID === this.sessionId && props.info.id) turn.children.created(props.info.id);
       return;
     }
     const session = props.sessionID;
-    if (session && session !== this.sessionId && !turn.children.has(session)) return;
+    if (session && session !== this.sessionId && !turn.children.follows(session)) return;
     if (session === this.sessionId && this.taskTurn) this.followTaskTurn(frame, this.taskTurn);
     // Answered before anything waits on the `task` call naming its session: a
     // subagent's request blocks the turn exactly as the session's own does.
     if (frame.type === 'permission.asked' || frame.type === 'permission.v2.asked') {
-      if (this.task) this.askPermission(props, turn.seen, onEvent);
-      else this.denyPermission(props, turn.seen, onEvent);
+      this.onPermissionAsked(props, turn.seen, onEvent);
       return;
     }
-    // Answered by OpenCode itself: a reject also refuses the session's other
-    // requests and an `always` grants the ones it covers.
     if (frame.type === 'permission.replied' || frame.type === 'permission.v2.replied') {
-      const id = props.requestID;
-      if (id && this.openPermissions.delete(id)) onEvent({ type: 'permission_cancelled', id });
+      this.permissions.withdraw(props.requestID, onEvent);
       return;
     }
     let subagentId: string | undefined;
     if (session && session !== this.sessionId) {
-      const owner = turn.children.get(session);
-      if (!owner) {
-        turn.heldFrames.set(session, [...(turn.heldFrames.get(session) ?? []), frame]);
-        return;
-      }
+      const owner = turn.children.claim(session, frame);
+      if (!owner) return;
       subagentId = owner;
     }
 
@@ -952,7 +839,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
       if (!props.messageID || !turn.assistantMessages.has(props.messageID)) return;
       const type = turn.partTypes.get(props.partID);
       if (type === 'reasoning') onEvent({ type: 'thinking_delta', text: props.delta, subagentId });
-      else if (type === 'text' && !subagentId) this.onTextDelta(props.partID, props.delta, turn, onEvent);
+      else if (type === 'text' && !subagentId) turn.text.delta(props.partID, props.delta, onEvent);
       return;
     }
     const part = props.part;
@@ -971,149 +858,46 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     if (part.time?.end) this.emitPart(part, turn, onEvent, subagentId);
   }
 
-  /**
-   * Stream one piece of a reply text part. The part's paragraph break goes out
-   * with its first visible delta, so the deltas add up to exactly the text the
-   * completed part then re-sends; a part that is only whitespace so far is
-   * held back, for the reason {@link emitPart} drops one.
-   */
-  private onTextDelta(partId: string, delta: string, turn: TurnState, onEvent: (e: AgentEvent) => void): void {
-    if (turn.seen.has(`text:${partId}`)) return;
-    const run = turn.textRuns.get(partId) ?? { held: '', lead: null };
-    turn.textRuns.set(partId, run);
-    if (run.lead !== null) {
-      onEvent({ type: 'assistant_text_delta', text: delta });
-      return;
-    }
-    run.held += delta;
-    if (!run.held.trim()) return;
-    run.lead = this.turnHasText ? '\n\n' : '';
-    this.turnHasText = true;
-    onEvent({ type: 'assistant_text_delta', text: `${run.lead}${run.held}` });
-  }
-
-  /**
-   * Deny one permission request (T1). OpenCode blocks the turn until the
-   * request is answered, so this must answer — `reject` rather than a silent
-   * drop, which is the same "absent answer is a denial" invariant ADR-0008
-   * states for Ordewell's own tools. The refusal is announced so the timeline
-   * shows the planner reaching for something it may not have.
-   */
-  private denyPermission(ask: OpenCodePermissionAsk, seen: Set<string>, onEvent: (e: AgentEvent) => void): void {
+  /** A planner's request is refused (T1); a task's is answered at once or left open for a card. */
+  private onPermissionAsked(ask: OpenCodePermissionAsk, seen: Set<string>, onEvent: (e: AgentEvent) => void): void {
     const id = ask.id;
-    if (!id || seen.has(`perm:${id}`)) return;
-    seen.add(`perm:${id}`);
-    // The planner's own submission path, which the allow rule should already
-    // have settled: the one request it may not be refused (ADR-0022, S3).
-    if (isOrdewellTool(this.ordewell, permissionName(ask))) {
-      void this.replyPermission(id, ask.sessionID ?? this.sessionId ?? '', { reply: 'once' }).catch(() => { /* see answerPermission */ });
-      return;
-    }
-    onEvent({ type: 'permission_request', id, name: permissionName(ask), detail: permissionDetail(ask) });
-    void this.replyPermission(id, ask.sessionID ?? this.sessionId ?? '', { reply: 'reject' })
-      .catch(() => { /* a server that forgot the request will not hang on it either */ });
-  }
-
-  /**
-   * A task's request. Under a mode whose manifest sets `approvals: auto` —
-   * `build`, which the terminal transport runs with `--auto` — it is answered
-   * at once with what `run --auto` answers, so the same plan behaves the same
-   * on both transports (ADR-0001), and announced already decided so the log
-   * still shows it. Any other mode leaves it open for an approval card.
-   */
-  private askPermission(ask: OpenCodePermissionAsk, seen: Set<string>, onEvent: (e: AgentEvent) => void): void {
-    const id = ask.id;
-    if (!id || seen.has(`perm:${id}`)) return;
-    seen.add(`perm:${id}`);
+    if (!id) return;
     const sessionId = ask.sessionID ?? this.sessionId ?? '';
-    const request: Extract<AgentEvent, { type: 'permission_request' }> = {
+    const name = permissionName(ask);
+    if (!this.task) {
+      this.permissions.refuse({ type: 'permission_request', id, name, detail: permissionDetail(ask) }, sessionId, seen, onEvent);
+      return;
+    }
+    const request: PermissionRequest = {
       type: 'permission_request',
       id,
-      name: permissionName(ask),
+      name,
       detail: permissionDetail(ask),
       input: ask.metadata ?? {},
       // The patterns `always` would grant: the runner's own offer, and the only grounds for "Allow for this task".
       ...(ask.always?.length ? { suggestions: ask.always } : {}),
       ...(ask.tool?.callID ? { toolUseId: ask.tool.callID } : {}),
     };
-    // Whatever the mode, a completion that waited on a person would hold the verdict hostage (ADR-0022, S3).
-    if (isOrdewellTool(this.ordewell, request.name) || this.task?.flags.modeSettings.approvals === AUTO_APPROVALS) {
-      onEvent({ ...request, decided: { decision: 'allow' } });
-      void this.replyPermission(id, sessionId, { reply: 'once' }).catch(() => { /* see answerPermission */ });
-      return;
-    }
-    this.openPermissions.set(id, sessionId);
-    onEvent(request);
+    this.permissions.ask(request, sessionId, autoApproves(this.task), seen, onEvent);
   }
 
   /**
    * `POST /permission/:id/reply` is the current answer. The per-session path
    * it replaced is tried only when a server too old to know the new one 404s.
    */
-  private async replyPermission(id: string, sessionId: string, reply: { reply: 'once' | 'always' | 'reject'; message?: string }): Promise<void> {
+  private async replyPermission(id: string, sessionId: string, reply: { reply: PermissionAnswer; message?: string }): Promise<void> {
     const response = await this.request('POST', `/permission/${id}/reply`, reply);
     if (response.status !== 404) return;
     await this.request('POST', `/session/${sessionId}/permissions/${id}`, { response: reply.reply });
   }
 
-  /**
-   * Open `/event` for one turn and wait until it is connected. The stream
-   * stopped being best-effort the moment permission answers moved onto it: a
-   * request raised before we connect is one nobody answers, and the turn
-   * hangs on it. Waiting is bounded so a server that never opens `/event`
-   * still gets its turn.
-   */
-  private async openStream(turn: TurnState, onEvent: (e: AgentEvent) => void, onActivity?: () => void): Promise<() => Promise<void>> {
-    const streamAbort = new AbortController();
-    let connected: () => void = () => {};
-    const streamReady = new Promise<void>((resolve) => { connected = resolve; });
-    const live = this.streamEvents(streamAbort.signal, (frame) => this.onFrame(frame, turn, onEvent), connected, onActivity);
-    await Promise.race([streamReady, new Promise<void>((r) => { const t = setTimeout(r, STREAM_CONNECT_TIMEOUT_MS); t.unref?.(); })]);
-    return async () => {
-      streamAbort.abort();
-      await live.catch(() => { /* the stream is best-effort */ });
-    };
-  }
-
-  /**
-   * Server-sent events from `/event`: the turn's live text, reasoning, tool
-   * activity and usage, and the only channel permission requests arrive on —
-   * so the stream is load-bearing for {@link denyPermission}.
-   */
-  private async streamEvents(
-    signal: AbortSignal,
-    onFrame: (frame: OpenCodeEvent) => void,
-    onConnected: () => void,
-    onActivity?: () => void,
-  ): Promise<void> {
-    const response = await this.deps.fetch(`${this.baseUrl}/event`, { signal, headers: this.headers() }).catch(() => null);
-    const body = response?.body;
-    if (!body) { onConnected(); return; }
-    onConnected();
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    for (;;) {
-      const { done, value } = await reader.read().catch(() => ({ done: true, value: undefined }));
-      if (done) return;
-      // Any bytes at all mean the server is still talking, independent of
-      // whether this chunk resolves into a part this adapter forwards —
-      // the same gap that made Claude Code's watchdog false-positive on
-      // filtered subagent output, closed here before it can recur.
-      onActivity?.();
-      buffer += decoder.decode(value, { stream: true });
-      let newline: number;
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (!line.startsWith('data:')) continue;
-        try {
-          onFrame(JSON.parse(line.slice(5).trim()) as OpenCodeEvent);
-        } catch {
-          // A partial or unrecognized frame costs one event, not the turn.
-        }
-      }
-    }
+  /** `/event` for one turn — see {@link openEventStream}. Load-bearing for {@link onPermissionAsked}. */
+  private openStream(turn: TurnState, onEvent: (e: AgentEvent) => void, onActivity?: () => void): Promise<() => Promise<void>> {
+    return openEventStream<OpenCodeEvent>(
+      (signal) => this.deps.fetch(`${this.baseUrl}/event`, { signal, headers: this.headers() }),
+      (frame) => this.onFrame(frame, turn, onEvent),
+      onActivity,
+    );
   }
 
   private async json<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T | null> {

@@ -5,7 +5,7 @@ import { fakeConfig, fakeFileSystem } from '../../testing';
 import type { IConfig } from '../../interfaces/IConfig';
 import type { ConversationRequest } from '../AiService';
 import type { ResearchProgress, ResearchStep } from '../../models/Task';
-import { fakeSpawn, fixture, openCodeFixture, planJson, scriptedAdapter, type FakeSpawnOptions, type ScriptedReply } from './harnessTestKit';
+import { fakeSpawn, fixture, openCodeFixture, planJson, scriptedAdapter, sseResponse, type FakeSpawnOptions, type ScriptedReply } from './harnessTestKit';
 import type { AgentEvent } from '../harness/AgentAdapter';
 import { addPlannerUsage, plannerContextFill } from '../../models/Usage';
 import { TurnStream } from '../replyStream';
@@ -947,18 +947,7 @@ describe('CliAgentAiService — OpenCode', () => {
       const body = routes(url, init);
       if (url.endsWith('/event')) {
         if (!sseFrames) return { ok: true, status: 200, statusText: 'OK', body: null } as unknown as Response;
-        const pending = [...sseFrames];
-        const signal = init?.signal;
-        const reader = {
-          read: () => (pending.length
-            ? Promise.resolve({ done: false, value: new TextEncoder().encode(pending.shift()!) })
-            // Idle until the turn ends and aborts the stream, as a live server is.
-            : new Promise<{ done: boolean; value?: Uint8Array }>((resolve) => {
-              if (signal?.aborted) return resolve({ done: true });
-              signal?.addEventListener('abort', () => resolve({ done: true }), { once: true });
-            })),
-        };
-        return { ok: true, status: 200, statusText: 'OK', body: { getReader: () => reader } } as unknown as Response;
+        return sseResponse(init, sseFrames).response;
       }
       return {
         ok: true,

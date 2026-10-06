@@ -253,7 +253,7 @@ export function scriptedAdapter(turns: AgentEvent[][], agentId = 'claude-code'):
  * One recorded OpenCode turn. OpenCode answers over HTTP rather than stdio, so
  * a turn is two recordings, not one transcript: the `/event` frames the server
  * pushed while the turn ran, and the settled response to the message POST.
- * Frames come back SSE-encoded, ready to hand to a fake `/event` body.
+ * Frames come back SSE-encoded, ready to hand to {@link sseResponse}.
  */
 export function openCodeFixture(name: string): { sessionId: string; frames: string[]; response: { info: { id: string; sessionID: string } } } {
   const dir = join(__dirname, 'fixtures', 'harness', 'opencode');
@@ -263,6 +263,58 @@ export function openCodeFixture(name: string): { sessionId: string; frames: stri
     .filter((line) => line.trim())
     .map((line) => `data: ${line}\n\n`);
   return { sessionId: response.info.sessionID, frames, response };
+}
+
+/** One open server-sent-events connection a test feeds. */
+export interface FakeEventStream {
+  /** Queue one frame as one read, SSE-encoded the way OpenCode sends it. */
+  push(frame: unknown): void;
+  /** Queue raw text as one read: half a frame, several at once, or a line that is no frame at all. */
+  pushRaw(chunk: string): void;
+  /** Resolves the first time a read finds nothing queued — everything queued so far has been read. */
+  readonly drained: Promise<void>;
+}
+
+/**
+ * A streaming `fetch` response, as OpenCode's `/event` (1.x) and `/api/event`
+ * (2.x) answer: `chunks` are read first, then each read waits for a push, and
+ * the stream ends once the request's signal aborts — the way a live server
+ * stays open until the adapter closes it.
+ */
+export function sseResponse(init?: RequestInit, chunks: string[] = []): { response: Response; stream: FakeEventStream } {
+  const queue = [...chunks];
+  const signal = init?.signal ?? undefined;
+  const encoder = new TextEncoder();
+  let wake: (() => void) | null = null;
+  let markDrained: () => void = () => {};
+  const drained = new Promise<void>((resolve) => { markDrained = resolve; });
+  const enqueue = (chunk: string) => {
+    queue.push(chunk);
+    wake?.();
+  };
+  const reader = {
+    read: async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+      for (;;) {
+        if (signal?.aborted) return { done: true };
+        const next = queue.shift();
+        if (next !== undefined) return { done: false, value: encoder.encode(next) };
+        markDrained();
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+          signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        wake = null;
+      }
+    },
+  };
+  return {
+    response: { ok: true, status: 200, statusText: 'OK', body: { getReader: () => reader } } as unknown as Response,
+    stream: {
+      push: (frame) => enqueue(`data: ${JSON.stringify(frame)}\n\n`),
+      pushRaw: enqueue,
+      drained,
+    },
+  };
 }
 
 /** Every mode a runner offers, so a per-mode test cannot quietly run over none. */

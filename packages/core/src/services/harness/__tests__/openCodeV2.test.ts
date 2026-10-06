@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { OpenCodeAdapter } from '../OpenCodeAdapter';
 import type { AgentEvent, AgentProcessDeps, AgentStartOptions, TaskStartOptions } from '../AgentAdapter';
 import type { SpawnFn } from '../../HeadlessRunner';
-import { fakeSpawn } from '../../__tests__/harnessTestKit';
+import { fakeSpawn, sseResponse, type FakeEventStream } from '../../__tests__/harnessTestKit';
 
 /**
  * OpenCode 2.x (`opencode serve`, the `/api` surface), recorded at v2.0.22: a
@@ -23,13 +23,9 @@ interface Recorded {
 
 type Reply = unknown | { status: number; body?: unknown };
 
-interface EventStream {
-  push(frame: Record<string, unknown>): void;
-}
-
 function fakeServer(routes: Record<string, (body: unknown) => Reply | Promise<Reply>> = {}) {
   const requests: Recorded[] = [];
-  const streams: EventStream[] = [];
+  const streams: FakeEventStream[] = [];
 
   const fetchImpl = async (input: unknown, init?: RequestInit) => {
     const path = String(input).replace(BASE, '');
@@ -39,30 +35,9 @@ function fakeServer(routes: Record<string, (body: unknown) => Reply | Promise<Re
     requests.push({ method, path, authorization: headers.get('authorization'), body });
 
     if (path === '/api/event') {
-      const queue: Uint8Array[] = [];
-      let wake: (() => void) | null = null;
-      const signal = init?.signal;
-      streams.push({
-        push(frame) {
-          queue.push(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
-          wake?.();
-        },
-      });
-      const reader = {
-        read: async (): Promise<{ done: boolean; value?: Uint8Array }> => {
-          for (;;) {
-            if (signal?.aborted) return { done: true };
-            const next = queue.shift();
-            if (next) return { done: false, value: next };
-            await new Promise<void>((resolve) => {
-              wake = resolve;
-              signal?.addEventListener('abort', () => resolve(), { once: true });
-            });
-            wake = null;
-          }
-        },
-      };
-      return { ok: true, status: 200, statusText: 'OK', body: { getReader: () => reader } } as unknown as Response;
+      const { response, stream } = sseResponse(init);
+      streams.push(stream);
+      return response;
     }
 
     const key = `${method} ${path}`;
@@ -92,7 +67,7 @@ function fakeServer(routes: Record<string, (body: unknown) => Reply | Promise<Re
   return {
     fetch: fetchImpl as unknown as typeof fetch,
     requests,
-    async stream(n = 0): Promise<EventStream> {
+    async stream(n = 0): Promise<FakeEventStream> {
       for (let i = 0; i < 200 && streams.length <= n; i++) await new Promise<void>((resolve) => setTimeout(resolve, 0));
       if (streams.length <= n) throw new Error(`event stream ${n} never opened`);
       return streams[n];
@@ -136,7 +111,7 @@ async function start(server: ReturnType<typeof fakeServer>, opts: AgentStartOpti
   for (let i = 0; i < 50 && spawned.processes.length === 0; i++) await Promise.resolve();
   spawned.processes[0].emitStdout(`server listening on ${BASE}\n`);
   await started;
-  return { adapter, env: envs[0] };
+  return { adapter, spawned, env: envs[0] };
 }
 
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -511,6 +486,145 @@ describe('OpenCode 2.x — subagents', () => {
     await turn;
 
     expect(events).toEqual([{ type: 'turn_end' }]);
+    adapter.dispose();
+  });
+});
+
+describe('OpenCode 2.x — shared protocol behaviour', () => {
+  async function turnOf(server: ReturnType<typeof fakeServer>, opts: AgentStartOptions = taskStart()) {
+    const { adapter, spawned } = await start(server, opts);
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    return { adapter, spawned, events, turn, stream };
+  }
+
+  it('cancels a request still open when the turn ends, and answers nothing for it', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnOf(server, taskStart({ flags: { permissionMode: 'plan', modeSettings: {} } }));
+    stream.push(permissionAsk('per_1'));
+    await until(() => events.some((e) => e.type === 'permission_request'));
+    stream.push(succeeded());
+    await turn;
+
+    expect(events.slice(-2)).toEqual([{ type: 'permission_cancelled', id: 'per_1' }, { type: 'turn_end' }]);
+    expect(adapter.answerPermission('per_1', { decision: 'allow' })).toBe(false);
+    expect(server.requests.some((r) => r.path.endsWith('/permission/per_1/reply'))).toBe(false);
+    adapter.dispose();
+  });
+
+  it('reports an interrupt false when OpenCode never acknowledges it', async () => {
+    const server = fakeServer({ [`POST /api/session/${SES}/interrupt`]: () => ({ interrupted: true }) });
+    const { adapter, turn, stream } = await turnOf(server);
+
+    expect(await adapter.interrupt(50)).toBe(false);
+    stream.push(succeeded());
+    await turn;
+    adapter.dispose();
+  });
+
+  it('reports an interrupt false when the server exits while it waits', async () => {
+    const server = fakeServer({ [`POST /api/session/${SES}/interrupt`]: () => ({ interrupted: true }) });
+    const { adapter, spawned, turn } = await turnOf(server);
+
+    const acknowledged = adapter.interrupt(5000);
+    await until(() => server.requests.some((r) => r.path.endsWith('/interrupt')));
+    spawned.processes[0].exit(1);
+    expect(await acknowledged).toBe(false);
+    await turn;
+    adapter.dispose();
+  });
+
+  it('acknowledges an interrupt between turns as soon as it is taken', async () => {
+    const server = fakeServer({ [`POST /api/session/${SES}/interrupt`]: () => ({ interrupted: true }) });
+    const { adapter } = await start(server);
+    expect(await adapter.interrupt(5000)).toBe(true);
+    adapter.dispose();
+  });
+
+  it('reads a frame split across reads, and skips lines that are no frame', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnOf(server);
+    const reply = `data: ${JSON.stringify(frame('session.text.ended', { assistantMessageID: MSG, ordinal: 0, text: 'Split <<<MARKER>>>' }))}\n\n`;
+    stream.pushRaw(': keepalive\n\n');
+    stream.pushRaw('event: message\ndata: {not json\n\n');
+    stream.pushRaw(reply.slice(0, 20));
+    stream.pushRaw(reply.slice(20, 60));
+    stream.pushRaw(`${reply.slice(60)}data: ${JSON.stringify(succeeded())}\n\n`);
+    await turn;
+
+    expect(events).toEqual([{ type: 'assistant_text', text: 'Split <<<MARKER>>>' }, { type: 'turn_end' }]);
+    adapter.dispose();
+  });
+
+  it('reports no usage for a failed call, no cost for a free one, and a subagent\'s usage as its own', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnOf(server, plannerStart());
+    stream.push(frame('session.step.failed', { assistantMessageID: 'msg_z', cost: 0, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }));
+    stream.push(frame('session.step.ended', { assistantMessageID: MSG, cost: 0, tokens: { input: 5, output: 2 } }));
+    for (const f of call('call_task', { description: 'Look around' }, 'subagent')) stream.push(f);
+    stream.push({ type: 'session.created', data: { sessionID: CHILD, parentID: SES } });
+    stream.push(frame('session.step.ended', { assistantMessageID: 'msg_child', cost: 0.002, tokens: { input: 7, output: 3 } }, CHILD));
+    stream.push(frame('session.tool.progress', { assistantMessageID: MSG, id: 'call_task', metadata: { sessionID: CHILD, status: 'running' } }));
+    stream.push(succeeded());
+    await turn;
+
+    expect(events.filter((e) => e.type === 'usage')).toEqual([
+      { type: 'usage', record: { source: 'opencode', inputTokens: 5, outputTokens: 2 } },
+      { type: 'usage', record: { source: 'opencode', inputTokens: 7, outputTokens: 3, reportedCost: { amount: 0.002, currency: 'USD' }, subagentId: 'call_task' } },
+    ]);
+    adapter.dispose();
+  });
+});
+
+describe('OpenCode 2.x — file edits', () => {
+  // The edit recorded in fixtures/harness/opencode/edit.events.jsonl, as 2.x reports it:
+  // the result's `metadata.files` carries each file's patch beside the text the model reads.
+  const patch = 'Index: sum.js\n===================================================================\n--- sum.js\n+++ sum.js\n@@ -1,3 +1,3 @@\n export function sum(a, b) {\n-  return a - b;\n+  return a + b;\n }\n';
+
+  it('reports an edit as its diff\'s hunks, as it does on 1.x, and a write with no diff as its text', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('fix sum', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    for (const f of call('call_edit', { path: 'sum.js', oldString: '  return a - b;', newString: '  return a + b;' }, 'edit')) stream.push(f);
+    stream.push(frame('session.tool.success', {
+      assistantMessageID: MSG, id: 'call_edit', executed: false,
+      content: [{ type: 'text', text: 'Edited sum.js (1 replacement)' }],
+      metadata: { files: [{ file: 'sum.js', patch, additions: 1, deletions: 1, status: 'modified' }] },
+    }));
+    for (const f of call('call_write', { path: 'hello.txt', content: 'hi\n' }, 'write')) stream.push(f);
+    stream.push(frame('session.tool.success', { assistantMessageID: MSG, id: 'call_write', executed: false, content: [{ type: 'text', text: 'Created file successfully: hello.txt' }] }));
+    stream.push(succeeded());
+    await turn;
+
+    const results = events.flatMap((e) => (e.type === 'tool_result' ? [[e.name, e.output]] : []));
+    expect(results).toEqual([
+      ['edit', '@@ -1,3 +1,3 @@\n export function sum(a, b) {\n-  return a - b;\n+  return a + b;\n }\n'],
+      ['write', 'Created file successfully: hello.txt'],
+    ]);
+    adapter.dispose();
+  });
+
+  it('keeps a failed edit\'s error, whatever its metadata says', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('fix sum', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    for (const f of call('call_edit', { path: 'sum.js' }, 'edit')) stream.push(f);
+    stream.push(frame('session.tool.failed', { assistantMessageID: MSG, id: 'call_edit', error: { type: 'unknown', message: 'Could not find oldString in sum.js.' }, metadata: { files: [{ patch }] } }));
+    stream.push(succeeded());
+    await turn;
+
+    expect(events.find((e) => e.type === 'tool_result')).toMatchObject({ output: 'Could not find oldString in sum.js.', success: false });
     adapter.dispose();
   });
 });
