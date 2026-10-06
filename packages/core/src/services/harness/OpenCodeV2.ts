@@ -1,10 +1,11 @@
-import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { AgentEvent, PlannerStartOptions, TaskStartOptions } from './AgentAdapter';
-import { isOrdewellTool, ordewellToolPrefix } from './openCodeOrdewell';
-
-/** How long a turn waits for `/api/event` before posting anyway. */
-const STREAM_CONNECT_TIMEOUT_MS = 5000;
+import { ordewellToolPrefix } from './openCodeOrdewell';
+import { hunksOf } from './fileDiff';
+import {
+  OpenCodePermissions, autoApproves, delay, interruptAcknowledged, openEventStream, permissionReply, settleTurn, splitModelId, streamTurn,
+  turnLatch, usageRecord, type OpenCodeTokens, type PermissionRequest, type StreamTurn, type TurnLatch,
+} from './openCodeTransport';
 /** A turn's end is also read from `/api/session/active`, behind the stream, which can drop a frame. */
 const ACTIVE_POLL_INTERVAL_MS = 1000;
 /** Polls that find the session inactive before any frame of this turn arrived, after which it is taken as already over. */
@@ -23,8 +24,6 @@ const PLANNER_RULES: SessionRule[] = [
 /** A task asks its user in plain text for now, as it does on every transport. */
 const TASK_RULES: SessionRule[] = [{ action: 'question', resource: '*', effect: 'deny' }];
 
-const AUTO_APPROVALS = 'auto';
-
 interface SessionRule {
   action: string;
   resource: string;
@@ -35,13 +34,6 @@ interface V2Model {
   id: string;
   providerID: string;
   variant?: string;
-}
-
-interface V2Tokens {
-  input?: number;
-  output?: number;
-  reasoning?: number;
-  cache?: { read?: number; write?: number };
 }
 
 interface V2ToolContent {
@@ -66,13 +58,14 @@ interface V2Frame {
     error?: { type?: string; message?: string };
     model?: { id?: string; providerID?: string };
     cost?: number;
-    tokens?: V2Tokens;
+    tokens?: OpenCodeTokens;
     requestID?: string;
     action?: string;
     resources?: string[];
     save?: string[];
     source?: { type?: string; messageID?: string; id?: string };
-    metadata?: { sessionID?: string; status?: string };
+    /** On a delegating call's progress, the child session it runs; on a file edit's success, the diff of each file it changed. */
+    metadata?: { sessionID?: string; status?: string; files?: unknown };
   };
 }
 
@@ -96,49 +89,24 @@ export interface OpenCodeV2Host {
   exitMessage(): string;
 }
 
-interface TurnState {
-  seen: Set<string>;
+interface TurnState extends StreamTurn<V2Frame> {
   /** Tool call id → tool name, from `session.tool.input.started`; `tool.called` carries no name. */
   toolNames: Map<string, string>;
   /** Assistant message id → the model that ran it, from `session.step.started`. */
   stepModels: Map<string, string>;
-  textRuns: Map<string, { held: string; lead: string | null }>;
-  /** Child sessions of this session, mapped to the tool call that spawned each once it names it. */
-  children: Map<string, string | null>;
   /** A delegation call's own id and its brief, remembered so `subagent_started` can name it. */
   briefs: Map<string, string>;
-  /** Frames from a child session that arrived before the call that owns it was named. */
-  heldFrames: Map<string, V2Frame[]>;
   /** Assistant messages whose text the stream delivered, so a read-back does not repeat them. */
   streamedMessages: Set<string>;
 }
 
-interface Turn {
-  /** This turn's own work has begun, so an end frame or an idle session is this turn's. */
-  live: boolean;
-  done: boolean;
+interface Turn extends TurnLatch {
   outcome: 'succeeded' | 'failed' | 'interrupted' | null;
   failure: string | null;
-  finish: () => void;
-  ended: Promise<void>;
 }
 
 function newTurnState(): TurnState {
-  return { seen: new Set(), toolNames: new Map(), stepModels: new Map(), textRuns: new Map(), children: new Map(), briefs: new Map(), heldFrames: new Map(), streamedMessages: new Set() };
-}
-
-function splitModelId(id: string): { providerID: string; id: string } | null {
-  const slash = id.indexOf('/');
-  if (slash <= 0 || slash === id.length - 1) return null;
-  return { providerID: id.slice(0, slash), id: id.slice(slash + 1) };
-}
-
-function delay(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
-    signal?.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
-  });
+  return { ...streamTurn<V2Frame>(), toolNames: new Map(), stepModels: new Map(), briefs: new Map(), streamedMessages: new Set() };
 }
 
 function contentText(content: V2ToolContent[] | undefined): string {
@@ -151,12 +119,20 @@ function subagentDigest(output: string): string {
   return inner ? inner[1] : output;
 }
 
-function permissionReply(decision: ApprovalDecision): { decision: 'once' | 'always' | 'reject'; message?: string } {
-  if (decision.decision === 'allow') return { decision: 'once' };
-  if (decision.decision === 'allowForTask') return { decision: 'always' };
-  const note = decision.note?.trim();
-  // With a message OpenCode hands the note to the agent as a correction; without one it is a bare refusal.
-  return note ? { decision: 'reject', message: note } : { decision: 'reject' };
+/**
+ * What a file edit changed, beside the text the model reads ("Edited sum.js
+ * (1 replacement)"): the hunks of each file diff its result carries, in the
+ * shape {@link OpenCodeAdapter} gives 1.x's. A write's result carries none, so
+ * it keeps its text.
+ */
+function editDiff(metadata: NonNullable<V2Frame['data']>['metadata']): string {
+  const files = metadata?.files;
+  if (!Array.isArray(files)) return '';
+  const patches = (files as unknown[]).flatMap((file) => {
+    const patch = typeof file === 'object' && file !== null ? (file as { patch?: unknown }).patch : undefined;
+    return typeof patch === 'string' && patch ? [patch] : [];
+  });
+  return patches.length ? hunksOf(patches.join('\n')) : '';
 }
 
 /**
@@ -174,10 +150,11 @@ export class OpenCodeV2 {
   private model: V2Model | null = null;
   private agent: string;
   private turn: Turn | null = null;
-  private turnHasText = false;
   private interruptRequested = false;
-  /** A task's requests waiting for an answer, by request id, with the session that asked. */
-  private readonly openPermissions = new Map<string, string>();
+  private readonly permissions = new OpenCodePermissions(
+    (id, sessionId, decision) => this.replyPermission(id, sessionId, decision),
+    () => this.opts.mcp,
+  );
 
   constructor(
     private host: OpenCodeV2Host,
@@ -187,7 +164,7 @@ export class OpenCodeV2 {
     this.agent = opts.kind === 'task' ? opts.flags.permissionMode : 'plan';
     const split = opts.model ? splitModelId(opts.model) : null;
     const variant = opts.kind === 'task' ? opts.flags.effort : opts.effort;
-    if (split) this.model = { ...split, ...(variant ? { variant } : {}) };
+    if (split) this.model = { providerID: split.providerID, id: split.modelID, ...(variant ? { variant } : {}) };
   }
 
   nativeSessionId(): string | null { return this.sessionId; }
@@ -238,11 +215,8 @@ export class OpenCodeV2 {
       return;
     }
     const state = newTurnState();
-    this.turnHasText = false;
     this.interruptRequested = false;
-    let markDone: () => void = () => {};
-    const ended = new Promise<void>((resolve) => { markDone = resolve; });
-    const turn: Turn = { live: false, done: false, outcome: null, failure: null, ended, finish: () => { turn.done = true; markDone(); } };
+    const turn: Turn = Object.assign(turnLatch(), { outcome: null, failure: null });
     this.turn = turn;
     const closeStream = await this.openStream(state, turn, onEvent, onActivity);
     const poll = new AbortController();
@@ -257,23 +231,19 @@ export class OpenCodeV2 {
       }
 
       void this.pollActive(turn, poll.signal);
-      const aborted = new Promise<void>((resolve) => {
-        if (signal?.aborted) resolve();
-        signal?.addEventListener('abort', () => resolve(), { once: true });
-      });
-      await Promise.race([turn.ended, aborted, this.host.processEnded]);
-      if (signal?.aborted) return;
-      if (!turn.done) { onEvent({ type: 'error', message: this.host.exitMessage() }); return; }
-
-      await this.readBack(state, onEvent);
-      // OpenCode asks only mid-turn and blocks on the answer, so a request still open now was dropped by the abort that ended the turn.
-      for (const id of [...this.openPermissions.keys()]) {
-        this.openPermissions.delete(id);
-        onEvent({ type: 'permission_cancelled', id });
-      }
-      if (turn.outcome === 'interrupted' || this.interruptRequested) onEvent({ type: 'turn_end', interrupted: true });
-      else if (turn.outcome === 'failed') onEvent({ type: 'error', message: turn.failure ?? 'OpenCode reported that the turn failed.' });
-      else onEvent({ type: 'turn_end' });
+      // An aborted turn is left to the owning adapter, which disposes of the server.
+      await settleTurn(turn, {
+        signal,
+        processEnded: this.host.processEnded,
+        exitMessage: () => this.host.exitMessage(),
+        readBack: () => this.readBack(state, onEvent),
+        permissions: this.permissions,
+        outcome: () => {
+          if (turn.outcome === 'interrupted' || this.interruptRequested) return { type: 'turn_end', interrupted: true };
+          if (turn.outcome === 'failed') return { type: 'error', message: turn.failure ?? 'OpenCode reported that the turn failed.' };
+          return { type: 'turn_end' };
+        },
+      }, onEvent);
     } finally {
       this.turn = null;
       poll.abort();
@@ -330,7 +300,7 @@ export class OpenCodeV2 {
     for (const message of [...own].reverse()) {
       if (message.type !== 'assistant' || !message.id || state.streamedMessages.has(message.id)) continue;
       (message.content ?? []).forEach((part, index) => {
-        if (part.type === 'text' && part.text) this.emitText(`${message.id}:readback:${index}`, part.text, state, onEvent);
+        if (part.type === 'text' && part.text) state.text.complete(`${message.id}:readback:${index}`, part.text, onEvent);
       });
     }
   }
@@ -346,66 +316,20 @@ export class OpenCodeV2 {
     const response = await this.host.json<{ interrupted?: boolean }>('POST', `/api/session/${this.sessionId}/interrupt`).catch(() => null);
     if (!response) return false;
     if (!turn || turn.done) return true;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); timer.unref?.(); });
-    const acknowledged = await Promise.race([turn.ended.then(() => true), this.host.processEnded.then(() => false), timedOut]);
-    clearTimeout(timer);
-    return acknowledged;
+    return interruptAcknowledged(turn, this.host.processEnded, timeoutMs);
   }
 
   answerPermission(id: string, decision: ApprovalDecision): boolean {
-    const sessionId = this.openPermissions.get(id);
-    if (sessionId === undefined) return false;
-    this.openPermissions.delete(id);
-    void this.replyPermission(id, sessionId, permissionReply(decision))
-      .catch(() => { /* a server that forgot the request will not hang on it either */ });
-    return true;
+    return this.permissions.answer(id, decision);
   }
 
-  private async replyPermission(id: string, sessionId: string, reply: { decision: 'once' | 'always' | 'reject'; message?: string }): Promise<void> {
-    await this.host.request('POST', `/api/session/${sessionId}/permission/${id}/reply`, reply);
+  private async replyPermission(id: string, sessionId: string, decision: ApprovalDecision): Promise<void> {
+    await this.host.request('POST', `/api/session/${sessionId}/permission/${id}/reply`, permissionReply(decision, 'decision'));
   }
 
-  private async openStream(state: TurnState, turn: Turn, onEvent: (e: AgentEvent) => void, onActivity?: () => void): Promise<() => Promise<void>> {
-    const streamAbort = new AbortController();
-    let connected: () => void = () => {};
-    const ready = new Promise<void>((resolve) => { connected = resolve; });
-    const live = this.streamEvents(streamAbort.signal, (frame) => this.onFrame(frame, state, turn, onEvent), connected, onActivity);
-    // Permission answers ride this stream, so a request raised before it connects is one nobody answers.
-    // Waiting is bounded so a server that never opens it still gets its turn.
-    await Promise.race([ready, new Promise<void>((r) => { const t = setTimeout(r, STREAM_CONNECT_TIMEOUT_MS); t.unref?.(); })]);
-    return async () => {
-      streamAbort.abort();
-      await live.catch(() => { /* the stream is best-effort */ });
-    };
-  }
-
-  private async streamEvents(signal: AbortSignal, onFrame: (frame: V2Frame) => void, onConnected: () => void, onActivity?: () => void): Promise<void> {
-    const response = await this.host.openEvents(signal).catch(() => null);
-    const body = response?.body;
-    if (!body) { onConnected(); return; }
-    onConnected();
-    const reader = body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    for (;;) {
-      const { done, value } = await reader.read().catch(() => ({ done: true, value: undefined }));
-      if (done) return;
-      // Any bytes mean the server is still talking, whether or not the chunk becomes an event.
-      onActivity?.();
-      buffer += decoder.decode(value, { stream: true });
-      let newline: number;
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline).trim();
-        buffer = buffer.slice(newline + 1);
-        if (!line.startsWith('data:')) continue;
-        try {
-          onFrame(JSON.parse(line.slice(5).trim()) as V2Frame);
-        } catch {
-          // A partial or unrecognized frame costs one event, not the turn.
-        }
-      }
-    }
+  /** `/api/event` for one turn — see {@link openEventStream}. */
+  private openStream(state: TurnState, turn: Turn, onEvent: (e: AgentEvent) => void, onActivity?: () => void): Promise<() => Promise<void>> {
+    return openEventStream<V2Frame>((signal) => this.host.openEvents(signal), (frame) => this.onFrame(frame, state, turn, onEvent), onActivity);
   }
 
   /**
@@ -416,13 +340,13 @@ export class OpenCodeV2 {
     const data = frame.data;
     if (!data || !frame.type) return;
     if (frame.type === 'session.created') {
-      if (data.parentID && data.parentID === this.sessionId && data.sessionID && !state.children.has(data.sessionID)) state.children.set(data.sessionID, null);
+      if (data.parentID && data.parentID === this.sessionId && data.sessionID) state.children.created(data.sessionID);
       return;
     }
     const session = data.sessionID;
     if (!session) return;
     const isChild = session !== this.sessionId;
-    if (isChild && !state.children.has(session)) return;
+    if (isChild && !state.children.follows(session)) return;
 
     if (!isChild) {
       if (frame.type === 'session.execution.started') { turn.live = true; return; }
@@ -438,23 +362,18 @@ export class OpenCodeV2 {
     // Answered before anything waits on the delegating call naming its session: a subagent's
     // request blocks the turn exactly as the session's own does.
     if (frame.type === 'permission.asked') {
-      if (this.role === 'task') this.askPermission(data, session, state, onEvent);
-      else this.denyPermission(data, session, state, onEvent);
+      this.onPermissionAsked(data, session, state, onEvent);
       return;
     }
     if (frame.type === 'permission.replied') {
-      const id = data.requestID;
-      if (id && this.openPermissions.delete(id)) onEvent({ type: 'permission_cancelled', id });
+      this.permissions.withdraw(data.requestID, onEvent);
       return;
     }
 
     let subagentId: string | undefined;
     if (isChild) {
-      const owner = state.children.get(session);
-      if (!owner) {
-        state.heldFrames.set(session, [...(state.heldFrames.get(session) ?? []), frame]);
-        return;
-      }
+      const owner = state.children.claim(session, frame);
+      if (!owner) return;
       subagentId = owner;
     }
     this.onContentFrame(frame, data, state, turn, onEvent, subagentId);
@@ -478,12 +397,12 @@ export class OpenCodeV2 {
       }
       case 'session.text.delta':
         // A subagent's text is its report to its caller, not the reply; the delegating call's result carries it.
-        if (!subagentId && data.delta) this.onTextDelta(`${message}:${data.ordinal ?? 0}`, data.delta, state, onEvent);
+        if (!subagentId && data.delta) state.text.delta(`${message}:${data.ordinal ?? 0}`, data.delta, onEvent);
         return;
       case 'session.text.ended':
         if (subagentId || !data.text) return;
         if (message) state.streamedMessages.add(message);
-        this.emitText(`${message}:${data.ordinal ?? 0}`, data.text, state, onEvent);
+        state.text.complete(`${message}:${data.ordinal ?? 0}`, data.text, onEvent);
         return;
       case 'session.tool.input.started':
         if (data.id && data.name) state.toolNames.set(data.id, data.name);
@@ -509,7 +428,7 @@ export class OpenCodeV2 {
         if (!id || state.seen.has(`result:${id}`)) return;
         state.seen.add(`result:${id}`);
         const success = frame.type === 'session.tool.success';
-        const output = success ? contentText(data.content) : data.error?.message ?? data.error?.type ?? '';
+        const output = success ? editDiff(data.metadata) || contentText(data.content) : data.error?.message ?? data.error?.type ?? '';
         onEvent({ type: 'tool_result', id, name: state.toolNames.get(id) ?? 'tool', output, success, subagentId });
         if (!subagentId) this.finishChild(id, success, output, state, onEvent);
         return;
@@ -525,71 +444,28 @@ export class OpenCodeV2 {
   private adoptChild(data: NonNullable<V2Frame['data']>, state: TurnState, onEvent: (e: AgentEvent) => void, turn: Turn): void {
     const child = data.metadata?.sessionID;
     const callId = data.id;
-    if (!child || !callId || state.children.get(child)) return;
+    const held = child && callId ? state.children.adopt(child, callId) : null;
+    if (!held || !callId) return;
     const model = state.stepModels.get(data.assistantMessageID ?? '');
     onEvent({ type: 'subagent_started', subagentId: callId, brief: state.briefs.get(callId) ?? '', ...(model ? { model } : {}) });
-    state.children.set(child, callId);
-    const held = state.heldFrames.get(child) ?? [];
-    state.heldFrames.delete(child);
     for (const frame of held) this.onFrame(frame, state, turn, onEvent);
   }
 
   private finishChild(callId: string, success: boolean, output: string, state: TurnState, onEvent: (e: AgentEvent) => void): void {
-    if (![...state.children.values()].includes(callId)) return;
+    if (!state.children.owns(callId)) return;
     onEvent({ type: 'subagent_finished', subagentId: callId, outcome: success ? 'done' : 'failed', digest: subagentDigest(output) });
   }
 
   /** One model call's usage, once, when its step ends. Zeros mean the call failed before the provider answered. */
   private countUsage(data: NonNullable<V2Frame['data']>, state: TurnState, onEvent: (e: AgentEvent) => void, subagentId?: string): void {
     const message = data.assistantMessageID;
-    const tokens = data.tokens;
-    if (!message || !tokens || state.seen.has(`usage:${message}`)) return;
+    if (!message || !data.tokens || state.seen.has(`usage:${message}`)) return;
     state.seen.add(`usage:${message}`);
-    const prompt = partedPromptUsage({ uncached: tokens.input, cacheRead: tokens.cache?.read, cacheWrite: tokens.cache?.write });
-    // Reasoning is billed as output, and OpenCode reports it beside the output count rather than inside it.
-    const outputTokens = (tokens.output ?? 0) + (tokens.reasoning ?? 0);
-    if ((prompt.inputTokens ?? 0) + outputTokens === 0) return;
-    const record: UsageRecord = { source: 'opencode', ...prompt, outputTokens };
-    const model = state.stepModels.get(message);
-    if (model) record.model = model;
-    // OpenCode prices a call itself, so 0 is a free model or one its catalog cannot price — not a bill of nothing.
-    if (typeof data.cost === 'number' && data.cost > 0) record.reportedCost = { amount: data.cost, currency: 'USD' };
-    if (subagentId) record.subagentId = subagentId;
-    onEvent({ type: 'usage', record });
+    const record = usageRecord(data.tokens, { model: state.stepModels.get(message), cost: data.cost, subagentId });
+    if (record) onEvent({ type: 'usage', record });
   }
 
-  /** One complete reply text, once. A message can carry text on both sides of a tool call, so each run after the first opens a paragraph. */
-  private emitText(id: string, text: string, state: TurnState, onEvent: (e: AgentEvent) => void): void {
-    if (state.seen.has(`text:${id}`)) return;
-    state.seen.add(`text:${id}`);
-    // Some models open a message with text of nothing but newlines before calling a tool; it says nothing.
-    if (!text.trim()) return;
-    const lead = state.textRuns.get(id)?.lead ?? (this.turnHasText ? '\n\n' : '');
-    onEvent({ type: 'assistant_text', text: `${lead}${text}` });
-    this.turnHasText = true;
-  }
-
-  /**
-   * Stream one piece of a reply text. The paragraph break goes out with the
-   * first visible delta, so the deltas add up to exactly the text the completed
-   * run then re-sends; a run that is only whitespace so far is held back.
-   */
-  private onTextDelta(id: string, delta: string, state: TurnState, onEvent: (e: AgentEvent) => void): void {
-    if (state.seen.has(`text:${id}`)) return;
-    const run = state.textRuns.get(id) ?? { held: '', lead: null };
-    state.textRuns.set(id, run);
-    if (run.lead !== null) {
-      onEvent({ type: 'assistant_text_delta', text: delta });
-      return;
-    }
-    run.held += delta;
-    if (!run.held.trim()) return;
-    run.lead = this.turnHasText ? '\n\n' : '';
-    this.turnHasText = true;
-    onEvent({ type: 'assistant_text_delta', text: `${run.lead}${run.held}` });
-  }
-
-  private permissionRequest(ask: NonNullable<V2Frame['data']>): Extract<AgentEvent, { type: 'permission_request' }> | null {
+  private permissionRequest(ask: NonNullable<V2Frame['data']>): PermissionRequest | null {
     const id = ask.id;
     if (!id) return null;
     const scope = (ask.resources ?? []).join(', ');
@@ -605,42 +481,11 @@ export class OpenCodeV2 {
     };
   }
 
-  /**
-   * Deny one planner request. OpenCode blocks the turn until it is answered, so
-   * this must answer: `reject` rather than a silent drop is the "absent answer
-   * is a denial" invariant ADR-0008 states. The refusal is announced so the
-   * timeline shows the planner reaching for something it may not have.
-   */
-  private denyPermission(ask: NonNullable<V2Frame['data']>, session: string, state: TurnState, onEvent: (e: AgentEvent) => void): void {
+  /** A planner's request is refused; a task's is answered at once or left open for a card. */
+  private onPermissionAsked(ask: NonNullable<V2Frame['data']>, session: string, state: TurnState, onEvent: (e: AgentEvent) => void): void {
     const request = this.permissionRequest(ask);
-    if (!request || state.seen.has(`perm:${request.id}`)) return;
-    state.seen.add(`perm:${request.id}`);
-    if (isOrdewellTool(this.opts.mcp, request.name)) {
-      void this.replyPermission(request.id, session, { decision: 'once' }).catch(() => { /* see answerPermission */ });
-      return;
-    }
-    onEvent(request);
-    void this.replyPermission(request.id, session, { decision: 'reject' })
-      .catch(() => { /* see answerPermission */ });
-  }
-
-  /**
-   * A task's request. Under a mode whose manifest sets `approvals: auto` it is
-   * answered at once with what `opencode run --auto` answers, so the same plan
-   * behaves the same on both transports (ADR-0001), and announced already
-   * decided so the log still shows it. Any other mode leaves it open for an
-   * approval card.
-   */
-  private askPermission(ask: NonNullable<V2Frame['data']>, session: string, state: TurnState, onEvent: (e: AgentEvent) => void): void {
-    const request = this.permissionRequest(ask);
-    if (!request || state.seen.has(`perm:${request.id}`)) return;
-    state.seen.add(`perm:${request.id}`);
-    if (isOrdewellTool(this.opts.mcp, request.name) || (this.opts.kind === 'task' && this.opts.flags.modeSettings.approvals === AUTO_APPROVALS)) {
-      onEvent({ ...request, decided: { decision: 'allow' } });
-      void this.replyPermission(request.id, session, { decision: 'once' }).catch(() => { /* see answerPermission */ });
-      return;
-    }
-    this.openPermissions.set(request.id, session);
-    onEvent(request);
+    if (!request) return;
+    if (this.role !== 'task') this.permissions.refuse(request, session, state.seen, onEvent);
+    else this.permissions.ask(request, session, this.opts.kind === 'task' && autoApproves(this.opts), state.seen, onEvent);
   }
 }

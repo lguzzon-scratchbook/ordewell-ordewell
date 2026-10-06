@@ -578,3 +578,53 @@ describe('OpenCode 2.x — shared protocol behaviour', () => {
     adapter.dispose();
   });
 });
+
+describe('OpenCode 2.x — file edits', () => {
+  // The edit recorded in fixtures/harness/opencode/edit.events.jsonl, as 2.x reports it:
+  // the result's `metadata.files` carries each file's patch beside the text the model reads.
+  const patch = 'Index: sum.js\n===================================================================\n--- sum.js\n+++ sum.js\n@@ -1,3 +1,3 @@\n export function sum(a, b) {\n-  return a - b;\n+  return a + b;\n }\n';
+
+  it('reports an edit as its diff\'s hunks, as it does on 1.x, and a write with no diff as its text', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('fix sum', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    for (const f of call('call_edit', { path: 'sum.js', oldString: '  return a - b;', newString: '  return a + b;' }, 'edit')) stream.push(f);
+    stream.push(frame('session.tool.success', {
+      assistantMessageID: MSG, id: 'call_edit', executed: false,
+      content: [{ type: 'text', text: 'Edited sum.js (1 replacement)' }],
+      metadata: { files: [{ file: 'sum.js', patch, additions: 1, deletions: 1, status: 'modified' }] },
+    }));
+    for (const f of call('call_write', { path: 'hello.txt', content: 'hi\n' }, 'write')) stream.push(f);
+    stream.push(frame('session.tool.success', { assistantMessageID: MSG, id: 'call_write', executed: false, content: [{ type: 'text', text: 'Created file successfully: hello.txt' }] }));
+    stream.push(succeeded());
+    await turn;
+
+    const results = events.flatMap((e) => (e.type === 'tool_result' ? [[e.name, e.output]] : []));
+    expect(results).toEqual([
+      ['edit', '@@ -1,3 +1,3 @@\n export function sum(a, b) {\n-  return a - b;\n+  return a + b;\n }\n'],
+      ['write', 'Created file successfully: hello.txt'],
+    ]);
+    adapter.dispose();
+  });
+
+  it('keeps a failed edit\'s error, whatever its metadata says', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('fix sum', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+    for (const f of call('call_edit', { path: 'sum.js' }, 'edit')) stream.push(f);
+    stream.push(frame('session.tool.failed', { assistantMessageID: MSG, id: 'call_edit', error: { type: 'unknown', message: 'Could not find oldString in sum.js.' }, metadata: { files: [{ patch }] } }));
+    stream.push(succeeded());
+    await turn;
+
+    expect(events.find((e) => e.type === 'tool_result')).toMatchObject({ output: 'Could not find oldString in sum.js.', success: false });
+    adapter.dispose();
+  });
+});
