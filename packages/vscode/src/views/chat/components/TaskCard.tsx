@@ -76,7 +76,7 @@ interface TaskCardProps {
   onExpandedChange?: (expanded: boolean) => void;
 }
 
-export const STATUS_BADGE: Record<TaskStatusKind, { label: string; cls: string }> = {
+const STATUS_BADGE: Record<TaskStatusKind, { label: string; cls: string }> = {
   done: { label: 'Done', cls: 'status-completed' },
   failed: { label: 'Failed', cls: 'status-failed' },
   running: { label: 'Running', cls: 'status-running' },
