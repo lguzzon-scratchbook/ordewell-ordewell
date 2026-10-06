@@ -1,3 +1,4 @@
+import { approvalLabel } from '@ordewell/core/plan-utils';
 import type { TaskLogStatus } from '../../shared/taskLogProtocol';
 
 export type TaskLogStateKind = 'approval' | 'working' | 'waiting' | 'checkpoint' | 'done' | 'failed' | 'idle';
@@ -16,9 +17,8 @@ export interface TaskLogState {
 export function taskLogState(
   status: Pick<TaskLogStatus, 'working' | 'awaitingReason' | 'awaitingApproval' | 'planStatus' | 'lastTurnEnd'>,
 ): TaskLogState {
-  if (status.awaitingApproval > 0) {
-    return { kind: 'approval', label: status.awaitingApproval > 1 ? `Waiting for approval (${status.awaitingApproval})` : 'Waiting for approval' };
-  }
+  const approvals = approvalLabel(status.awaitingApproval);
+  if (approvals) return { kind: 'approval', label: approvals };
   if (status.working) return { kind: 'working', label: 'Working' };
   switch (status.awaitingReason) {
     case 'checkpoint': return { kind: 'checkpoint', label: 'Waiting at a checkpoint' };

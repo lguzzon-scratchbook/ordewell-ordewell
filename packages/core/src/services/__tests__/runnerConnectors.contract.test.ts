@@ -3,7 +3,7 @@ import { CONNECTORS } from '../harness/connectors';
 import type { AgentEvent, AgentStartOptions } from '../harness/AgentAdapter';
 import { CliAgentAiService } from '../harness/CliAgentAiService';
 import { OrdewellMcpServer, PLANNER_TOOLS, TASK_TOOLS, mcpClientConfig } from '../mcp';
-import { providerForRunner } from '../ProviderRegistry';
+import { CLI_PROVIDERS, providerForRunner, runnerForProvider } from '../ProviderRegistry';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { resolveTaskRunnerFlags } from '../../plugins/resolveArgs';
 import { fakeConfig, fakeFileSystem } from '../../testing';
@@ -52,6 +52,10 @@ afterEach(async () => {
 it('has a fake for every connector and a runner name for every connector that takes the tools', () => {
   expect(Object.keys(FAKE_RUNNERS).sort()).toEqual(Object.keys(CONNECTORS).sort());
   expect(Object.keys(RUNNER_NAME).sort()).toEqual([...runners].sort());
+});
+
+it('offers a harness planner for exactly the runners with a connector', () => {
+  expect(CLI_PROVIDERS.map(runnerForProvider).sort()).toEqual(Object.keys(CONNECTORS).sort());
 });
 
 describe.each(runners)('the %s connector and the Ordewell tools', (runner) => {

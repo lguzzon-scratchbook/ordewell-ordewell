@@ -4,6 +4,7 @@ import type { RunnerRegistry } from '../plugins/RunnerRegistry';
 import { augmentedPath, withPath } from '../utils/shellPath';
 import { planDirectLaunch } from '../utils/launch';
 import type { ExecImpl } from './ModelDiscovery';
+import { connectorFor } from './harness/connectors';
 
 const execAsync = promisify(exec);
 
@@ -17,13 +18,6 @@ const defaultExec: ExecImpl = async (command, options) => {
 };
 
 const CHECK_TIMEOUT_MS = 8000;
-
-/**
- * Runners with a harness-planner adapter (ADR-0009). Plugin runners are
- * deliberately absent: a manifest-level planner capability block, so user
- * plugins can declare themselves plannable, is a follow-up.
- */
-const PLANNER_CAPABLE_RUNNERS = new Set(['claude-code', 'codex', 'opencode']);
 
 /**
  * Detects whether a runner's underlying CLI is actually installed on the host,
@@ -80,7 +74,9 @@ export class RunnerInstallation {
    * typing a real goal is the failure this exists to prevent.
    *
    * "Usable" is deliberately shallow: the binary answers `--version`, and the
-   * runner declares a planner transport. Whether the user's subscription is
+   * runner has a connector to plan over. Plugin runners have none yet: a
+   * manifest-level planner capability, so a plugin can declare itself
+   * plannable, is a follow-up. Whether the user's subscription is
    * live cannot be known without spending a turn on it, so an expired login
    * surfaces where it actually bites — as the agent's own error text on the
    * first turn.
@@ -88,7 +84,7 @@ export class RunnerInstallation {
   async plannerUsability(runner: string): Promise<{ usable: boolean; reason?: string }> {
     const manifest = this.registry.getManifest(runner);
     if (!manifest) return { usable: false, reason: `No runner manifest is registered for "${runner}".` };
-    if (!PLANNER_CAPABLE_RUNNERS.has(runner)) {
+    if (!connectorFor(runner)) {
       return { usable: false, reason: `${manifest.displayName ?? runner} has no planner transport yet.` };
     }
     if (!(await this.isInstalled(runner))) {

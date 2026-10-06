@@ -4,6 +4,8 @@ import type { ExecImpl } from '../ModelDiscovery';
 import type { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { CLAUDE_CODE_MANIFEST } from '../../plugins/builtin/claude-code.manifest';
 import { OPENCODE_MANIFEST } from '../../plugins/builtin/opencode.manifest';
+import { CODEX_MANIFEST } from '../../plugins/builtin/codex.manifest';
+import { CONNECTORS } from '../harness/connectors';
 
 function registryWith(...manifests: Array<{ name: string; runner: { command: string } }>): RunnerRegistry {
   const byName = new Map(manifests.map((m) => [m.name, m]));
@@ -94,6 +96,16 @@ describe('RunnerInstallation.plannerUsability (ADR-0009 preflight)', () => {
     const result = await inst.plannerUsability('aider');
     expect(result.usable).toBe(false);
     expect(result.reason).toContain('no planner transport');
+  });
+
+  it('plans with exactly the runners the connector registry holds', async () => {
+    const exec: ExecImpl = vi.fn(async () => ({ stdout: 'ok' }));
+    const manifests = [CLAUDE_CODE_MANIFEST, CODEX_MANIFEST, OPENCODE_MANIFEST, { name: 'aider', runner: { command: 'aider' } }];
+    const inst = new RunnerInstallation(registryWith(...manifests), exec);
+
+    const plannable: string[] = [];
+    for (const m of manifests) if ((await inst.plannerUsability(m.name)).usable) plannable.push(m.name);
+    expect(plannable.sort()).toEqual(Object.keys(CONNECTORS).sort());
   });
 
   it('refuses an unregistered runner without probing anything', async () => {
