@@ -346,6 +346,91 @@ describe('OpenCodeAdapter task mode — when a turn ends', () => {
   });
 });
 
+describe('OpenCodeAdapter task mode — messages into the running turn (ADR-0023)', () => {
+  const userMessage = (id: string) => ({ type: 'message.updated', properties: { sessionID: SES, info: { id, role: 'user' } } });
+  const assistantWithParent = (id: string, parentID: string) => ({
+    type: 'message.updated',
+    properties: { sessionID: SES, info: { id, role: 'assistant', parentID } },
+  });
+
+  /** The body of the `n`th `prompt_async` the adapter posted for this session. */
+  const promptBodies = (server: ReturnType<typeof fakeServer>) =>
+    server.requests.filter((r) => r.path === `/session/${SES}/prompt_async`).map((r) => r.body as { parts: unknown; agent: string; tools: unknown; messageID?: string });
+
+  it('hands a busy turn a named message at once, and logs the delivery when an assistant message is parented to it', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnWith(server, taskStart());
+    await until(() => promptBodies(server).length === 1);
+
+    expect(await adapter.steer('m-1', 'use Postgres')).toBe(true);
+    const bodies = promptBodies(server);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toEqual({
+      parts: [{ type: 'text', text: 'use Postgres' }],
+      agent: 'build',
+      tools: { question: false },
+      model: { providerID: 'anthropic', modelID: 'claude-sonnet-4' },
+      messageID: expect.stringMatching(/^msg/),
+    });
+    // The first prompt is stored without a message id, so the two are told apart.
+    expect(bodies[0].messageID).toBeUndefined();
+
+    stream.push(userMessage(bodies[1].messageID!));
+    // Storage is not delivery: no event until the model's answer names it.
+    await stream.drained;
+    expect(events.some((e) => e.type === 'message_delivered')).toBe(false);
+    stream.push(assistantWithParent('msg_a', bodies[1].messageID!));
+    stream.push(assistantWithParent('msg_b', bodies[1].messageID!));
+    await until(() => events.some((e) => e.type === 'message_delivered'));
+    expect(events.filter((e) => e.type === 'message_delivered')).toEqual([{ type: 'message_delivered', id: 'm-1' }]);
+
+    stream.push(status('idle'));
+    await turn;
+    expect(events.some((e) => e.type === 'message_dropped')).toBe(false);
+    adapter.dispose();
+  });
+
+  it('refuses a message when no turn is running, so the caller keeps it for the turn end', async () => {
+    const server = fakeServer();
+    const { adapter, turn, stream } = await turnWith(server, taskStart());
+    await until(() => promptBodies(server).length === 1);
+
+    stream.push(status('idle'));
+    await turn;
+    // The turn is over: the caller keeps the message for the turn-end queue.
+    expect(await adapter.steer('m-1', 'too late')).toBe(false);
+    expect(promptBodies(server)).toHaveLength(1);
+    adapter.dispose();
+  });
+
+  it('falls back when the server refuses the steer request', async () => {
+    let posts = 0;
+    const server = fakeServer({ [`POST /session/${SES}/prompt_async`]: () => (++posts === 1 ? { status: 204 } : { status: 500 }) });
+    const { adapter, events, turn, stream } = await turnWith(server, taskStart());
+    await until(() => posts === 1);
+
+    expect(await adapter.steer('m-1', 'use Postgres')).toBe(false);
+    stream.push(status('idle'));
+    await turn;
+    expect(events.filter((e) => e.type === 'message_delivered' || e.type === 'message_dropped')).toEqual([]);
+    adapter.dispose();
+  });
+
+  it('drops a message the turn ended before the model read, and deletes the stored copy so the re-send does not duplicate it', async () => {
+    const server = fakeServer();
+    const { adapter, events, turn, stream } = await turnWith(server, taskStart());
+    await until(() => promptBodies(server).length === 1);
+    expect(await adapter.steer('m-1', 'use Postgres')).toBe(true);
+    const messageID = promptBodies(server)[1].messageID!;
+
+    stream.push(status('idle'));
+    await turn;
+    await until(() => server.requests.some((r) => r.method === 'DELETE' && r.path === `/session/${SES}/message/${messageID}`));
+    expect(events).toContainEqual({ type: 'message_dropped', id: 'm-1' });
+    adapter.dispose();
+  });
+});
+
 describe('OpenCodeAdapter task mode — interrupt', () => {
   it('aborts the session and ends the turn as interrupted once it goes idle', async () => {
     const server = fakeServer();

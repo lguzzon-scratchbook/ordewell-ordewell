@@ -12,7 +12,7 @@ import { awaitAttach } from './ordewellBinding';
 import type { McpClientConfig } from '../mcp';
 import { hunksOf, markedLines } from './fileDiff';
 import {
-  OpenCodePermissions, autoApproves, delay, interruptAcknowledged, openEventStream, permissionReply, settleTurn, splitModelId,
+  OpenCodePermissions, PendingSteers, autoApproves, delay, interruptAcknowledged, newUserMessageId, openEventStream, permissionReply, settleTurn, splitModelId,
   streamTurn, turnLatch, usageRecord, type PermissionAnswer, type PermissionRequest, type StreamTurn, type TurnLatch,
 } from './openCodeTransport';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
@@ -276,6 +276,8 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     (id, sessionId, decision) => this.replyPermission(id, sessionId, permissionReply(decision, 'reply')),
     () => this.ordewell,
   );
+  /** Messages handed into the running task turn, until the model reads them (ADR-0023). Kept across turns: the server keeps the message too. */
+  private readonly steers = new PendingSteers();
   /** Set once the server turns out to speak the 2.x API, which then owns the session. */
   private v2: OpenCodeV2 | null = null;
   /** The Ordewell server this process was configured with; null when none was given or its config could not be merged. */
@@ -480,17 +482,8 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     const poll = new AbortController();
 
     try {
-      const model = task.model ? splitModelId(task.model) : null;
-      const body = {
-        parts: [{ type: 'text', text: message }],
-        // The manifest's meaning of the task's mode (ADR-0001): for OpenCode a mode is an agent.
-        agent: task.flags.permissionMode,
-        tools: TASK_DISABLED_TOOLS,
-        ...(model ? { model } : {}),
-        ...(task.flags.effort ? { variant: task.flags.effort } : {}),
-      };
       try {
-        await this.json('POST', `/session/${this.sessionId}/prompt_async`, body, signal);
+        await this.json('POST', `/session/${this.sessionId}/prompt_async`, this.taskPromptBody(task, message), signal);
       } catch (err) {
         if (signal?.aborted) { this.dispose(); return; }
         onEvent({ type: 'error', message: `OpenCode did not take the message: ${describeError(err)}` });
@@ -510,11 +503,63 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
           return failure ? { type: 'error', message: failure } : { type: 'turn_end' };
         },
       }, onEvent);
-      if (!settled) this.dispose();
+      // A turn that ends with a message the model never read leaves it stored
+      // server-side. Drop it so Ordewell re-sends it as the next turn (ADR-0023,
+      // D4) and delete the stored copy so that re-send does not duplicate it.
+      if (settled) this.dropUnreadSteers(onEvent);
+      else this.dispose();
     } finally {
+      this.steers.drain();
       this.taskTurn = null;
       poll.abort();
       await closeStream();
+    }
+  }
+
+  /**
+   * The prompt that carries a task message: the mode as the agent, the task
+   * model and effort, and only `question` withheld. A steer names its own
+   * `messageID` so the frames can be told apart from the first prompt's.
+   */
+  private taskPromptBody(task: TaskStartOptions, message: string, messageID?: string): Record<string, unknown> {
+    const model = task.model ? splitModelId(task.model) : null;
+    return {
+      parts: [{ type: 'text', text: message }],
+      // The manifest's meaning of the task's mode (ADR-0001): for OpenCode a mode is an agent.
+      agent: task.flags.permissionMode,
+      tools: TASK_DISABLED_TOOLS,
+      ...(model ? { model } : {}),
+      ...(task.flags.effort ? { variant: task.flags.effort } : {}),
+      ...(messageID ? { messageID } : {}),
+    };
+  }
+
+  /** Hand a message into the running task turn (ADR-0023, D2), naming it so its delivery is observable. */
+  async steer(id: string, text: string): Promise<boolean> {
+    const task = this.task;
+    const turn = this.taskTurn;
+    // 1.x's mid-turn path is the validated one (ADR-0023). 2.x has none yet, so
+    // its adapter keeps the turn-end queue by refusing every steer.
+    if (this.v2 || !task || !this.process || !this.sessionId || this.exited || !turn || turn.done || this.interruptRequested) return false;
+    const messageID = newUserMessageId();
+    this.steers.hand(messageID, id);
+    const posted = await this.json('POST', `/session/${this.sessionId}/prompt_async`, this.taskPromptBody(task, text, messageID))
+      .then(() => true, () => false);
+    if (posted) return true;
+    // The request failed. If the delivery still arrived, the model has it and
+    // there is nothing to fall back to; otherwise the message stays queued.
+    return !this.steers.forget(id);
+  }
+
+  /**
+   * Messages handed over but unread when the turn ended. Each is deleted from
+   * the session — so the next turn's re-send is not a duplicate — and reported
+   * dropped, which is what puts it back in Ordewell's queue.
+   */
+  private dropUnreadSteers(onEvent: (event: AgentEvent) => void): void {
+    for (const { messageId, id } of this.steers.drain()) {
+      void this.json('DELETE', `/session/${this.sessionId}/message/${messageId}`).catch(() => { /* the next turn re-sends it either way */ });
+      onEvent({ type: 'message_dropped', id });
     }
   }
 
@@ -571,7 +616,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   }
 
   /** What a frame of the task's own session says about the turn's end. */
-  private followTaskTurn(frame: OpenCodeEvent, turn: TaskTurn): void {
+  private followTaskTurn(frame: OpenCodeEvent, turn: TaskTurn, onEvent: (e: AgentEvent) => void): void {
     const props = frame.properties ?? {};
     if ((frame.type === 'session.status' && props.status?.type === 'idle') || frame.type === 'session.idle') {
       void this.confirmIdle(turn);
@@ -580,6 +625,11 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     if (frame.type === 'message.updated' && props.info?.role === 'user') {
       if (props.info.id) turn.userMessages.add(props.info.id);
       return;
+    }
+    // An assistant message parented to a message a steer stored is the server's
+    // account that the model read it (ADR-0023, OpenCode 1.x).
+    if (frame.type === 'message.updated' && props.info?.role === 'assistant') {
+      for (const id of this.steers.deliveredBy(props.info.parentID)) onEvent({ type: 'message_delivered', id });
     }
     // Only the model's work counts: the session is retitled and the prompt
     // stored before it is scheduled, and a poll in that gap reads "not busy".
@@ -812,7 +862,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     }
     const session = props.sessionID;
     if (session && session !== this.sessionId && !turn.children.follows(session)) return;
-    if (session === this.sessionId && this.taskTurn) this.followTaskTurn(frame, this.taskTurn);
+    if (session === this.sessionId && this.taskTurn) this.followTaskTurn(frame, this.taskTurn, onEvent);
     // Answered before anything waits on the `task` call naming its session: a
     // subagent's request blocks the turn exactly as the session's own does.
     if (frame.type === 'permission.asked' || frame.type === 'permission.v2.asked') {
@@ -936,6 +986,8 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    // The server is gone with its session; its stored messages are unreachable.
+    this.steers.drain();
     const proc = this.process;
     this.process = null;
     this.baseUrl = null;

@@ -115,21 +115,32 @@ describe.runIf(live)('structured transport — OpenCode live smoke', () => {
     }
   }, TIMEOUT_MS);
 
-  it('queues a message sent mid-turn and delivers it when the turn ends', async () => {
+  it('hands a message sent during a command to the running turn, which acts on it before the turn ends (ADR-0023)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-oc-'));
     const { runner, spawn } = harness();
     try {
-      const { session, turns, events } = await spawn('oc-queue', dir, 'Use the bash tool to run `sleep 5`, then reply with only the word: done');
-      await vi.waitFor(() => expect(events.some((e) => e.type === 'tool_call'), JSON.stringify(events) + session.getOutput()).toBe(true), { timeout: 60_000, interval: 250 });
+      const { session, turns, events } = await spawn('oc-steer', dir,
+        'Use the bash tool to run `sleep 20 && echo step1done`. Then use the bash tool to run `echo step2done`. Then reply with one short sentence saying what you ran.');
+      await vi.waitFor(() => expect(events.some((e) => e.type === 'tool_call'), JSON.stringify(events)).toBe(true), { timeout: 60_000, interval: 250 });
+      await new Promise<void>((resolve) => setTimeout(resolve, 4000));
 
-      const id = session.sendMessage('reply with the word PONG');
-      expect(events).toContainEqual({ type: 'message_queued', messageId: id, text: 'reply with the word PONG' });
-      expect(session.queued().map((m) => m.id)).toEqual([id]);
+      const id = session.sendMessage('Before your next command, use the bash tool to run `touch steered.txt`. Then carry on, and include the word PINEAPPLE in your final reply.');
+      await turns.next();
 
-      await vi.waitFor(() => expect(turns.ends).toEqual(['completed', 'completed']), { timeout: 120_000, interval: 250 });
-      expect(events.some((e) => e.type === 'turn_start' && e.messageId === id)).toBe(true);
+      const at = (match: (e: StructuredEvent) => boolean) => events.findIndex(match);
+      const handed = at((e) => e.type === 'message_handed_over' && e.messageId === id);
+      const delivered = at((e) => e.type === 'message_delivered' && e.messageId === id);
+      const touched = events.findIndex((e, i) => i > delivered && e.type === 'tool_call' && JSON.stringify(e.args).includes('steered.txt'));
+      console.error(`[live] opencode steer: handed over at ${handed}, delivered at ${delivered}, acted on at ${touched}, turn ended at ${at((e) => e.type === 'turn_end')}`);
+      expect(turns.ends, session.getOutput()).toEqual(['completed']);
+      expect(events.filter((e) => e.type === 'turn_start')).toHaveLength(1);
+      expect(handed).toBeGreaterThan(-1);
+      expect(delivered, session.getOutput()).toBeGreaterThan(handed);
+      expect(touched, session.getOutput()).toBeGreaterThan(delivered);
+      expect(touched).toBeLessThan(at((e) => e.type === 'turn_end'));
+      expect(existsSync(join(dir, 'steered.txt'))).toBe(true);
+      expect(session.getOutput()).toContain('PINEAPPLE');
       expect(session.queued()).toEqual([]);
-      expect(session.getOutput()).toContain('PONG');
     } finally {
       runner.stopAll();
       rmSync(dir, { recursive: true, force: true });
