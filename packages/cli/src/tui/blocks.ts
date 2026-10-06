@@ -293,6 +293,12 @@ function approvalLine(block: ApprovalBlock, cols: number): string {
   return `${paint(mark)}${truncate(line, cols).slice(mark.length)}`;
 }
 
+/** Keys first, so a narrow pane cuts the optional parts and never `ctrl-y`. */
+function approvalKeysLine(block: ApprovalBlock, cols: number): string {
+  const keys = ['ctrl-y allow', ...(block.allowForTask ? ['ctrl-t allow for task'] : []), 'ctrl-g deny (composer text is the note)'];
+  return style.grey(truncate(`  ${keys.join(' · ')}`, cols));
+}
+
 function planLine(block: PlanBlock, cols: number): string {
   const count = block.taskCount === undefined ? '' : ` (${countOf(block.taskCount, 'task')})`;
   const text = block.status === 'building' ? 'Building plan…' : `Plan ${block.status}${count}`;
@@ -340,12 +346,14 @@ function drawn(block: DisplayBlock, cols: number, detailAll: boolean): string[] 
   return lines;
 }
 
-/** The conversation as chat-pane lines, a blank line after each block. The token line is not among them. */
-export function conversationLines(blocks: readonly DisplayBlock[], cols: number, detailAll: boolean): string[] {
+/** The conversation as chat-pane lines, a blank line after each block; `answering` is the request the task view's keys answer, which carries them under it. The token line is not among them. */
+export function conversationLines(blocks: readonly DisplayBlock[], cols: number, detailAll: boolean, answering?: ApprovalBlock): string[] {
   const lines: string[] = [];
   for (const block of blocks) {
     if (block.type === 'usage') continue;
-    lines.push(...drawn(block, cols, detailAll), '');
+    lines.push(...drawn(block, cols, detailAll));
+    if (block === answering) lines.push(approvalKeysLine(block, cols));
+    lines.push('');
   }
   return lines;
 }

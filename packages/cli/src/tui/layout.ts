@@ -5,7 +5,7 @@ import { chatEditorRoomFor, chatPaneWidth, planPaneWidth } from './geometry';
 import { SLASH_COMMANDS, type SlashCategory } from './slash';
 import { findTask, planRows, plannerInFlight, selectedPlanRow, waitingApproval, type PlanRow, type TaskView, type TuiState } from './state';
 import { modesForTask } from './taskAssignment';
-import { ALL_PROVIDERS, approvalLabel, awaitingLabel, hasHiddenDetail, markAction, runnerForProvider, taskRowView, type AiProvider, type DisplayBlock, type TaskStatusKind } from '@ordewell/core';
+import { ALL_PROVIDERS, approvalLabel, awaitingLabel, hasHiddenDetail, markAction, runnerForProvider, taskRowView, type AiProvider, type ApprovalBlock, type DisplayBlock, type TaskStatusKind } from '@ordewell/core';
 
 /**
  * What each pane's content actually is, and therefore how far it can scroll.
@@ -221,10 +221,10 @@ interface ChatBodyMemo {
 // at: the two of them share the one entry instead of evicting each other's.
 let chatBodyMemo: ChatBodyMemo | null = null;
 
-export function chatBodyLines(blocks: readonly DisplayBlock[], cols: number, detailAll: boolean): string[] {
+export function chatBodyLines(blocks: readonly DisplayBlock[], cols: number, detailAll: boolean, answering?: ApprovalBlock): string[] {
   const memo = chatBodyMemo;
   if (memo && memo.blocks === blocks && memo.cols === cols && memo.detailAll === detailAll) return memo.lines;
-  const lines = conversationLines(blocks, cols, detailAll);
+  const lines = conversationLines(blocks, cols, detailAll, answering);
   chatBodyMemo = { blocks, cols, detailAll, lines };
   return lines;
 }
@@ -254,7 +254,7 @@ export function chatLayout(state: TuiState, rows: number, cols: number): ChatLay
   // planning conversation and only goes once a plan exists — from then on the
   // plan pane owns the screen and the chat column is too narrow for the art.
   const welcome = !tv && state.tasks.length === 0;
-  const body = chatBodyLines(blocks, cols, state.detailAll);
+  const body = chatBodyLines(blocks, cols, state.detailAll, tv ? waitingApproval(tv) : undefined);
   const transcript = !welcome ? body : body.length === 0 ? welcomeLines(state, cols) : [...welcomeLines(state, cols), '', ...body];
   // The queued prompts paint as part of the tail, newest last — they are the
   // turns that have not gone out yet, and they travel where a sent message
@@ -764,7 +764,7 @@ export function helpLayout(rows: number, cols: number): HelpLayout {
     style.grey('tab switches panes · pgup/pgdn scroll · ctrl-o toggles full detail · esc takes back a queued prompt, otherwise esc twice stops · ctrl-l clears · ctrl-c quits'),
   );
   body.push(
-    style.grey('in a task view (t or /terminal on a structured task): ctrl-r removes the selected queued message · ctrl-x interrupts · ctrl-y allows a tool request · ctrl-t allows it for the task · ctrl-g denies it, with the composer text as the note · alt←/→ changes attempt · esc returns'),
+    style.grey('in a task view (t or /terminal on a structured task): ctrl-r removes the selected queued message · ctrl-x interrupts · ctrl-y allows a tool request (its keys sit under it) · ctrl-t allows it for the task · ctrl-g denies it, with the composer text as the note · alt←/→ changes attempt · esc returns'),
   );
 
   // The sheet is a table: clip long descriptions to one row each rather than

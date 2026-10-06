@@ -115,7 +115,7 @@ export function announceApprovals(state: TuiState, action: Extract<Action, { typ
   if (state.taskView?.taskId === action.taskId) return state;
   const task = findTask(state.tasks, action.taskId);
   const spoken = action.events.reduce((s, event) => (event.type === 'approval_requested'
-    ? say(s, 'system', `· Task ${task?.order ?? '?'} waits for approval: ${runnerToolSubject(event.tool, event.args)} — t on it to answer`)
+    ? say(s, 'system', `· Task ${task?.order ?? '?'} waits for approval: ${runnerToolSubject(event.tool, event.args)} — t on it, then ctrl-y to allow or ctrl-g to deny`)
     : s), state);
   return spoken !== state ? { ...spoken, scroll: state.scroll } : spoken;
 }
