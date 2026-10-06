@@ -8,6 +8,20 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Internals reorganized behind narrower modules.** OpenCode 1.x and 2.x share
+  one HTTP transport, each task row's state is decided once in core for the TUI
+  and VS Code, each runner's Ordewell tools are declared in one place, plan
+  editing has its own module, and what differs between change, ops, repair and
+  continued attempts is read from one attempt kind. No behaviour change is
+  intended beyond the fix below.
+
+### Fixed
+
+- **OpenCode 2.x task logs show file edits as diffs**, as they do on 1.x. An edit
+  row used to say only that the edit succeeded.
+
 ## [0.7.0] — 2026-10-05
 
 ### Added

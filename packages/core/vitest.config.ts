@@ -1,5 +1,15 @@
 import { defineConfig } from 'vitest/config';
 
+// Floors for the modules the seam refactors introduced, each at its measured
+// value rounded down. The rest of the codebase stays report-only (see ci.yml).
+const floor = (lines: number, branches: number, functions: number, statements = lines) => ({
+  lines,
+  branches,
+  functions,
+  statements,
+  perFile: true,
+});
+
 export default defineConfig({
   test: {
     include: ['src/**/*.test.ts'],
@@ -9,6 +19,21 @@ export default defineConfig({
       reportsDirectory: 'coverage',
       include: ['src/**/*.ts'],
       exclude: ['**/*.test.ts', '**/__tests__/**', '**/fixtures/**', '**/*.d.ts', 'dist/**'],
+      thresholds: {
+        'src/services/PlanEditError.ts': floor(100, 100, 100),
+        'src/services/PlanEditor.ts': floor(100, 92, 100),
+        'src/services/attemptKind.ts': floor(100, 100, 100),
+        'src/services/harness/claudeOrdewell.ts': floor(100, 83, 100),
+        'src/services/harness/codexOrdewell.ts': floor(100, 94, 100),
+        'src/services/harness/connectors.ts': floor(100, 87, 100),
+        'src/services/harness/openCodeTransport.ts': floor(100, 97, 94),
+        'src/services/harness/ordewellBinding.ts': floor(80, 78, 100),
+        'src/taskRow/actions.ts': floor(100, 100, 100),
+        'src/taskRow/index.ts': floor(100, 100, 100),
+        'src/taskRow/status.ts': floor(100, 100, 100),
+        'src/taskRow/texts.ts': floor(100, 100, 100),
+        'src/taskRow/view.ts': floor(100, 100, 100),
+      },
     },
   },
 });
