@@ -1,3 +1,4 @@
+import { randomBytes } from 'crypto';
 import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { McpClientConfig } from '../mcp';
@@ -96,6 +97,73 @@ export function permissionReply<K extends string>(decision: ApprovalDecision, ke
  */
 export function autoApproves(task: TaskStartOptions): boolean {
   return task.flags.modeSettings.approvals === 'auto';
+}
+
+/** An id in the shape OpenCode's prompt body takes for `messageID` (`^msg`), so a steer names its own message. */
+export function newUserMessageId(): string {
+  return `msg_${randomBytes(12).toString('hex')}`;
+}
+
+/**
+ * The messages handed into a running OpenCode turn and not yet shown to the
+ * model, by the user message id the server stored each under (ADR-0023). The
+ * server keeps a stored message in the session, so a delivery the stream never
+ * carried is still owed when the turn ends — {@link drain} is what re-sends it.
+ */
+export class PendingSteers {
+  /** User message id → the Ordewell message id it was sent for. */
+  private readonly pending = new Map<string, string>();
+  /** The user message ids in the order they were handed over. */
+  private readonly order: string[] = [];
+
+  hand(messageId: string, id: string): void {
+    this.pending.set(messageId, id);
+    this.order.push(messageId);
+  }
+
+  /**
+   * The Ordewell ids an assistant message parented at `parentID` delivers: a
+   * pending whose stored message it is, or one handed over before it — the
+   * model read past the earlier message to answer this one.
+   */
+  deliveredBy(parentID: string | undefined): string[] {
+    if (!parentID) return [];
+    const upto = this.order.indexOf(parentID);
+    if (upto < 0) return [];
+    const delivered: string[] = [];
+    for (const messageId of [...this.pending.keys()]) {
+      // `hand` records the order too, so every pending id is in it.
+      if (this.order.indexOf(messageId) <= upto) {
+        delivered.push(this.pending.get(messageId)!);
+        this.pending.delete(messageId);
+      }
+    }
+    return delivered;
+  }
+
+  /**
+   * Stop expecting delivery of one handed over whose request then failed.
+   * False when it was already delivered, so a late failure does not recall it.
+   */
+  forget(id: string): boolean {
+    for (const [messageId, held] of this.pending) {
+      if (held !== id) continue;
+      this.pending.delete(messageId);
+      return true;
+    }
+    return false;
+  }
+
+  /** Every message still owed, oldest first, and empty this — what the server must be told to forget. */
+  drain(): Array<{ messageId: string; id: string }> {
+    const all = this.order.flatMap((messageId) => {
+      const id = this.pending.get(messageId);
+      return id === undefined ? [] : [{ messageId, id }];
+    });
+    this.pending.clear();
+    this.order.length = 0;
+    return all;
+  }
 }
 
 const ALLOW: ApprovalDecision = { decision: 'allow' };

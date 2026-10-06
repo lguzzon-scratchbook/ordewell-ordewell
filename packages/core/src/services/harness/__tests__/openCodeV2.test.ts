@@ -416,6 +416,25 @@ describe('OpenCode 2.x — permission requests', () => {
   });
 });
 
+describe('OpenCode 2.x — mid-turn delivery', () => {
+  it('has no verified mid-turn path yet, so every steer is refused and the turn-end queue stands', async () => {
+    const server = fakeServer();
+    const { adapter } = await start(server, taskStart());
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (e) => events.push(e));
+    const stream = await server.stream();
+    await until(() => server.requests.some((r) => r.path.endsWith('/prompt')));
+    stream.push(started());
+
+    expect(await adapter.steer('m-1', 'use Postgres')).toBe(false);
+    expect(server.requests.filter((r) => r.path.endsWith('/prompt'))).toHaveLength(1);
+
+    stream.push(succeeded());
+    await turn;
+    adapter.dispose();
+  });
+});
+
 describe('OpenCode 2.x — interrupt', () => {
   it('posts the interrupt and ends the turn as interrupted once OpenCode acknowledges', async () => {
     const server = fakeServer({ [`POST /api/session/${SES}/interrupt`]: () => ({ interrupted: true }) });

@@ -7,11 +7,11 @@ import { createTask, type Verdict } from '../../models/Task';
 import type { RunnerSpawnOptions } from '../AbstractRunner';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { isStructuredSession, type ITerminalSession, type StructuredEvent, type StructuredTurnEnd } from '../../interfaces/ITerminalRunner';
-import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter } from '../harness/AgentAdapter';
+import type { AgentEvent, AgentProcessDeps, AgentStartOptions, TaskModeAgentAdapter } from '../harness/AgentAdapter';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import { FakeStructuredSession, FakeTerminalSession } from '../../testing';
 import { OrdewellMcpServer, type CheckpointAnswer, type McpClientConfig } from '../mcp';
-import { fakeSpawn, fixture, type ScriptedReply } from './harnessTestKit';
+import { fakeSpawn, fixture, sseResponse, type FakeAgentProcess, type FakeEventStream, type ScriptedReply } from './harnessTestKit';
 
 /**
  * The `ITerminalSession` contract a structured task keeps (ADR-0018, O1a/S2):
@@ -706,6 +706,64 @@ describe('a message sent mid-turn (ADR-0023)', () => {
     await until(() => adapters[0].sent.length === 2);
 
     expect(turn.events.some((e) => e.type === 'message_handed_over' || e.type === 'message_delivered')).toBe(false);
+    turn.session.kill();
+  });
+
+  /** A real OpenCode 1.x server over a fake fetch: the one end-to-end entry no adapter double can pin. */
+  function openCodeServer() {
+    const base = 'http://127.0.0.1:4096';
+    const sessionId = 'ses_oc';
+    const streams: FakeEventStream[] = [];
+    const prompts: Array<{ messageID?: string }> = [];
+    const answer = (body: unknown, status = 200) => ({
+      ok: status >= 200 && status < 300, status, statusText: String(status), json: async () => body,
+    }) as unknown as Response;
+    const fetchImpl: AgentProcessDeps['fetch'] = async (input, init) => {
+      const path = String(input).replace(base, '');
+      const method = init?.method ?? 'GET';
+      if (path === '/event') { const { response, stream } = sseResponse(init); streams.push(stream); return response; }
+      if (path === '/session' && method === 'POST') return answer({ id: sessionId });
+      if (path === '/session/status') return answer({});
+      if (path.endsWith('/prompt_async')) {
+        prompts.push(typeof init?.body === 'string' ? JSON.parse(init.body) as { messageID?: string } : {});
+        return answer(null, 204);
+      }
+      if (path.endsWith('/message') && method === 'GET') return answer([]);
+      return answer({});
+    };
+    const spawned = fakeSpawn([]);
+    const spawn: AgentProcessDeps['spawn'] = (cmd, argv, opts) => {
+      const proc = spawned.spawn(cmd, argv, opts);
+      queueMicrotask(() => (proc as FakeAgentProcess).emitStdout(`opencode server listening on ${base}\n`));
+      return proc;
+    };
+    return { spawn, fetch: fetchImpl, streams, prompts, sessionId };
+  }
+
+  it('reaches the real OpenCode adapter as a steer, and clears the queue when the model reads it', async () => {
+    const server = openCodeServer();
+    const runner = new StructuredRunner({
+      process: { spawn: server.spawn, fetch: server.fetch, resolvePath: async () => '/usr/bin', platform: 'linux', isDirectory: () => true, exists: () => true },
+    });
+    const turn = observe(await runner.spawn(options({ runner: 'opencode', mode: 'build', modelId: 'opencode-go/deepseek-v4.1-flash' })));
+    await until(() => server.streams.length === 1 && server.prompts.length === 1);
+    const stream = server.streams[0];
+    stream.push({ type: 'session.status', properties: { sessionID: server.sessionId, status: { type: 'busy' } } });
+
+    const id = turn.session.sendMessage('and use Postgres');
+    await until(() => turn.session.queued().some((m) => m.handedOver));
+    const messageID = server.prompts[1].messageID!;
+    expect(messageID).toMatch(/^msg/);
+
+    // Storage alone is not delivery; the assistant message parented to the
+    // steer's own id is what says the model read it.
+    stream.push({ type: 'message.updated', properties: { sessionID: server.sessionId, info: { id: 'msg_a', role: 'assistant', parentID: messageID } } });
+    await until(() => turn.session.queued().length === 0);
+
+    stream.push({ type: 'session.status', properties: { sessionID: server.sessionId, status: { type: 'idle' } } });
+    await until(() => turn.turnEnds.length === 1);
+    expect(turn.events).toContainEqual({ type: 'message_delivered', messageId: id, text: 'and use Postgres' });
+    expect(turn.events.filter((e) => e.type === 'turn_start')).toEqual([{ type: 'turn_start', text: 'Do the task' }]);
     turn.session.kill();
   });
 });

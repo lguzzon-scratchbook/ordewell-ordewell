@@ -4,7 +4,7 @@ import type { AgentEvent, TaskStartOptions } from '../AgentAdapter';
 import { mcpClientConfig } from '../../mcp';
 import { sseResponse } from '../../__tests__/harnessTestKit';
 import {
-  ChildSessions, OpenCodePermissions, ReplyText, autoApproves, interruptAcknowledged, openEventStream, permissionReply, settleTurn,
+  ChildSessions, OpenCodePermissions, PendingSteers, ReplyText, autoApproves, interruptAcknowledged, newUserMessageId, openEventStream, permissionReply, settleTurn,
   splitModelId, turnLatch, usageRecord, type PermissionRequest,
 } from '../openCodeTransport';
 
@@ -53,6 +53,51 @@ describe('usageRecord', () => {
     expect(usageRecord(undefined, {})).toBeNull();
     expect(usageRecord({ input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }, { cost: 0.1 })).toBeNull();
     expect(usageRecord({ input: 1, output: 1 }, { cost: 0 })).toEqual({ source: 'opencode', inputTokens: 1, outputTokens: 1 });
+  });
+});
+
+describe('PendingSteers', () => {
+  it('names a user message in the shape OpenCode stores', () => {
+    expect(newUserMessageId()).toMatch(/^msg_[0-9a-f]{24}$/);
+    expect(newUserMessageId()).not.toBe(newUserMessageId());
+  });
+
+  it('delivers a hand when an assistant message is parented to its stored id, once', () => {
+    const steers = new PendingSteers();
+    steers.hand('msg_a', 'm-1');
+
+    expect(steers.deliveredBy('msg_other')).toEqual([]);
+    expect(steers.deliveredBy('msg_a')).toEqual(['m-1']);
+    expect(steers.deliveredBy('msg_a')).toEqual([]);
+  });
+
+  it('delivers an earlier hand when the answer is parented to a later one', () => {
+    const steers = new PendingSteers();
+    steers.hand('msg_a', 'm-1');
+    steers.hand('msg_b', 'm-2');
+
+    expect(steers.deliveredBy('msg_b')).toEqual(['m-1', 'm-2']);
+  });
+
+  it('forgets a hand whose request failed, but not one already delivered', () => {
+    const steers = new PendingSteers();
+    steers.hand('msg_a', 'm-1');
+    expect(steers.forget('m-1')).toBe(true);
+    expect(steers.forget('m-1')).toBe(false);
+
+    steers.hand('msg_b', 'm-2');
+    steers.deliveredBy('msg_b');
+    expect(steers.forget('m-2')).toBe(false);
+  });
+
+  it('drains what is still owed, oldest first, and empties itself', () => {
+    const steers = new PendingSteers();
+    steers.hand('msg_a', 'm-1');
+    steers.hand('msg_b', 'm-2');
+    steers.deliveredBy('msg_a');
+
+    expect(steers.drain()).toEqual([{ messageId: 'msg_b', id: 'm-2' }]);
+    expect(steers.drain()).toEqual([]);
   });
 });
 
