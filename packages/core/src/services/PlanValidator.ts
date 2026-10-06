@@ -1,4 +1,4 @@
-import { Task, createTask, TaskModelAssignment, RunnerId, type ValidationContext, type ValidationResult } from '../models/Task';
+import { Task, createTask, opsFlag, TaskModelAssignment, RunnerId, type ValidationContext, type ValidationResult } from '../models/Task';
 import { extractObjectsWithKey, stripTrailingCommas, escapeControlCharsInStrings, PlanParseError, PLAN_ENVELOPE_KEY } from './JsonExtractor';
 import { resolveTaskMode, type RunnerModeInfo } from './ModeResolver';
 
@@ -210,8 +210,8 @@ function parseTask(
     userStoriesCovered: Array.isArray(raw.userStoriesCovered)
       ? raw.userStoriesCovered.map(String)
       : undefined,
-    // A subtask runs with its parent, so only a top-level AI task carries it (ADR-0020).
-    ops: !inherited && taskType === 'ai' && raw.ops === true,
+    // A subtask runs with its parent, so only a top-level task carries it (ADR-0020).
+    ops: inherited ? undefined : opsFlag(raw.ops),
   });
 }
 

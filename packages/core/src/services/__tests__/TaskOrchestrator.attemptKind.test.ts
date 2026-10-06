@@ -1,0 +1,329 @@
+import { describe, it, expect, vi } from 'vitest';
+import { createTaskOrchestrator, TaskControlError } from '../TaskOrchestrator';
+import { createTask, type Task } from '../../models/Task';
+import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
+import { RunnerRegistry } from '../../plugins/RunnerRegistry';
+import { fakeConfig, FakeStructuredSession, FakeTerminalSession, FakeWorktreeIsolation, flushMicrotasks } from '../../testing';
+import { fakeNotification } from './sessionTestKit';
+import type { IConfig } from '../../interfaces/IConfig';
+import type { IsolationMergeResult } from '../../interfaces/IWorktreeIsolation';
+import type { ITerminalRunner, ITerminalSession } from '../../interfaces/ITerminalRunner';
+import type { RunnerSpawnOptions } from '../AbstractRunner';
+
+/**
+ * What differs between a change, an ops, a repair and a continued attempt, as
+ * the orchestrator shows it: where each runs, what it is told, whether its
+ * tree is checked, and whether it keeps Merge all out.
+ */
+function setup(opts: { isolation?: FakeWorktreeIsolation; config?: Partial<IConfig>; tdd?: boolean } = {}) {
+  const isolation = opts.isolation ?? new FakeWorktreeIsolation();
+  const sessions: FakeTerminalSession[] = [];
+  const requests: RunnerSpawnOptions[] = [];
+  /** Spawns that wait to be let through, by task id. */
+  const holds = new Map<string, Promise<void>>();
+  const runner = {
+    spawn: vi.fn(async (o: RunnerSpawnOptions): Promise<ITerminalSession> => {
+      requests.push(o);
+      await holds.get(o.taskId);
+      const id = `s${sessions.length + 1}`;
+      const session = o.transport === 'structured'
+        ? new FakeStructuredSession(id, o.taskId, o.resumeSessionId ?? `native-${o.taskId}-${sessions.length + 1}`)
+        : new FakeTerminalSession(id, o.taskId);
+      sessions.push(session);
+      return session;
+    }),
+    stop: vi.fn(),
+    stopAll: vi.fn(),
+    activeCount: 0,
+  } satisfies ITerminalRunner;
+  const orchestrator = createTaskOrchestrator({
+    config: fakeConfig({ worktreeIsolation: true, ...opts.config }),
+    notifications: fakeNotification(),
+    terminalRunner: runner,
+    output: new BufferedTaskOutputSource({ transcripts: { finalAssistantText: async () => null } }),
+    registry: new RunnerRegistry(),
+    isolation,
+    workspaceRoot: () => '/repo',
+    workspaceEnv: async () => ({ env: {}, blockedEnvrc: null, refused: [], trackedEnvFile: null }),
+    runnerTransport: () => 'structured',
+    tddEnabled: () => opts.tdd ?? false,
+  });
+  const notices: string[] = [];
+  orchestrator.subscribe({ onIsolationNotice: ({ message }) => notices.push(message) });
+  const spawned = (taskId: string) => requests.filter((r) => r.taskId === taskId);
+  const latest = (taskId: string) => sessions.filter((s) => s.taskId === taskId).at(-1)!;
+  const pass = (task: Task) => latest(task.id).emitOutput(`<<<ORDEWELL_DONE_${task.completionMarker}>>>`);
+  const status = (taskId: string) => orchestrator.storeInstance.get(taskId)!.status;
+  const ops = () => isolation.calls.map((c) => c.op);
+  const hold = (taskId: string): (() => void) => {
+    let open!: () => void;
+    holds.set(taskId, new Promise<void>((resolve) => { open = resolve; }));
+    return () => { holds.delete(taskId); open(); };
+  };
+  return { orchestrator, isolation, spawned, latest, pass, status, ops, notices, hold };
+}
+
+const change = (id: string, order: number, over: Partial<Task> = {}) =>
+  createTask({ id, order, title: `Task ${id}`, prompt: `do ${id}`, completionMarker: `mk-${id}`, ...over });
+const opsTask = (id: string, order: number, over: Partial<Task> = {}) => change(id, order, { ops: true, ...over });
+
+/** Run a task to a pass on its own, so it can be continued. */
+async function completed(env: ReturnType<typeof setup>, task: Task): Promise<void> {
+  await env.orchestrator.forceStartTask(task.id);
+  env.pass(task);
+  await vi.waitFor(() => expect(env.status(task.id)).toBe('completed'));
+  await flushMicrotasks();
+}
+
+/** A change task whose landing conflicts, with repairs on: its second attempt is a repair. */
+function conflicting(env: ReturnType<typeof setup>, id: string): void {
+  env.isolation.outcomes.set(id, 'conflict');
+  env.isolation.conflictFiles.set(id, ['a.ts']);
+}
+
+describe('attempt kinds, as the orchestrator runs them', () => {
+  describe('where each runs', () => {
+    it('a change attempt runs in the worktree prepared for it', async () => {
+      const env = setup();
+      env.orchestrator.loadPlan([change('c1', 1)]);
+
+      await env.orchestrator.approveReview();
+
+      expect(env.spawned('c1')[0].cwd).toBe('/fake-worktrees/run1/1-c1');
+    });
+
+    it('an ops attempt runs at the workspace root and prepares no worktree', async () => {
+      const env = setup();
+      env.orchestrator.loadPlan([change('c1', 1), opsTask('o2', 2)]);
+
+      await env.orchestrator.approveReview();
+
+      expect(env.spawned('o2')[0].cwd).toBe('/repo');
+      expect(env.isolation.taskIdsFor('prepare')).toEqual(['c1']);
+    });
+
+    it('a repair runs in the worktree kept for it', async () => {
+      const env = setup({ config: { conflictRepairAttempts: 1 } });
+      const c1 = change('c1', 1);
+      conflicting(env, 'c1');
+      env.orchestrator.loadPlan([c1]);
+      await env.orchestrator.approveReview();
+
+      env.pass(c1);
+
+      await vi.waitFor(() => expect(env.spawned('c1')).toHaveLength(2));
+      expect(env.spawned('c1')[1].cwd).toBe(env.spawned('c1')[0].cwd);
+      expect(env.isolation.taskIdsFor('reopen')).toEqual(['c1']);
+      expect(env.isolation.taskIdsFor('prepare')).toEqual(['c1']);
+    });
+
+    it('a continued change task starts from a fresh worktree', async () => {
+      const env = setup();
+      const c1 = change('c1', 1);
+      env.orchestrator.loadPlan([c1]);
+      await completed(env, c1);
+
+      await env.orchestrator.continueTask('c1', 'one more thing');
+
+      expect(env.spawned('c1')[1]).toMatchObject({ cwd: '/fake-worktrees/run1/1-c1', transport: 'structured' });
+      expect(env.isolation.taskIdsFor('prepare')).toEqual(['c1', 'c1']);
+    });
+
+    it('a continued ops task runs at the workspace root again', async () => {
+      const env = setup();
+      const o1 = opsTask('o1', 1);
+      env.orchestrator.loadPlan([o1]);
+      await completed(env, o1);
+
+      await env.orchestrator.continueTask('o1', 'check the pipeline again');
+
+      expect(env.spawned('o1')[1]).toMatchObject({ cwd: '/repo', transport: 'structured' });
+      expect(env.isolation.taskIdsFor('prepare')).toEqual([]);
+    });
+  });
+
+  describe('the tree check', () => {
+    it('never looks at the tree of a change task', async () => {
+      const env = setup();
+      const c1 = change('c1', 1);
+      env.orchestrator.loadPlan([c1]);
+      await env.orchestrator.approveReview();
+      env.isolation.changedFiles = ['a.ts'];
+
+      env.pass(c1);
+
+      await vi.waitFor(() => expect(env.status('c1')).toBe('completed'));
+      expect(env.ops()).not.toContain('snapshotTree');
+      expect(env.ops()).not.toContain('changedSince');
+    });
+
+    it('never looks at the tree of a repair', async () => {
+      const env = setup({ config: { conflictRepairAttempts: 1 } });
+      const c1 = change('c1', 1);
+      conflicting(env, 'c1');
+      env.orchestrator.loadPlan([c1]);
+      await env.orchestrator.approveReview();
+      env.pass(c1);
+      await vi.waitFor(() => expect(env.spawned('c1')).toHaveLength(2));
+      env.isolation.outcomes.delete('c1');
+      env.isolation.changedFiles = ['a.ts'];
+
+      env.pass(c1);
+
+      await vi.waitFor(() => expect(env.status('c1')).toBe('completed'));
+      expect(env.ops()).not.toContain('snapshotTree');
+    });
+
+    it('checks the tree of a continued ops task', async () => {
+      const env = setup();
+      const o1 = opsTask('o1', 1);
+      env.orchestrator.loadPlan([o1]);
+      await completed(env, o1);
+      const snapshotsBefore = env.ops().filter((op) => op === 'snapshotTree').length;
+      await env.orchestrator.continueTask('o1', 'retag it');
+      env.isolation.changedFiles = ['package.json'];
+
+      env.pass(o1);
+
+      await vi.waitFor(() => expect(env.status('o1')).toBe('awaiting_user'));
+      expect(env.orchestrator.storeInstance.get('o1')!.awaitingReason).toBe('files-changed');
+      expect(env.ops().filter((op) => op === 'snapshotTree')).toHaveLength(snapshotsBefore + 1);
+    });
+  });
+
+  describe('what each is told', () => {
+    it('a change attempt gets the TDD workflow when it is on', async () => {
+      const env = setup({ tdd: true });
+      env.orchestrator.loadPlan([change('c1', 1)]);
+
+      await env.orchestrator.approveReview();
+
+      expect(env.spawned('c1')[0].prompt).toContain('## Implementation workflow (TDD)');
+      expect(env.spawned('c1')[0].prompt).not.toContain('## Previous attempt');
+    });
+
+    it('an ops attempt gets it too, and no previous attempt on its first run', async () => {
+      const env = setup({ tdd: true });
+      env.orchestrator.loadPlan([opsTask('o1', 1)]);
+
+      await env.orchestrator.approveReview();
+
+      expect(env.spawned('o1')[0].prompt).toContain('## Implementation workflow (TDD)');
+      expect(env.spawned('o1')[0].prompt).not.toContain('## Previous attempt');
+    });
+
+    it('a repair is asked to resolve the conflict, never test-first', async () => {
+      const env = setup({ tdd: true, config: { conflictRepairAttempts: 1 } });
+      const c1 = change('c1', 1);
+      conflicting(env, 'c1');
+      env.orchestrator.loadPlan([c1]);
+      await env.orchestrator.approveReview();
+
+      env.pass(c1);
+
+      await vi.waitFor(() => expect(env.spawned('c1')).toHaveLength(2));
+      expect(env.spawned('c1')[1].prompt).toContain('conflicted in a.ts');
+      expect(env.spawned('c1')[1].prompt).not.toContain('## Implementation workflow (TDD)');
+    });
+
+    it('a continued change task is told its worktree was recreated', async () => {
+      const env = setup({ tdd: true });
+      const c1 = change('c1', 1);
+      env.orchestrator.loadPlan([c1]);
+      await completed(env, c1);
+
+      await env.orchestrator.continueTask('c1', 'one more thing');
+
+      const prompt = env.spawned('c1')[1].prompt;
+      expect(prompt.startsWith('one more thing\n')).toBe(true);
+      expect(prompt).toContain('Your working directory was recreated from the integration branch');
+      expect(prompt).not.toContain('## Implementation workflow (TDD)');
+    });
+
+    it('a continued ops task is told its earlier effects were not undone', async () => {
+      const env = setup();
+      const o1 = opsTask('o1', 1);
+      env.orchestrator.loadPlan([o1]);
+      await completed(env, o1);
+
+      await env.orchestrator.continueTask('o1', 'check the pipeline again');
+
+      const prompt = env.spawned('o1')[1].prompt;
+      expect(prompt).toContain('in the same checkout');
+      expect(prompt).toContain('was not undone');
+      expect(prompt).not.toContain('## Previous attempt');
+    });
+  });
+
+  describe('Merge all and ops work never overlap', () => {
+    it('refuses Merge all while a continued ops task runs', async () => {
+      const env = setup();
+      const c1 = change('c1', 1);
+      const o2 = opsTask('o2', 2);
+      env.orchestrator.loadPlan([c1, o2]);
+      await completed(env, c1);
+      await completed(env, o2);
+      await env.orchestrator.continueTask('o2', 'again');
+
+      await expect(env.orchestrator.mergeRun()).rejects.toThrow(TaskControlError);
+      expect(env.ops()).not.toContain('mergeIntoCheckedOut');
+    });
+
+    it('lets Merge all run beside a change task', async () => {
+      const env = setup();
+      const c1 = change('c1', 1);
+      env.orchestrator.loadPlan([c1, change('c2', 2)]);
+      await env.orchestrator.approveReview();
+      env.pass(c1);
+      await vi.waitFor(() => expect(env.status('c1')).toBe('completed'));
+      expect(env.status('c2')).toBe('in_progress');
+
+      await expect(env.orchestrator.mergeRun()).resolves.toEqual({ outcome: 'merged' });
+    });
+
+    it('refuses to run an ops task on its own while a merge is under way', async () => {
+      const env = setup();
+      const c1 = change('c1', 1);
+      env.orchestrator.loadPlan([c1, opsTask('o2', 2)]);
+      await completed(env, c1);
+      let refused: unknown = null;
+      env.isolation.mergeIntoCheckedOut = async () => {
+        refused = await env.orchestrator.runTask('o2').then(() => null, (err: unknown) => err);
+        return { outcome: 'merged' };
+      };
+
+      await env.orchestrator.mergeRun();
+
+      expect(refused).toBeInstanceOf(TaskControlError);
+      expect(env.spawned('o2')).toHaveLength(0);
+    });
+
+    // Readiness is read once per tick, before the tick awaits each start: a
+    // Merge all can begin while an earlier task of the same batch is starting.
+    it('starts no ops task the scheduler picked before a merge began', async () => {
+      const env = setup();
+      env.orchestrator.loadPlan([change('c1', 1), opsTask('o2', 2)]);
+      const openC1 = env.hold('c1');
+      let openMerge!: () => void;
+      let mergeEntered = false;
+      env.isolation.mergeIntoCheckedOut = async (): Promise<IsolationMergeResult> => {
+        mergeEntered = true;
+        await new Promise<void>((resolve) => { openMerge = resolve; });
+        return { outcome: 'merged' };
+      };
+
+      const started = env.orchestrator.approveReview();
+      await vi.waitFor(() => expect(env.spawned('c1')).toHaveLength(1));
+      const merged = env.orchestrator.mergeRun();
+      await vi.waitFor(() => expect(mergeEntered).toBe(true));
+      openC1();
+      await started;
+
+      expect(env.spawned('o2')).toHaveLength(0);
+
+      openMerge();
+      await merged;
+      await vi.waitFor(() => expect(env.spawned('o2')).toHaveLength(1));
+    });
+  });
+});

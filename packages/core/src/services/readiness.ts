@@ -1,6 +1,7 @@
 import type { Task } from '../models/Task';
 import type { PlanStore } from './PlanStore';
 import type { IsolationRunController } from './IsolationRunController';
+import { classifyAttempt, mergeExcludes } from './attemptKind';
 
 /** What the scheduler may read to decide what runs: read-only plan state, the holds, and the open isolated run. */
 export interface ReadinessInput {
@@ -16,7 +17,7 @@ export interface ReadinessInput {
   /** Attempts already holding a slot. */
   active: number;
   maxParallel: number;
-  /** A Merge all is under way, so no ops task may start (ADR-0020). */
+  /** A Merge all is under way, so no work it excludes may start (ADR-0020). */
   merging?: boolean;
 }
 
@@ -58,12 +59,10 @@ export function selectReadyTasks(input: ReadinessInput): Readiness {
     if (onHold.has(t.id)) return false;
     if (isBlocked(t, store)) return false;
     if (!t.dependencies.every((depId) => dependencyMet(depId, store, runs))) return false;
-    if (store.isOps(t.id)) {
-      if (input.merging) return false;
-      if (mergeGate(t, store, runs).length > 0) {
-        gated.push(t);
-        return false;
-      }
+    if (heldByMerge(t, input)) return false;
+    if (mergeGate(t, store, runs).length > 0) {
+      gated.push(t);
+      return false;
     }
     return true;
   });
@@ -127,6 +126,11 @@ function exclusionReasons(task: Readonly<Task>, input: ReadinessInput): string[]
   if (isBlocked(task, store)) reasons.push('blocked');
   if (!task.dependencies.every((depId) => dependencyMet(depId, store, runs))) reasons.push('deps');
   if (mergeGate(task, store, runs).length > 0) reasons.push('merge-gate');
-  if (input.merging && store.isOps(task.id)) reasons.push('merging');
+  if (heldByMerge(task, input)) reasons.push('merging');
   return reasons;
+}
+
+/** A Merge all under way holds back the work it excludes (ADR-0020). */
+function heldByMerge(task: Readonly<Task>, input: ReadinessInput): boolean {
+  return input.merging === true && mergeExcludes(classifyAttempt(input.store.isOps(task.id)));
 }

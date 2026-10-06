@@ -270,26 +270,35 @@ export class IsolationRunController {
   }
 
   /**
-   * The one place an attempt's working directory is decided: the worktree
-   * prepared for it in an isolated run, the kept one for a conflict repair,
-   * else the workspace root. `worktree` says which. Does not itself report a
-   * worktree it creates as a change — the caller does once the attempt is
-   * committed as running, so a spawn abandoned or failed after this settles
-   * is not misreported as a change that stuck.
+   * The working directory of an attempt that may run in a worktree — which
+   * attempts do is the attempt kind's to say (see `attemptKind.attemptCwd`):
+   * the worktree prepared for it in an isolated run, the kept one for a
+   * conflict repair, else the workspace root. `worktree` says which. Does not
+   * itself report a worktree it creates as a change — the caller does once
+   * the attempt is committed as running, so a spawn abandoned or failed after
+   * this settles is not misreported as a change that stuck.
    */
-  async attemptCwd(task: Task, opts: { repair: boolean; ops?: boolean }): Promise<{ cwd: string; worktree: boolean }> {
-    if (opts.repair && this.run) {
-      const { cwd } = await this.isolation.reopen(task, this.run);
-      return { cwd, worktree: true };
-    }
-    // An ops task acts from the user's own checkout, never a worktree (ADR-0020).
-    if (opts.ops || !this.isolating || !this.run) {
-      // A worktree left by an earlier attempt describes work this attempt
-      // replaces; left alone it could later be integrated as if it were this one's.
-      await this.release(task.id, { keep: false });
-      return { cwd: this.workspaceRoot(), worktree: false };
-    }
-    const { cwd, copied } = await this.isolation.prepare(task, this.run);
+  attemptCwd(task: Task, opts: { repair: boolean }): Promise<{ cwd: string; worktree: boolean }> {
+    if (opts.repair && this.run) return this.reopenCwd(task, this.run);
+    if (!this.isolating || !this.run) return this.workspaceCwd(task);
+    return this.prepareCwd(task, this.run);
+  }
+
+  /** The workspace root, for an attempt that runs outside any worktree. */
+  async workspaceCwd(task: Task): Promise<{ cwd: string; worktree: boolean }> {
+    // A worktree left by an earlier attempt describes work this attempt
+    // replaces; left alone it could later be integrated as if it were this one's.
+    await this.release(task.id, { keep: false });
+    return { cwd: this.workspaceRoot(), worktree: false };
+  }
+
+  private async reopenCwd(task: Task, run: IsolationRun): Promise<{ cwd: string; worktree: boolean }> {
+    const { cwd } = await this.isolation.reopen(task, run);
+    return { cwd, worktree: true };
+  }
+
+  private async prepareCwd(task: Task, run: IsolationRun): Promise<{ cwd: string; worktree: boolean }> {
+    const { cwd, copied } = await this.isolation.prepare(task, run);
     this.reportCopies(copied);
     return { cwd, worktree: true };
   }
@@ -383,10 +392,11 @@ export class IsolationRunController {
   }
 
   /**
-   * The tracked state of the workspace as an ops task starts, for
-   * {@link filesChangedSince} (ADR-0020). Null where the check does not run:
-   * a run that shares the workspace root, where every task's edits land in
-   * it, or a workspace git cannot isolate at all.
+   * The tracked state of the workspace as an attempt whose tree is checked
+   * starts (see `attemptKind.checksTree`), for {@link filesChangedSince}
+   * (ADR-0020). Null where the check does not run: a run that shares the
+   * workspace root, where every task's edits land in it, or a workspace git
+   * cannot isolate at all.
    */
   async snapshotWorkspace(): Promise<TreeSnapshot | null> {
     if (this.mode === 'shared') return null;

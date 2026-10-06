@@ -2,7 +2,7 @@ import { v4 as uuidv4 } from 'uuid';
 import {
   Task, RunnerId, flattenTasks,
   addTaskToPlan, removeTaskFromPlan, updateTaskInPlan, renumberTasks,
-  createTask,
+  createTask, opsFlag, inheritedOps,
 } from '../models/Task';
 import { extractObjectsWithKey, stripTrailingCommas, escapeControlCharsInStrings, PlanParseError, TASK_OPS_ENVELOPE_KEY } from './JsonExtractor';
 import { validateTaskEdit, checkModelAndModeValidity, type EditCatalog } from './TaskEditValidator';
@@ -185,17 +185,13 @@ function refCollidesWithExisting(name: string, originalFlatAll: Task[]): boolean
   return originalFlatAll.some((t) => t.title === name);
 }
 
-/**
- * The fields of a planner's `changes` it may set. `ops` decides where a task
- * runs, so anything but a literal true reads as a change task, as a parsed
- * plan reads it (ADR-0020).
- */
+/** The fields of a planner's `changes` it may set, with the ops flag read as every entry point reads it. */
 function updatableChanges(raw: Partial<Task> | undefined): Partial<Task> {
   const changes: Partial<Task> = {};
   for (const key of UPDATABLE_FIELDS) {
     if (raw && key in raw) (changes as Record<string, unknown>)[key] = (raw as Record<string, unknown>)[key];
   }
-  if ('ops' in changes) changes.ops = changes.ops === true ? true : undefined;
+  if ('ops' in changes) changes.ops = opsFlag(changes.ops);
   return changes;
 }
 
@@ -563,7 +559,7 @@ export function applyTaskOps(currentTasks: readonly Task[], ops: TaskOp[], runne
           taskMode: spec.taskMode ?? toMerge[0].taskMode,
           autonomy: spec.autonomy ?? toMerge.find((t) => t.autonomy)?.autonomy,
           sliceType: spec.sliceType ?? toMerge.find((t) => t.sliceType)?.sliceType,
-          ops: spec.ops ?? toMerge.every((t) => t.ops),
+          ops: inheritedOps(toMerge, spec.ops),
           userStoriesCovered: spec.userStoriesCovered ?? (toMerge.flatMap((t) => t.userStoriesCovered ?? []).length
             ? [...new Set(toMerge.flatMap((t) => t.userStoriesCovered ?? []))]
             : undefined),
@@ -623,7 +619,7 @@ export function applyTaskOps(currentTasks: readonly Task[], ops: TaskOp[], runne
             taskMode: spec.taskMode ?? target.taskMode,
             autonomy: spec.autonomy ?? target.autonomy,
             sliceType: spec.sliceType ?? target.sliceType,
-            ops: spec.ops ?? target.ops,
+            ops: inheritedOps([target], spec.ops),
             userStoriesCovered: spec.userStoriesCovered ?? target.userStoriesCovered,
           });
           newTasks.push(nt);
