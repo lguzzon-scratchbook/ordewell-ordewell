@@ -137,6 +137,19 @@ interface OpenTurn {
   abort: AbortController;
   ended: boolean;
   reason: StructuredTurnEnd;
+  /** The runner refused a message into this turn, so the rest wait for its end too. */
+  steerRefused: boolean;
+}
+
+/**
+ * A message not yet delivered (ADR-0023, Q1). `queued` waits for a turn to end
+ * and can be taken back; `steering` is being offered to the running turn;
+ * `handed_over` the runner accepted and owes a delivery.
+ */
+interface PendingMessage {
+  id: string;
+  text: string;
+  stage: 'queued' | 'steering' | 'handed_over';
 }
 
 interface SessionLaunch {
@@ -154,8 +167,9 @@ interface SessionLaunch {
  * an `ITerminalSession`, so everything downstream of `onOutput` is unchanged;
  * what a terminal cannot do sits on {@link StructuredSessionCapability}.
  *
- * Ordewell owns the message queue (M1): a message sent mid-turn waits for the
- * turn to end rather than being typed into a runner that is busy.
+ * Ordewell owns the message queue (M1). A message sent mid-turn is handed to a
+ * runner that can take one at its next step (ADR-0023); otherwise it waits for
+ * the turn to end rather than being typed into a runner that is busy.
  */
 export class StructuredSession extends AbstractTerminalSession implements StructuredSessionCapability {
   readonly transport = 'structured' as const;
@@ -169,7 +183,7 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
   private state: 'working' | 'idle' = 'idle';
   private turn: OpenTurn | null = null;
   private turnCount = 0;
-  private queue: QueuedTaskMessage[] = [];
+  private queue: PendingMessage[] = [];
   private messageCount = 0;
   private interrupting: Promise<void> | null = null;
   private lastSessionId: string | null = null;
@@ -263,7 +277,11 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     super.baseHandleExit(code);
   }
 
-  /** A reply typed at the task — a checkpoint answer, most often — is a user message. */
+  /**
+   * A reply typed at the task — a checkpoint answer, most often — is a user
+   * message like any other: into the running turn where the runner takes one,
+   * else the next turn. A runner that stopped to ask reads it at once either way.
+   */
   write(text: string): void {
     const message = text.trim();
     if (message) this.sendMessage(message);
@@ -297,21 +315,25 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     if (this.exited) this.emitEvent({ type: 'message_undelivered', messageId: id, text });
     else if (this.state === 'idle' && this.adapterStarted) this.deliver(text);
     else {
-      this.queue.push({ id, text });
+      this.queue.push({ id, text, stage: 'queued' });
       this.emitEvent({ type: 'message_queued', messageId: id, text });
+      this.offerNext();
     }
     return id;
   }
 
+  /** No runner can recall a message once offered to it, so only a queued one comes back. */
   removeQueued(id: string): boolean {
-    const before = this.queue.length;
-    this.queue = this.queue.filter((m) => m.id !== id);
-    if (this.queue.length === before) return false;
+    const message = this.queue.find((m) => m.id === id);
+    if (message?.stage !== 'queued') return false;
+    this.queue = this.queue.filter((m) => m !== message);
     this.emitEvent({ type: 'message_removed', messageId: id });
     return true;
   }
 
-  queued(): QueuedTaskMessage[] { return this.queue.map((m) => ({ ...m })); }
+  queued(): QueuedTaskMessage[] {
+    return this.queue.map(({ id, text, stage }) => (stage === 'queued' ? { id, text } : { id, text, handedOver: true }));
+  }
 
   nativeSessionId(): string | null {
     return this.adapter?.nativeSessionId() ?? this.lastSessionId;
@@ -343,7 +365,10 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     const turn = this.turn;
     const adapter = this.adapter;
     if (!turn || turn.ended || !adapter) return Promise.resolve();
-    this.interrupting = this.interruptTurn(turn, adapter).finally(() => { this.interrupting = null; });
+    this.interrupting = this.interruptTurn(turn, adapter).finally(() => {
+      this.interrupting = null;
+      this.offerNext();
+    });
     return this.interrupting;
   }
 
@@ -374,6 +399,8 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     this.generation += 1;
     turn.abort.abort();
     if (this.adapter) this.withdrawPermissions(this.adapter);
+    // The killed process takes what it was handed with it; the queue still has the messages.
+    for (const message of this.queue) this.requeue(message);
     try {
       await this.startAdapter({ ...this.startOptions, resumeSessionId });
     } catch (err) {
@@ -408,7 +435,7 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
 
   private openTurn(text: string, messageId?: string): OpenTurn {
     this.turnCount += 1;
-    const turn: OpenTurn = { id: this.turnCount, abort: new AbortController(), ended: false, reason: 'completed' };
+    const turn: OpenTurn = { id: this.turnCount, abort: new AbortController(), ended: false, reason: 'completed', steerRefused: false };
     this.turn = turn;
     this.state = 'working';
     this.emitEvent({ type: 'turn_start', text, ...(messageId ? { messageId } : {}) });
@@ -432,6 +459,58 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
       this.lastSessionId = adapter.nativeSessionId() ?? this.lastSessionId;
       if (generation === this.generation) this.endTurn(turn, turn.reason);
     });
+    this.offerNext();
+  }
+
+  /**
+   * Offer the oldest queued message to the running turn (ADR-0023, D2), one at
+   * a time so the runner takes them in the order they were sent. A refusal
+   * leaves it, and everything behind it, for the turn's end.
+   */
+  private offerNext(): void {
+    const adapter = this.adapter;
+    const turn = this.turn;
+    if (!adapter?.steer || !turn || turn.ended || turn.steerRefused || this.interrupting || this.exited) return;
+    if (this.queue.some((m) => m.stage === 'steering')) return;
+    const next = this.queue.find((m) => m.stage === 'queued');
+    if (!next) return;
+    next.stage = 'steering';
+    const generation = this.generation;
+    adapter.steer(next.id, next.text).catch(() => false).then((accepted) => {
+      if (generation === this.generation) this.steered(turn, next, accepted);
+    });
+  }
+
+  private steered(turn: OpenTurn, message: PendingMessage, accepted: boolean): void {
+    // Delivered, dropped or undelivered while the answer was on its way.
+    if (message.stage !== 'steering' || !this.queue.includes(message)) {
+      this.offerNext();
+      this.deliverNext();
+      return;
+    }
+    if (accepted) {
+      message.stage = 'handed_over';
+      this.emitEvent({ type: 'message_handed_over', messageId: message.id });
+      this.offerNext();
+      return;
+    }
+    message.stage = 'queued';
+    turn.steerRefused = true;
+    this.offerNext();
+    this.deliverNext();
+  }
+
+  private delivered(id: string): PendingMessage | undefined {
+    const message = this.queue.find((m) => m.id === id);
+    if (message) this.queue = this.queue.filter((m) => m !== message);
+    return message;
+  }
+
+  /** Back to waiting in Ordewell's queue, removable again; the log hears of it only if it had shown as handed over. */
+  private requeue(message: PendingMessage): void {
+    const was = message.stage;
+    message.stage = 'queued';
+    if (was === 'handed_over') this.emitEvent({ type: 'message_queued', messageId: message.id, text: message.text });
   }
 
   private route(adapter: TaskModeAgentAdapter, turn: OpenTurn | null, event: AgentEvent): void {
@@ -439,7 +518,16 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
       if (turn) turn.reason = event.interrupted ? 'interrupted' : 'completed';
     } else if (event.type === 'permission_request') this.openPermission(adapter, event);
     else if (event.type === 'permission_cancelled') this.cancelPermission(adapter, event.id);
-    else {
+    else if (event.type === 'message_delivered') {
+      const message = this.delivered(event.id);
+      if (message) this.emitEvent({ type: 'message_delivered', messageId: message.id, text: message.text });
+    } else if (event.type === 'message_dropped') {
+      const message = this.queue.find((m) => m.id === event.id);
+      if (!message) return;
+      this.requeue(message);
+      if (turn) turn.steerRefused = true;
+      this.deliverNext();
+    } else {
       if (event.type === 'error' && turn) turn.reason = 'failed';
       this.handleEvent(event);
     }
@@ -454,7 +542,20 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
   private handleOutOfTurn(adapter: TaskModeAgentAdapter, generation: number, event: AgentEvent): void {
     if (generation !== this.generation || this.exited) return;
     let turn = this.turn && !this.turn.ended ? this.turn : null;
-    if (!turn && TURN_OPENING_EVENTS.has(event.type)) turn = this.openTurn('');
+    if (!turn && event.type === 'message_delivered') {
+      // The runner opened a turn of its own for a message it was handed as the
+      // last one closed, so the message is that turn's, not a mid-turn read.
+      const message = this.delivered(event.id);
+      if (message) {
+        this.openTurn(message.text, message.id);
+        this.offerNext();
+      }
+      return;
+    }
+    if (!turn && TURN_OPENING_EVENTS.has(event.type)) {
+      turn = this.openTurn('');
+      this.offerNext();
+    }
     this.route(adapter, turn, event);
     if (turn && (event.type === 'turn_end' || event.type === 'error')) this.endTurn(turn, turn.reason);
   }
@@ -480,7 +581,7 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     }
   }
 
-  private handleEvent(event: Exclude<AgentEvent, { type: 'turn_end' | 'permission_request' | 'permission_cancelled' }>): void {
+  private handleEvent(event: Exclude<AgentEvent, { type: 'turn_end' | 'permission_request' | 'permission_cancelled' | 'message_delivered' | 'message_dropped' }>): void {
     switch (event.type) {
       case 'assistant_text_delta': this.text.delta(event.text); break;
       case 'assistant_text': this.text.block(event.text); break;
@@ -494,7 +595,9 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
   /**
    * A queued message goes out as the turn closes, and the state never passes
    * through `idle` on the way, so a listener told the turn ended can already
-   * see the task is not waiting.
+   * see the task is not waiting. Nor does a message the runner owes, or one
+   * still being offered: the runner is about to read it, or Ordewell to send
+   * it (ADR-0023, D5).
    */
   private endTurn(turn: OpenTurn, reason: StructuredTurnEnd): void {
     if (turn.ended) return;
@@ -504,8 +607,19 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     if (reason === 'failed') this.undeliverQueued();
     this.state = !this.exited && this.queue.length ? 'working' : 'idle';
     this.structuredEmitter.emit('turnEnd', reason);
-    const next = this.exited ? undefined : this.queue.shift();
-    if (next) this.deliver(next.text, next.id);
+    this.deliverNext();
+  }
+
+  /**
+   * Between turns the oldest message opens the next one — but only once it is
+   * back in Ordewell's hands: while it is on offer or owed, nothing overtakes it.
+   */
+  private deliverNext(): void {
+    if (this.exited || (this.turn && !this.turn.ended)) return;
+    const head = this.queue[0];
+    if (head?.stage !== 'queued') return;
+    this.queue.shift();
+    this.deliver(head.text, head.id);
   }
 
   private undeliverQueued(): void {

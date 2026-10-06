@@ -211,3 +211,58 @@ describe('undelivered messages in the saved task log', () => {
     ]);
   });
 });
+
+describe('a message read mid-turn in the saved task log (ADR-0023)', () => {
+  it('replays the message where Codex read it, inside the one turn, as the surfaces drew it live', async () => {
+    const rpc = (msg: Record<string, unknown>) => `${JSON.stringify({ jsonrpc: '2.0', ...msg })}\n`;
+    const item = (method: string, body: Record<string, unknown>) => rpc({ method, params: { threadId: 'thr-task-1', turnId: 'turn-a', item: body } });
+    const command = { id: 'cmd-1', type: 'commandExecution', command: 'sleep 20', cwd: '/repo' };
+    const spawned = fakeSpawn([
+      fixture('codex', 'handshake'),
+      fixture('codex', 'task-thread'),
+      (_written, proc) => proc.emitStdout(rpc({ method: 'turn/started', params: { threadId: 'thr-task-1', turn: { id: 'turn-a', status: 'inProgress', items: [] } } }) + item('item/started', command)),
+      (written, proc) => {
+        const steer = JSON.parse(written) as { id: number; params: { clientUserMessageId: string } };
+        proc.emitStdout(rpc({ id: steer.id, result: { turnId: 'turn-a' } }));
+        // Codex accepts at once and delivers once the command in flight completes.
+        setTimeout(() => proc.emitStdout(
+          item('item/completed', { ...command, aggregatedOutput: '', exitCode: 0 })
+          + item('item/started', { id: 'um-1', type: 'userMessage', clientId: steer.params.clientUserMessageId, content: [] })
+          + item('item/completed', { id: 'am-1', type: 'agentMessage', text: 'Using Postgres.' })
+          + rpc({ method: 'turn/completed', params: { threadId: 'thr-task-1', turn: { id: 'turn-a', status: 'completed', items: [] } } }),
+        ), 5);
+      },
+    ]);
+    const structured = new StructuredRunner({
+      process: { spawn: spawned.spawn, resolvePath: async () => '/usr/bin', platform: 'linux', isDirectory: () => true, exists: () => true },
+    });
+    const sent: SessionMessage[] = [];
+    const recorder = new TaskLogRecorder({ broadcast: (m) => sent.push(m), location: () => where, flushMs: 1 });
+    const session = await recorder.wrap(structured).spawn({ taskId: TASK, runner: 'codex', prompt: 'Do the task', cwd: '/repo', registry: new RunnerRegistry(), mode: 'fullAccess' });
+    if (!isStructuredSession(session)) throw new Error('expected a structured session');
+    const ended = turnEnds(session, 1);
+    await vi.waitFor(() => expect(sent.some((m) => m.type === 'task_log' && m.events.some((e) => e.type === 'tool_call'))).toBe(true));
+
+    const id = session.sendMessage('use Postgres');
+    await ended;
+    await vi.waitFor(() => expect(saved(1).some((e) => e.type === 'turn_end')).toBe(true));
+    session.kill();
+
+    const events = saved(1);
+    expect(events.filter((e) => e.type.startsWith('message_') || e.type.startsWith('turn_'))).toEqual([
+      { type: 'turn_start', message: 'Do the task' },
+      { type: 'message_queued', messageId: id, text: 'use Postgres' },
+      { type: 'message_handed_over', messageId: id },
+      { type: 'message_delivered', messageId: id, text: 'use Postgres' },
+      { type: 'turn_end', reason: 'completed' },
+    ]);
+    const live = sent
+      .filter((m): m is TaskLogMessage => m.type === 'task_log' && m.attempt === 1)
+      .reduce((view, m) => m.events.reduce(reduceTaskLog, view), EMPTY_TASK_LOG);
+    const replayed = replayTaskLog(events);
+    expect(replayed).toEqual(live);
+    expect(replayed.queued).toEqual([]);
+    expect(replayed.blocks.map((b) => (b.type === 'message' ? `${b.role}:${b.text}` : b.type)))
+      .toEqual(['user:Do the task', 'tool', 'user:use Postgres', 'agent:Using Postgres.']);
+  });
+});

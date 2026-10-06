@@ -17,7 +17,7 @@ import { finishedTool, pendingTool, settledMessage } from './records';
  * one at a time.
  */
 export interface TaskLogView extends BlockList {
-  /** Messages waiting for the running turn to end, oldest first. */
+  /** Messages not yet delivered, oldest first; `handedOver` marks the ones the runner already has. */
   readonly queued: readonly QueuedTaskMessage[];
   /** A turn is running. */
   readonly working: boolean;
@@ -213,8 +213,21 @@ function endTurn(view: TaskLogView, { reason }: Event<'turn_end'>): TaskLogView 
 }
 
 function queueMessage(view: TaskLogView, { messageId, text }: Event<'message_queued'>): TaskLogView {
-  if (view.queued.some((m) => m.id === messageId)) return view;
-  return { ...view, queued: [...view.queued, { id: messageId, text }] };
+  const listed = view.queued.find((m) => m.id === messageId);
+  if (!listed) return { ...view, queued: [...view.queued, { id: messageId, text }] };
+  if (!listed.handedOver) return view;
+  return { ...view, queued: view.queued.map((m) => (m === listed ? { id: m.id, text: m.text } : m)) };
+}
+
+function handOver(view: TaskLogView, { messageId }: Event<'message_handed_over'>): TaskLogView {
+  const listed = view.queued.find((m) => m.id === messageId);
+  if (!listed || listed.handedOver) return view;
+  return { ...view, queued: view.queued.map((m) => (m === listed ? { ...m, handedOver: true } : m)) };
+}
+
+/** The message joins the transcript where the runner read it, between the steps around it. */
+function deliverMidTurn(view: TaskLogView, event: Event<'message_delivered'>): TaskLogView {
+  return appendOutput(unqueueMessage(view, event), null, (id) => settledMessage(id, 'user', event.text));
 }
 
 function unqueueMessage(view: TaskLogView, { messageId }: { messageId: string }): TaskLogView {
@@ -243,6 +256,8 @@ export function reduceTaskLog(view: TaskLogView, event: TaskLogEvent): TaskLogVi
     case 'usage': return reportUsage(view, event);
     case 'message_queued': return queueMessage(view, event);
     case 'message_removed': return unqueueMessage(view, event);
+    case 'message_handed_over': return handOver(view, event);
+    case 'message_delivered': return deliverMidTurn(view, event);
     case 'message_undelivered': return append(unqueueMessage(view, event), (id) => settledMessage(id, 'system', `${event.text} · not delivered`));
     case 'error': return appendOutput(view, null, (id) => settledMessage(id, 'error', event.message));
     case 'approval_requested': return requestApproval(view, event);

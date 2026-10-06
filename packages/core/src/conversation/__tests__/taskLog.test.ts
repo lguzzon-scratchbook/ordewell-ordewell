@@ -257,3 +257,39 @@ describe('reduceTaskLog', () => {
     expect(EMPTY_TASK_LOG).toMatchObject({ blocks: [], queued: [], working: false });
   });
 });
+
+describe('reduceTaskLog with messages read mid-turn (ADR-0023)', () => {
+  const handedOver = replayTaskLog([
+    start,
+    { type: 'tool_call', id: 'c1', name: 'Bash', args: '{"command":"sleep 20"}' },
+    { type: 'message_queued', messageId: 'msg-1', text: 'use Postgres' },
+    { type: 'message_queued', messageId: 'msg-2', text: 'and docs' },
+    { type: 'message_handed_over', messageId: 'msg-1' },
+  ]);
+
+  it('marks the message the runner has, leaving the rest queued', () => {
+    expect(handedOver.queued).toEqual([{ id: 'msg-1', text: 'use Postgres', handedOver: true }, { id: 'msg-2', text: 'and docs' }]);
+    expect(reduceTaskLog(handedOver, { type: 'message_handed_over', messageId: 'msg-1' })).toBe(handedOver);
+    expect(reduceTaskLog(handedOver, { type: 'message_handed_over', messageId: 'nope' })).toBe(handedOver);
+  });
+
+  it('shows the message in the transcript where the runner read it, between the steps around it, and drops it from the queue', () => {
+    const view = replayTaskLog([
+      { type: 'text_delta', text: 'Waiting on the sleep' },
+      { type: 'tool_result', id: 'c1', output: '', success: true },
+      { type: 'message_delivered', messageId: 'msg-1', text: 'use Postgres' },
+      { type: 'text_delta', text: 'Switching.' },
+    ], handedOver);
+
+    expect(view.queued).toEqual([{ id: 'msg-2', text: 'and docs' }]);
+    expect(view.working).toBe(true);
+    const shown = view.blocks.map((b) => (b.type === 'message' ? `${b.role}:${b.text}${b.streaming ? '…' : ''}` : b.type));
+    expect(shown).toEqual(['user:Do the task', 'tool', 'agent:Waiting on the sleep', 'user:use Postgres', 'agent:Switching.…']);
+  });
+
+  it('puts a message the runner let go of back in the queue, removable again', () => {
+    const requeued = reduceTaskLog(handedOver, { type: 'message_queued', messageId: 'msg-1', text: 'use Postgres' });
+    expect(requeued.queued).toEqual([{ id: 'msg-1', text: 'use Postgres' }, { id: 'msg-2', text: 'and docs' }]);
+    expect(reduceTaskLog(requeued, { type: 'message_queued', messageId: 'msg-1', text: 'use Postgres' })).toBe(requeued);
+  });
+});

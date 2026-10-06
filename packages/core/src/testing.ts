@@ -195,6 +195,13 @@ export class FakeStructuredSession extends FakeTerminalSession implements Struct
   emitEvent(event: StructuredEvent): void {
     for (const cb of this.eventCbs) cb(event);
   }
+  /** The runner reads a queued message inside the running turn, as `StructuredSession` reports it (ADR-0023). */
+  deliverMidTurn(id: string): void {
+    const message = this.messages.find((m) => m.id === id);
+    if (!message) return;
+    this.messages = this.messages.filter((m) => m !== message);
+    this.emitEvent({ type: 'message_delivered', messageId: id, text: message.text });
+  }
   emitTurnEnd(reason: StructuredTurnEnd): void {
     const next = this.messages.shift();
     if (!next) this.state = 'idle';

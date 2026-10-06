@@ -78,6 +78,18 @@ export type AgentEvent =
    * rather than one the agent chose to end.
    */
   | { type: 'turn_end'; interrupted?: boolean }
+  /**
+   * The model has a message handed over by {@link TaskModeAgentAdapter.steer},
+   * by the runner's own account rather than because the write succeeded
+   * (ADR-0023, D3). With no turn open, the runner opened one for it.
+   */
+  | { type: 'message_delivered'; id: string }
+  /**
+   * The runner let go of a message it accepted from `steer` without showing it
+   * to the model — Codex does, for one its turn ended before consuming. It is
+   * Ordewell's to send again (ADR-0023, D4).
+   */
+  | { type: 'message_dropped'; id: string }
   /** The turn failed. Carries the agent's own words — never a Ordewell paraphrase. */
   | { type: 'error'; message: string };
 
@@ -202,6 +214,16 @@ export interface TaskModeAgentAdapter extends AgentAdapter {
   onOutOfTurn?(listener: (event: AgentEvent) => void): void;
   /** Registers a listener for the process ending, for any reason. Fires at most once. */
   onProcessExit(listener: (code: number) => void): void;
+  /**
+   * Hand a message to the running turn, for the runner to show the model at
+   * its next step boundary (ADR-0023, D1–D2). Resolves true once the runner
+   * accepted it: handed over, not yet delivered — the turn's events later
+   * carry `message_delivered` or `message_dropped` for `id`. False when the
+   * runner refused it or no turn is running; the caller keeps it for the
+   * turn's end. Absent on an adapter whose runner cannot take a message
+   * mid-turn.
+   */
+  steer?(id: string, text: string): Promise<boolean>;
   /**
    * Answer an open `permission_request`. False when the id is not open — it
    * was answered, cancelled, or never asked.

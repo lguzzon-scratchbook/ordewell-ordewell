@@ -241,3 +241,49 @@ describe('the task log tab (ADR-0018, V1)', () => {
     });
   });
 });
+
+describe('a message the runner reads mid-turn (ADR-0023)', () => {
+  beforeEach(() => {
+    cleanup();
+    api.postMessage.mockClear();
+  });
+
+  const before = [
+    { type: 'turn_start', message: 'Do the task' },
+    { type: 'tool_call', id: 'c1', name: 'Bash', args: '{"command":"sleep 20"}' },
+    { type: 'message_queued', messageId: 'm1', text: 'use Postgres' },
+    { type: 'message_queued', messageId: 'm2', text: 'then add tests' },
+    { type: 'message_handed_over', messageId: 'm1' },
+  ] as const;
+
+  it('marks a message the runner already has, with no way to take it back', () => {
+    render(<TaskLogApp />);
+    const view = replayTaskLog([...before]);
+    init({ working: true, queued: [...view.queued] }, [...view.blocks]);
+
+    expect(screen.getByText('handed over')).toBeTruthy();
+    const removes = screen.getAllByTitle('Remove this message');
+    expect(removes).toHaveLength(1);
+    act(() => { fireEvent.click(removes[0]); });
+    expect(api.postMessage).toHaveBeenCalledWith({ type: 'removeQueuedTaskMessage', id: 'm2' });
+  });
+
+  it('draws the message in the log where the runner read it, and takes it off the queue', () => {
+    render(<TaskLogApp />);
+    const view = replayTaskLog([
+      ...before,
+      { type: 'tool_result', id: 'c1', output: '', success: true },
+      { type: 'message_delivered', messageId: 'm1', text: 'use Postgres' },
+      { type: 'text', text: 'Switching to Postgres.' },
+    ]);
+    init({ working: true, queued: [...view.queued] }, [...view.blocks]);
+
+    expect(screen.queryByText('handed over')).toBeNull();
+    const prompt = screen.getByText('Do the task');
+    const read = screen.getByText('use Postgres');
+    const reply = screen.getByText('Switching to Postgres.');
+    expect(prompt.compareDocumentPosition(read) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(read.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText('then add tests')).toBeTruthy();
+  });
+});

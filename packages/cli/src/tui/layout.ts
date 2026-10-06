@@ -5,7 +5,7 @@ import { chatEditorRoomFor, chatPaneWidth, planPaneWidth } from './geometry';
 import { SLASH_COMMANDS, type SlashCategory } from './slash';
 import { findTask, planRows, plannerInFlight, selectedPlanRow, waitingApproval, type PlanRow, type TaskView, type TuiState } from './state';
 import { modesForTask } from './taskAssignment';
-import { ALL_PROVIDERS, approvalLabel, awaitingLabel, hasHiddenDetail, markAction, runnerForProvider, taskRowView, type AiProvider, type ApprovalBlock, type DisplayBlock, type TaskStatusKind } from '@ordewell/core';
+import { ALL_PROVIDERS, approvalLabel, awaitingLabel, hasHiddenDetail, markAction, runnerForProvider, taskRowView, type AiProvider, type ApprovalBlock, type DisplayBlock, type QueuedTaskMessage, type TaskStatusKind } from '@ordewell/core';
 
 /**
  * What each pane's content actually is, and therefore how far it can scroll.
@@ -110,19 +110,20 @@ function queuedBubble(text: string, cols: number): string[] {
 }
 
 /**
- * The task view's queued messages, one bubble each, in queue order. A queued
- * message is a turn that has not gone out yet; the highlighted one is what
- * ctrl-r takes back.
+ * The task view's undelivered messages, one bubble each, in queue order. A
+ * queued message has not reached the runner yet, and the highlighted one is
+ * what ctrl-r takes back; a handed-over one the runner already has and will
+ * show the model at its next step (ADR-0023).
  */
 export function taskQueuedRows(state: TuiState, cols: number): string[] {
   const tv = state.taskView;
   if (!tv) return [];
-  return tv.view.queued.flatMap((message, i) => queuedTaskBubble(message.text, i === tv.queuedIndex, cols));
+  return tv.view.queued.flatMap((message, i) => queuedTaskBubble(message, i === tv.queuedIndex, cols));
 }
 
-function queuedTaskBubble(text: string, selected: boolean, cols: number): string[] {
+function queuedTaskBubble({ text, handedOver }: QueuedTaskMessage, selected: boolean, cols: number): string[] {
   const marker = selected ? style.accent('❯') : style.grey('◇');
-  const tag = selected ? ' · queued · ctrl-r removes' : ' · queued';
+  const tag = handedOver ? ' · handed over' : selected ? ' · queued · ctrl-r removes' : ' · queued';
   const room = Math.max(1, cols - width(`❯ ◇  ${tag}`));
   return wrap(text, room).map((line, i) => i === 0
     ? truncate(`${marker} ${selected ? style.bold(line) : line}${style.grey(tag)}`, cols)

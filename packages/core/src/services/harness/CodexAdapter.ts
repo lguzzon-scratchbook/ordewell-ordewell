@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { isAbsolute, relative, sep } from 'path';
 import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter } from './AgentAdapter';
 import type { SubagentOutcome } from '../../models/Task';
@@ -57,6 +58,26 @@ interface ThreadItem {
   changes?: FileUpdateChange[];
   /** `collabAgentToolCall`: last known status of each target thread. */
   agentsStates?: Record<string, { status?: string; message?: string | null } | undefined>;
+  /** `userMessage`: the `clientUserMessageId` the input was steered under. */
+  clientId?: string | null;
+}
+
+/** A message steered into a turn (ADR-0023), until its `userMessage` item shows the model has it. */
+interface Steer {
+  /** The session's id for the message. */
+  id: string;
+  /** Codex answered the `turn/steer` with the turn's id. */
+  accepted: boolean;
+  settle(accepted: boolean): void;
+}
+
+interface CodexTurn {
+  /** Arrives with `turn/started` or the `turn/start` response, whichever lands first. */
+  id: string | null;
+  /** By the `clientUserMessageId` each was sent under. */
+  steers: Map<string, Steer>;
+  /** Steers asked for before Codex named the turn, sent once it does. */
+  onNamed: Array<() => void>;
 }
 
 interface FileUpdateChange {
@@ -258,11 +279,8 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   private startOpts: AgentStartOptions | null = null;
   /** Whether this turn has already emitted prose — see the `agentMessage` case. */
   private turnHasText = false;
-  /**
-   * The turn in flight. Its id arrives with `turn/started` or the `turn/start`
-   * response, whichever lands first; `turn/interrupt` cannot be sent without it.
-   */
-  private turn: { id: string | null } | null = null;
+  /** The turn in flight. `turn/interrupt` and `turn/steer` cannot be sent before it has an id. */
+  private turn: CodexTurn | null = null;
   /** The JSON-RPC id of the `turn/start` that opened {@link turn}. */
   private turnRequestId: number | null = null;
   /** The last turn this adapter ended — so its second end signal, landing late, ends nothing. */
@@ -455,6 +473,61 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   }
 
   /**
+   * `turn/steer` into the running turn (ADR-0023). Codex answers with the
+   * turn's id at once — acceptance, not delivery — and shows the input to the
+   * model after the item in flight, as a `userMessage` item carrying the
+   * `clientUserMessageId` sent; that item is the delivery. The request needs
+   * the turn's id, so a steer asked for before Codex named the turn waits for
+   * it, as an interrupt does. Refused when the turn has ended or is another one.
+   */
+  steer(id: string, text: string): Promise<boolean> {
+    const turn = this.turn;
+    if (!this.process || !turn) return Promise.resolve(false);
+    const clientId = randomUUID();
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const steer: Steer = {
+        id,
+        accepted: false,
+        settle: (accepted) => {
+          if (settled) return;
+          settled = true;
+          if (!accepted) turn.steers.delete(clientId);
+          resolve(accepted);
+        },
+      };
+      turn.steers.set(clientId, steer);
+      const send = () => this.requestSteer(turn.id!, text, clientId, (ok) => {
+        // An answer landing after the turn closed is for a steer already refused there.
+        if (!ok || this.turn !== turn) {
+          steer.settle(false);
+          return;
+        }
+        steer.accepted = true;
+        steer.settle(true);
+      });
+      void this.processEnded.then(() => steer.settle(false));
+      if (turn.id) send();
+      else turn.onNamed.push(send);
+    });
+  }
+
+  /** The one way input reaches a running turn: a task message, or a deny note. */
+  private requestSteer(turnId: string, text: string, clientUserMessageId?: string, answered?: (ok: boolean) => void): void {
+    const requestId = this.nextRequestId++;
+    if (answered) {
+      this.pendingRequests.set(requestId, (ok) => {
+        this.pendingRequests.delete(requestId);
+        answered(ok);
+      });
+    }
+    this.writeLine({
+      jsonrpc: '2.0', id: requestId, method: 'turn/steer',
+      params: { threadId: this.threadId, expectedTurnId: turnId, input: [{ type: 'text', text }], ...(clientUserMessageId ? { clientUserMessageId } : {}) },
+    });
+  }
+
+  /**
    * Answer an open approval in its own result schema. Codex's decline carries
    * no message, so a deny note reaches the agent as input steered into the
    * running turn.
@@ -465,17 +538,12 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
     this.openPermissions.delete(id);
     this.writeLine({ jsonrpc: '2.0', id: open.requestId, result: TASK_APPROVALS[open.method].answer(decision.decision, open.params) });
     const note = decision.decision === 'deny' ? decision.note?.trim() : undefined;
-    if (note && this.turn?.id) {
-      this.writeLine({
-        jsonrpc: '2.0', id: this.nextRequestId++, method: 'turn/steer',
-        params: { threadId: this.threadId, expectedTurnId: this.turn.id, input: [{ type: 'text', text: note }] },
-      });
-    }
+    if (note && this.turn?.id) this.requestSteer(this.turn.id, note);
     return true;
   }
 
   protected turnPayload(message: string): string {
-    this.turn = { id: null };
+    this.turn = { id: null, steers: new Map(), onNamed: [] };
     this.interruptRequested = false;
     this.turnRequestId = this.nextRequestId++;
     return `${JSON.stringify({
@@ -537,7 +605,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
 
     if (msg.id === this.turnRequestId && !msg.method) {
       if (msg.error) {
-        this.closeTurn();
+        this.closeTurn(emit);
         emit({ type: 'error', message: `Codex refused the turn: ${msg.error.message ?? 'unknown error'}` });
         return;
       }
@@ -630,7 +698,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
       case 'thread/status/changed': {
         const params = msg.params as { threadId?: string; status?: { type?: string } } | undefined;
         if (params?.threadId !== this.threadId || params?.status?.type !== 'idle' || !this.turn?.id) return;
-        this.closeTurn();
+        this.closeTurn(emit);
         emit(this.interruptRequested ? { type: 'turn_end', interrupted: true } : { type: 'turn_end' });
         return;
       }
@@ -661,7 +729,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
         if (this.subagentOf(msg.params?.threadId)) return;
         const failure = msg.params as { error?: { message?: string }; willRetry?: boolean } | undefined;
         if (failure?.willRetry) return;
-        this.closeTurn();
+        this.closeTurn(emit);
         emit({ type: 'error', message: failure?.error?.message || 'Codex ended the turn with an error.' });
         return;
       }
@@ -672,7 +740,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
         if (this.subagentOf(msg.params?.threadId)) return;
         const turn = msg.params?.turn as { id?: string; status?: string; error?: { message?: string } } | undefined;
         if (!this.turn || (turn?.id && turn.id === this.endedTurnId)) return;
-        this.closeTurn();
+        this.closeTurn(emit);
         if (this.interruptRequested || turn?.status === 'interrupted') {
           emit({ type: 'turn_end', interrupted: true });
         } else if (turn?.status === 'failed') {
@@ -690,17 +758,40 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   }
 
   private turnStarted(id: unknown): void {
-    if (!this.turn || this.turn.id || typeof id !== 'string') return;
-    this.turn.id = id;
+    const turn = this.turn;
+    if (!turn || turn.id || typeof id !== 'string') return;
+    turn.id = id;
     const interrupt = this.interruptOnStart;
     this.interruptOnStart = null;
     interrupt?.();
+    for (const send of turn.onNamed.splice(0)) send();
   }
 
-  private closeTurn(): void {
-    this.endedTurnId = this.turn?.id ?? null;
+  /**
+   * Ahead of the event that ends the turn: a steer Codex accepted and the turn
+   * never consumed is gone — Codex keeps no queue across turns — and one not
+   * yet accepted never will be (ADR-0023, D4).
+   */
+  private closeTurn(emit: (event: AgentEvent) => void): void {
+    const turn = this.turn;
+    this.endedTurnId = turn?.id ?? null;
     this.turn = null;
     this.interruptOnStart = null;
+    if (!turn) return;
+    for (const steer of [...turn.steers.values()]) {
+      if (steer.accepted) emit({ type: 'message_dropped', id: steer.id });
+      else steer.settle(false);
+    }
+    turn.steers.clear();
+  }
+
+  /** The `userMessage` item a steer turns into once the item before it completes: the model has it. */
+  private steerDelivered({ clientId }: ThreadItem, emit: (event: AgentEvent) => void): void {
+    const steer = clientId ? this.turn?.steers.get(clientId) : undefined;
+    if (!clientId || !steer) return;
+    this.turn?.steers.delete(clientId);
+    steer.settle(true);
+    emit({ type: 'message_delivered', id: steer.id });
   }
 
   /**
@@ -832,6 +923,9 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   private emitItemStart(item: ThreadItem | undefined, emit: (e: AgentEvent) => void, subagentId?: string): void {
     if (!item?.id) return;
     switch (item.type) {
+      case 'userMessage':
+        if (!subagentId) this.steerDelivered(item, emit);
+        return;
       case 'commandExecution':
         emit({ type: 'tool_call', id: item.id, name: 'shell', args: { command: item.command, cwd: item.cwd }, ...(subagentId ? { subagentId } : {}) });
         return;
@@ -873,6 +967,10 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
       return;
     }
     switch (item.type) {
+      // Codex announces the item started and completed; whichever lands first delivers.
+      case 'userMessage':
+        if (!subagentId) this.steerDelivered(item, emit);
+        return;
       // A Codex turn is several whole messages — progress commentary, then the
       // final answer — not a token stream. Concatenated raw they run together
       // ("…as requested.`head` failed because…"), so each one after the first
