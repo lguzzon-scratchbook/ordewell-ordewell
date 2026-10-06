@@ -1,5 +1,5 @@
 import type { Task, Verdict, VerificationCheck } from '../models/Task';
-import { isStructuredSession, type ITerminalSession } from '../interfaces/ITerminalRunner';
+import { isStructuredSession, type ITerminalSession, type StructuredSessionCapability } from '../interfaces/ITerminalRunner';
 import { flattenTerminalOutput, renderTerminalOutput } from './terminalRender';
 import type { CheckpointAnswer, TaskCompleteArgs } from './mcp/tools';
 
@@ -34,6 +34,8 @@ const IDLE_TIMEOUT_MS = 60_000;
 
 export class VerdictEngine {
   private markerSeen = new Set<string>();
+  private pendingVerdicts = new Map<string, Verdict>();
+  private structuredSessions = new Map<string, ITerminalSession & StructuredSessionCapability>();
   private markerTails = new Map<string, string>();
   private checkpointCarry = new Map<string, string>();
   private pausedSessions = new Map<string, ITerminalSession>();
@@ -197,22 +199,28 @@ export class VerdictEngine {
       this.markerTails.set(task.id, tail);
       if (markerVisible(tail, doneToken)) {
         this.markerSeen.add(task.id);
-        // Deliver verdict immediately instead of killing the session.
-        // The terminal stays open so the user can read output or keep chatting
-        // with the AI runner. Bump the generation so the onExit callback
-        // (which will fire when the terminal eventually closes) bails out.
-        this.forget(task.id);
-        this.bumpGeneration(task.id);
-        const verdict = this.decide(task, 0);
-        for (const l of this.listeners) l(task.id, verdict);
+        this.acceptVerdict(task.id, this.decide(task, 0));
         return;
       }
       this.scanCheckpoints(task.id, session, text);
     });
     if (isStructuredSession(session)) {
+      this.structuredSessions.set(task.id, session);
+      session.onTurnEnd(() => {
+        if (this.generations.get(task.id) !== gen) return;
+        // A queued follow-up supersedes this turn's evidence without ending the attempt.
+        const pending = this.pendingVerdicts.get(task.id);
+        this.pendingVerdicts.delete(task.id);
+        if (session.turnState() === 'idle' && pending) this.publishVerdict(task.id, pending);
+      });
       session.onEvent((event) => {
         if (this.generations.get(task.id) !== gen) return;
-        if (event.type === 'turn_start') this.resumeIdle(task.id);
+        if (event.type === 'turn_start') {
+          this.pendingVerdicts.delete(task.id);
+          this.markerTails.set(task.id, '');
+          this.checkpointCarry.set(task.id, '');
+          this.resumeIdle(task.id);
+        }
         else if (event.type === 'permission_request' && !event.decided) this.approvalOpened(task.id, event.id);
         else if (event.type === 'permission_decided' || event.type === 'permission_withdrawn') this.approvalClosed(task.id, event.id, gen);
       });
@@ -238,9 +246,21 @@ export class VerdictEngine {
    */
   signalComplete(taskId: string, generation: number, report: TaskCompleteArgs): void {
     if (this.generations.get(taskId) !== generation) return;
+    this.acceptVerdict(taskId, reportedVerdict(report));
+  }
+
+  private acceptVerdict(taskId: string, verdict: Verdict): void {
+    if (this.pendingVerdicts.has(taskId)) return;
+    if (this.structuredSessions.get(taskId)?.queued().length) {
+      this.pendingVerdicts.set(taskId, verdict);
+      return;
+    }
+    this.publishVerdict(taskId, verdict);
+  }
+
+  private publishVerdict(taskId: string, verdict: Verdict): void {
     this.forget(taskId);
     this.bumpGeneration(taskId);
-    const verdict = reportedVerdict(report);
     for (const l of this.listeners) l(taskId, verdict);
   }
 
@@ -312,6 +332,8 @@ export class VerdictEngine {
   }
 
   private forget(taskId: string): void {
+    this.pendingVerdicts.delete(taskId);
+    this.structuredSessions.delete(taskId);
     this.markerTails.delete(taskId);
     this.checkpointCarry.delete(taskId);
     this.pausedSessions.delete(taskId);
@@ -350,6 +372,8 @@ export class VerdictEngine {
 
   /** Drop all tracking state (used on stop / loadPlan). */
   reset(): void {
+    this.pendingVerdicts.clear();
+    this.structuredSessions.clear();
     this.markerSeen.clear();
     this.markerTails.clear();
     this.checkpointCarry.clear();

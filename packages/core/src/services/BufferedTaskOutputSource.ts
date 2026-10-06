@@ -27,6 +27,7 @@ interface Capture {
   exited: boolean;
   /** What the runner said it did in its `task_complete` call (ADR-0022, V4). */
   reported?: string;
+  turnStart?: number;
 }
 
 /**
@@ -54,8 +55,14 @@ export class BufferedTaskOutputSource implements TaskOutputSource {
       capture.exited = true;
     });
     if (isStructuredSession(session)) {
+      session.onEvent((event) => {
+        if (capture.attached && event.type === 'turn_start') {
+          capture.reported = undefined;
+          capture.turnStart = capture.dropped + capture.raw.length;
+        }
+      });
       session.onTaskComplete(({ summary }) => {
-        if (capture.attached && summary.trim()) capture.reported = summary.trim();
+        if (capture.attached) capture.reported = summary.trim() || undefined;
       });
     }
   }
@@ -86,7 +93,8 @@ export class BufferedTaskOutputSource implements TaskOutputSource {
       });
       if (transcript) return transcript;
     }
-    const raw = this.captures.get(attempt.taskId)?.raw ?? '';
+    const capture = this.captures.get(attempt.taskId);
+    const raw = capture?.raw.slice(Math.max(0, (capture.turnStart ?? 0) - capture.dropped)) ?? '';
     // A marker on the first painted row leaves nothing above the cut; the
     // uncut render is still better than an empty summary.
     return renderCleanCapture(raw, doneToken) || renderCleanCapture(raw);

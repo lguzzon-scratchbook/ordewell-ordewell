@@ -52,6 +52,7 @@ export type StructuredEvent =
   | { type: 'turn_end'; reason: StructuredTurnEnd }
   | { type: 'message_queued'; messageId: string; text: string }
   | { type: 'message_removed'; messageId: string }
+  | { type: 'message_undelivered'; messageId: string; text: string }
   /** An open `permission_request` was answered, by whoever answered it (ADR-0018, A1). */
   | { type: 'permission_decided'; id: string; decision: ApprovalDecision }
   /** An open `permission_request` can no longer be answered: the runner withdrew it, or its process is gone. */

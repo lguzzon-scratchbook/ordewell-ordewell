@@ -30,6 +30,7 @@ export type TaskLogEvent =
   | { type: 'usage'; record: UsageRecord }
   | { type: 'message_queued'; messageId: string; text: string }
   | { type: 'message_removed'; messageId: string }
+  | { type: 'message_undelivered'; messageId: string; text: string }
   /** The agent's own words for a failed turn. */
   | { type: 'error'; message: string }
   /**
@@ -106,6 +107,8 @@ export function toTaskLogEvent(event: StructuredEvent): TaskLogEvent | null {
       return { type: 'usage', record: event.record };
     case 'message_queued':
       return { type: 'message_queued', messageId: event.messageId, text: event.text };
+    case 'message_undelivered':
+      return { type: 'message_undelivered', messageId: event.messageId, text: event.text };
     case 'message_removed':
       return { type: 'message_removed', messageId: event.messageId };
     case 'error':

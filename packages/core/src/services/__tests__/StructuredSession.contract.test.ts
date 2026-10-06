@@ -2,6 +2,8 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { StructuredRunner } from '../StructuredRunner';
+import { VerdictEngine } from '../VerdictEngine';
+import { createTask, type Verdict } from '../../models/Task';
 import type { RunnerSpawnOptions } from '../AbstractRunner';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { isStructuredSession, type ITerminalSession, type StructuredEvent, type StructuredTurnEnd } from '../../interfaces/ITerminalRunner';
@@ -533,6 +535,30 @@ describe('the Ordewell task tools (ADR-0022)', () => {
     expect(result.isError).toBe(false);
     expect(reports).toEqual([{ status: 'done', summary: 'Built it.' }]);
     session.kill();
+  });
+
+  it('delivers a queued final-turn message before settling, with the same task token valid for the next report', async () => {
+    const { runner, adapters } = served();
+    const session = await runner.spawn(options());
+    if (!isStructuredSession(session)) throw new Error('not a structured session');
+    const engine = new VerdictEngine();
+    const verdicts: Verdict[] = [];
+    engine.onVerdict((_id, verdict) => { verdicts.push(verdict); session.kill(); });
+    engine.watch(createTask({ id: session.taskId, completionMarker: 'mk-1' }), session);
+    await until(() => adapters[0].sent.length === 1);
+    session.sendMessage('Also add tests');
+    const client = await connect(servedConfig(adapters[0]));
+    expect(await client.callTool({ name: 'task_complete', arguments: { status: 'done', summary: 'Original work' } })).toMatchObject({ isError: false });
+    expect(verdicts).toEqual([]);
+    adapters[0].endTurn();
+    await until(() => adapters[0].sent.length === 2);
+    expect(adapters[0].sent).toEqual(['Do the task', 'Also add tests']);
+    expect(verdicts).toEqual([]);
+    expect(await client.callTool({ name: 'task_complete', arguments: { status: 'failed', summary: 'Tests failed', reason: 'Assertion failed' } })).toMatchObject({ isError: false });
+    expect(verdicts).toHaveLength(1);
+    expect(verdicts[0].outcome).toBe('fail');
+    expect(verdicts[0].reason).toContain('Assertion failed');
+    engine.reset();
   });
 
   it('holds a checkpoint call open until the session answers it, and returns the answer', async () => {

@@ -217,7 +217,7 @@ function queueMessage(view: TaskLogView, { messageId, text }: Event<'message_que
   return { ...view, queued: [...view.queued, { id: messageId, text }] };
 }
 
-function unqueueMessage(view: TaskLogView, { messageId }: Event<'message_removed'>): TaskLogView {
+function unqueueMessage(view: TaskLogView, { messageId }: { messageId: string }): TaskLogView {
   const queued = view.queued.filter((m) => m.id !== messageId);
   return queued.length === view.queued.length ? view : { ...view, queued };
 }
@@ -243,6 +243,7 @@ export function reduceTaskLog(view: TaskLogView, event: TaskLogEvent): TaskLogVi
     case 'usage': return reportUsage(view, event);
     case 'message_queued': return queueMessage(view, event);
     case 'message_removed': return unqueueMessage(view, event);
+    case 'message_undelivered': return append(unqueueMessage(view, event), (id) => settledMessage(id, 'system', `${event.text} · not delivered`));
     case 'error': return appendOutput(view, null, (id) => settledMessage(id, 'error', event.message));
     case 'approval_requested': return requestApproval(view, event);
     case 'approval_decided': return decideApproval(view, event);
