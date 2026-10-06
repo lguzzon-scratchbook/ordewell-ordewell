@@ -264,6 +264,38 @@ export function claudeTurnEndQueue(runner: string, deps: AgentProcessDeps): Task
 }
 
 /**
+ * A Claude Code task turn recorded from `claude` 2.1.291 under
+ * `--replay-user-messages` (ADR-0023), cut where the steer was written so the
+ * rest arrives only once it is, as from the CLI. `before` answers the prompt;
+ * `answer` answers the steer, echoing the uuid it was written under.
+ *
+ * - `mid-turn`: written during a `sleep`, after the Bash call went out; read
+ *   with the call's result, inside the turn.
+ * - `after-result`: written while a text-only reply streamed; the turn ends,
+ *   then the CLI runs the message as a turn of its own.
+ */
+export function claudeSteerRecording(when: 'mid-turn' | 'after-result'): { before: string; answer: ScriptedReply } {
+  const name = when === 'mid-turn' ? 'task-steer' : 'task-steer-after-result';
+  const lines = fixture('claude-code', name).split('\n');
+  const cut = when === 'mid-turn'
+    ? lines.findIndex((line) => line.includes('"task_started"'))
+    : lines.findIndex((line) => line.includes('"text_delta"')) + 1;
+  return {
+    before: `${lines.slice(0, cut).join('\n')}\n`,
+    answer: (written, proc) => {
+      const { uuid } = JSON.parse(written) as { uuid: string };
+      const rest = fixture('claude-code', name, { STEER_UUID: uuid }).split('\n').slice(cut);
+      // The CLI's own turn starts a second or so after the `result`, never in
+      // the same chunk: the session has settled the closed turn by then.
+      const opens = rest.findIndex((line) => line.includes('"subtype":"init"'));
+      if (opens < 0) { proc.emitStdout(rest.join('\n')); return; }
+      proc.emitStdout(`${rest.slice(0, opens).join('\n')}\n`);
+      setTimeout(() => proc.emitStdout(rest.slice(opens).join('\n')), 5);
+    },
+  };
+}
+
+/**
  * One recorded OpenCode turn. OpenCode answers over HTTP rather than stdio, so
  * a turn is two recordings, not one transcript: the `/event` frames the server
  * pushed while the turn ran, and the settled response to the message POST.
