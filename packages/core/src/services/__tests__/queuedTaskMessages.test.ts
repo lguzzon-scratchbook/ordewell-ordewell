@@ -6,7 +6,7 @@ import { createTask } from '../../models/Task';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { fakeConfig, FakeStructuredSession, flushMicrotasks } from '../../testing';
 import { fakeNotification } from './sessionTestKit';
-import { fakeSpawn, scriptedAdapter } from './harnessTestKit';
+import { claudeTurnEndQueue, fakeSpawn, scriptedAdapter } from './harnessTestKit';
 import { isStructuredSession, type ITerminalRunner, type StructuredEvent } from '../../interfaces/ITerminalRunner';
 
 const runners: StructuredRunner[] = [];
@@ -132,7 +132,10 @@ describe('queued task messages before settlement', () => {
 describe('messages that cannot be delivered', () => {
   it.each(['kill', 'exit'] as const)('logs every queued message on %s and empties the queue', async (ending) => {
     const spawned = fakeSpawn([() => {}]);
-    const runner = new StructuredRunner({ process: { spawn: spawned.spawn, resolvePath: async () => '/usr/bin', platform: 'linux', isDirectory: () => true, exists: () => true } });
+    const runner = new StructuredRunner({
+      process: { spawn: spawned.spawn, resolvePath: async () => '/usr/bin', platform: 'linux', isDirectory: () => true, exists: () => true },
+      createAdapter: claudeTurnEndQueue,
+    });
     runners.push(runner);
     const session = await runner.spawn({ taskId: 't1', runner: 'claude-code', prompt: 'Do it', cwd: '/repo', registry: new RunnerRegistry() });
     if (!isStructuredSession(session)) throw new Error('expected structured');

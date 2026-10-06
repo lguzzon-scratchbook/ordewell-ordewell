@@ -8,7 +8,7 @@ import { supportsTaskMode, createTaskAdapter } from '../harness/taskAdapters';
 import { resolveArgs, resolveTaskRunnerFlags } from '../../plugins/resolveArgs';
 import { CLAUDE_CODE_MANIFEST } from '../../plugins/builtin/claude-code.manifest';
 import { mcpClientConfig } from '../mcp';
-import { modeIds, fakeSpawn, fixture, type ScriptedReply } from './harnessTestKit';
+import { modeIds, fakeSpawn, fixture, claudeSteerRecording, type ScriptedReply } from './harnessTestKit';
 
 /**
  * The adapter's task mode (ADR-0018, C1), against transcripts recorded from
@@ -108,6 +108,7 @@ describe('ClaudeCodeAdapter start switch', () => {
       '--output-format', 'stream-json',
       '--verbose',
       '--include-partial-messages',
+      '--replay-user-messages',
       '--permission-prompt-tool', 'stdio',
       '--permission-mode', 'default',
       '--disallowedTools', 'AskUserQuestion',
@@ -163,6 +164,7 @@ describe('ClaudeCodeAdapter task argv for every effort and mode', () => {
       '--output-format', 'stream-json',
       '--verbose',
       '--include-partial-messages',
+      '--replay-user-messages',
       '--permission-prompt-tool', 'stdio',
       '--permission-mode', permissionMode,
       '--disallowedTools', 'AskUserQuestion',
@@ -692,5 +694,119 @@ describe('ClaudeCodeAdapter with the Ordewell MCP server (ADR-0022)', () => {
     expect(events.find((e) => e.type === 'permission_request')).not.toHaveProperty('decided');
     expect(spawned.processes[0].written).toHaveLength(1);
     adapter.dispose();
+  });
+});
+
+/**
+ * Mid-turn delivery (ADR-0023), against transcripts recorded from `claude`
+ * 2.1.291 under `--replay-user-messages`, on haiku: a steer written during a
+ * `sleep`, and one written while the model was writing a text-only reply.
+ */
+describe('ClaudeCodeAdapter steer', () => {
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+  const midTurn = claudeSteerRecording('mid-turn');
+  const afterResult = claudeSteerRecording('after-result');
+
+  function steerLine(written: string): { type: string; uuid: string; message: { role: string; content: Array<{ type: string; text: string }> } } {
+    return JSON.parse(written) as ReturnType<typeof steerLine>;
+  }
+
+  it('writes the message as a user line under a uuid of its own, and reports it delivered when the CLI echoes that uuid', async () => {
+    const { spawned, processDeps } = deps([midTurn.before, midTurn.answer]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskIn('bypassPermissions'));
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('Run the sleep', (e) => events.push(e));
+    await until(() => events.some((e) => e.type === 'tool_call'));
+
+    expect(await adapter.steer('msg-1', 'Also include the word PINEAPPLE in your final reply.')).toBe(true);
+    const line = steerLine(spawned.processes[0].written[1]);
+    expect(line).toEqual({ type: 'user', uuid: expect.stringMatching(UUID), message: { role: 'user', content: [{ type: 'text', text: 'Also include the word PINEAPPLE in your final reply.' }] } });
+    await turn;
+
+    const at = (match: (e: AgentEvent) => boolean) => events.findIndex(match);
+    const delivered = at((e) => e.type === 'message_delivered');
+    // The first prompt is echoed too, and is no delivery.
+    expect(events.filter((e) => e.type === 'message_delivered')).toEqual([{ type: 'message_delivered', id: 'msg-1' }]);
+    expect(delivered).toBeGreaterThan(at((e) => e.type === 'tool_result'));
+    expect(delivered).toBeLessThan(at((e) => e.type === 'assistant_text' && e.text.includes('PINEAPPLE')));
+    expect(events.filter((e) => e.type === 'turn_end')).toEqual([{ type: 'turn_end' }]);
+    expect(events.at(-1)).toEqual({ type: 'turn_end' });
+    adapter.dispose();
+  });
+
+  it('a message the model did not read before the result opens the CLI\'s own turn, reported out of turn and written once', async () => {
+    const { spawned, processDeps } = deps([afterResult.before, afterResult.answer]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskIn('bypassPermissions'));
+    const outOfTurn: AgentEvent[] = [];
+    adapter.onOutOfTurn((e) => outOfTurn.push(e));
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('Say something about the sea', (e) => events.push(e));
+    await until(() => events.some((e) => e.type === 'assistant_text_delta'));
+
+    expect(await adapter.steer('msg-1', 'Now reply with only the word PINEAPPLE.')).toBe(true);
+    await turn;
+    expect(events.some((e) => e.type === 'message_delivered')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'turn_end' });
+
+    await until(() => outOfTurn.some((e) => e.type === 'turn_end'));
+    expect(outOfTurn[0]).toEqual({ type: 'message_delivered', id: 'msg-1' });
+    // A turn of its own: its text opens no paragraph after the last turn's.
+    expect(outOfTurn.filter((e) => e.type === 'assistant_text')).toEqual([{ type: 'assistant_text', text: 'PINEAPPLE' }]);
+    expect(outOfTurn.filter((e) => e.type === 'message_delivered' || e.type === 'message_dropped')).toHaveLength(1);
+    expect(spawned.processes[0].written.filter((w) => w.includes('PINEAPPLE'))).toHaveLength(1);
+    adapter.dispose();
+  });
+
+  it('reports each message delivered once, by its own echo, whatever else the CLI echoes', async () => {
+    const { spawned, processDeps } = deps([]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskStart());
+    const events: AgentEvent[] = [];
+    void adapter.send('Do it', (e) => events.push(e));
+    await adapter.steer('msg-1', 'one');
+    await adapter.steer('msg-2', 'two');
+    const [, first, second] = spawned.processes[0].written.map(steerLine);
+    // Accepted is not delivered: only the echo says the model has it.
+    expect(events.some((e) => e.type === 'message_delivered')).toBe(false);
+    const echo = (uuid: string) => `${JSON.stringify({ type: 'user', isReplay: true, uuid, session_id: 's', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'text', text: 'x' }] } })}\n`;
+
+    // A steer of another process — a stale attempt's, or a killed one's — is not this one's to report.
+    spawned.processes[0].emitStdout(echo('00000000-0000-4000-8000-000000000000') + echo(first.uuid) + echo(first.uuid) + echo(second.uuid));
+
+    expect(first.uuid).not.toBe(second.uuid);
+    expect(events.filter((e) => e.type === 'message_delivered')).toEqual([
+      { type: 'message_delivered', id: 'msg-1' },
+      { type: 'message_delivered', id: 'msg-2' },
+    ]);
+    adapter.dispose();
+  });
+
+  it('is refused, leaving the message for the turn\'s end, while an interrupt is in flight and before a resume is taken up', async () => {
+    const { spawned, processDeps } = deps([]);
+    const adapter = new ClaudeCodeAdapter(processDeps);
+    await adapter.start(taskStart({ resumeSessionId: 'sess-task-marker' }));
+    void adapter.send('go on', () => {});
+    expect(await adapter.steer('msg-1', 'too early')).toBe(false);
+
+    spawned.processes[0].emitStdout(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'sess-task-marker', permissionMode: 'acceptEdits' })}\n`);
+    void adapter.interrupt(50);
+    expect(await adapter.steer('msg-2', 'mid-interrupt')).toBe(false);
+    expect(spawned.processes[0].written.some((w) => w.includes('too early') || w.includes('mid-interrupt'))).toBe(false);
+    adapter.dispose();
+  });
+
+  it('is refused by a planner, and once the process is gone', async () => {
+    const planner = new ClaudeCodeAdapter(deps([]).processDeps);
+    await planner.start({ kind: 'planner', cwd: '/repo', systemPrompt: 'PLAN' });
+    expect(await planner.steer('msg-1', 'hi')).toBe(false);
+    planner.dispose();
+
+    const task = new ClaudeCodeAdapter(deps([]).processDeps);
+    await task.start(taskStart());
+    task.dispose();
+    expect(await task.steer('msg-1', 'hi')).toBe(false);
   });
 });

@@ -8,13 +8,15 @@ import { isStructuredSession, type ITerminalSession, type StructuredEvent, type 
 import { TaskModeUnsupportedError, type AgentEvent, type AgentStartOptions, type TaskModeAgentAdapter } from '../harness/AgentAdapter';
 import { ClaudeCodeAdapter } from '../harness/ClaudeCodeAdapter';
 import type { SpawnFn } from '../HeadlessRunner';
-import { fakeSpawn, fixture, type FakeSpawnResult, type ScriptedReply } from './harnessTestKit';
+import { claudeTurnEndQueue, fakeSpawn, fixture, type FakeSpawnResult, type ScriptedReply } from './harnessTestKit';
 
 /**
  * The structured transport (ADR-0018) driven through the real Claude Code
  * adapter and a fake process, fed transcripts recorded from `claude` 2.1.284.
  * What is asserted is what the orchestrator and the surfaces would see:
- * `onOutput`, the turn lifecycle, the queue, and `onExit`.
+ * `onOutput`, the turn lifecycle, the queue, and `onExit`. Those transcripts
+ * predate mid-turn delivery, so the adapter keeps the turn-end queue here;
+ * Claude's mid-turn delivery is covered in claudeTaskMode.test.ts.
  */
 
 const registry = new RunnerRegistry();
@@ -28,6 +30,7 @@ function harness(replies: ScriptedReply[], interruptGraceMs = 1000) {
   };
   const runner = new StructuredRunner({
     process: { spawn, resolvePath: async () => '/usr/bin', platform: 'linux', isDirectory: () => true, exists: () => true },
+    createAdapter: claudeTurnEndQueue,
     interruptGraceMs,
   });
   return { runner, spawned, spawns };
@@ -167,6 +170,7 @@ describe('StructuredRunner spawn', () => {
       '--output-format', 'stream-json',
       '--verbose',
       '--include-partial-messages',
+      '--replay-user-messages',
       '--permission-prompt-tool', 'stdio',
       '--permission-mode', 'acceptEdits',
       '--disallowedTools', 'AskUserQuestion',

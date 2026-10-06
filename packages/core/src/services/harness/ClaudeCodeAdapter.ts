@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import type { SubagentOutcome } from '../../models/Task';
 import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
@@ -36,6 +37,13 @@ const PROTOCOL_ARGS = [
   '--verbose',
   '--include-partial-messages',
 ];
+
+/**
+ * A task's stdin messages come back as `isReplay` echoes, and a steered one's
+ * echo is the only sign the model has it (ADR-0023): the CLI echoes it once
+ * it attaches the message to a tool result, or once it opens a turn for it.
+ */
+const TASK_PROTOCOL_ARGS = [...PROTOCOL_ARGS, '--replay-user-messages'];
 
 /**
  * How Claude Code reports an `Agent` call it decided to run in the background.
@@ -129,6 +137,9 @@ interface ClaudeLine {
   tool_use_id?: string;
   status?: string;
   summary?: string;
+  /** A `user` line the CLI echoes back from stdin under `--replay-user-messages`, with the `uuid` it was written under. */
+  isReplay?: boolean;
+  uuid?: string;
 }
 
 /** The tool Claude Code delegates to a subagent with — `Task` before it was renamed `Agent`. */
@@ -247,6 +258,10 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
   private mcpConfig: OwnerOnlyFile | null = null;
   /** Whether this process was given the server, so its tools' requests are Ordewell's own. */
   private givenOrdewell = false;
+  /** Messages written into a running task turn, by the `uuid` their echo will carry, until it does (ADR-0023). */
+  private readonly steers = new Map<string, string>();
+  /** The last turn's `result` ended it, so a steer's echo now opens a turn the CLI started for that message. */
+  private turnClosed = false;
 
   protected spawnSpec(opts: AgentStartOptions): SpawnSpec {
     if (opts.kind === 'task') return this.taskSpawnSpec(opts);
@@ -283,7 +298,7 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
   private taskSpawnSpec(opts: TaskStartOptions): SpawnSpec {
     this.requestedMode = opts.flags.permissionMode;
     const args = [
-      ...PROTOCOL_ARGS,
+      ...TASK_PROTOCOL_ARGS,
       '--permission-prompt-tool', 'stdio',
       '--permission-mode', opts.flags.permissionMode,
       '--disallowedTools', TASK_DISALLOWED_TOOLS.join(','),
@@ -343,6 +358,22 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
     if (!this.process) return false;
     this.interruptRequested = true;
     return (await this.control({ subtype: 'interrupt' }, timeoutMs))?.subtype === 'success';
+  }
+
+  /**
+   * A `user` line written mid-turn is Claude Code's own queue (ADR-0023): the
+   * CLI attaches it to the next tool result, or runs it as a turn of its own
+   * after `result` — an interrupted one included — so it never lets go of one,
+   * and nothing is ever reported dropped. Refused while an interrupt is in
+   * flight, and before a `--resume` is taken up: a refused resume closes stdin
+   * with the message unread.
+   */
+  async steer(id: string, text: string): Promise<boolean> {
+    if (this.role !== 'task' || !this.process || this.interruptRequested || this.pendingResume) return false;
+    const uuid = randomUUID();
+    this.steers.set(uuid, id);
+    this.writeLine({ type: 'user', uuid, message: { role: 'user', content: [{ type: 'text', text }] } });
+    return true;
   }
 
   /** Send a control request and wait for its answer; null when none came in time or the process ended. */
@@ -410,14 +441,33 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
   }
 
   protected turnPayload(message: string): string {
-    this.turnHasText = false;
-    this.interruptRequested = false;
-    this.resultHeld = false;
-    this.clearFollowOnTimer();
+    this.openTurnState();
     return `${JSON.stringify({
       type: 'user',
       message: { role: 'user', content: [{ type: 'text', text: message }] },
     })}\n`;
+  }
+
+  private openTurnState(): void {
+    this.turnHasText = false;
+    this.interruptRequested = false;
+    this.resultHeld = false;
+    this.turnClosed = false;
+    this.clearFollowOnTimer();
+  }
+
+  /**
+   * The echo of a steered message: the model has it. After a closed turn it
+   * opens the CLI's own turn for the message, which then runs like one Ordewell
+   * sent. The first prompt is echoed too, and is no steer.
+   */
+  private steerDelivered(uuid: string | undefined, emit: (event: AgentEvent) => void): void {
+    const id = uuid ? this.steers.get(uuid) : undefined;
+    if (!uuid || id === undefined) return;
+    this.steers.delete(uuid);
+    if (this.turnClosed) this.openTurnState();
+    else this.clearFollowOnTimer();
+    emit({ type: 'message_delivered', id });
   }
 
   protected handleLine(line: string, emit: (event: AgentEvent) => void): void {
@@ -520,6 +570,10 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
         return;
 
       case 'user':
+        if (msg.isReplay) {
+          this.steerDelivered(msg.uuid, emit);
+          return;
+        }
         // The transport echoes tool results back as a synthetic user message.
         for (const block of blocksOf(msg)) {
           if (block.type !== 'tool_result') continue;
@@ -561,13 +615,16 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
         this.reportSessionCost(msg, emit);
         if (this.interruptRequested && (msg.is_error || msg.subtype !== 'success')) {
           this.interruptRequested = false;
+          this.turnClosed = true;
           emit({ type: 'turn_end', interrupted: true });
         } else if (msg.is_error || (msg.subtype && msg.subtype !== 'success')) {
+          this.turnClosed = true;
           emit({ type: 'error', message: msg.result?.trim() || msg.errors?.join('\n').trim() || `Claude Code ended the turn: ${msg.subtype ?? 'error'}` });
         } else if (this.role === 'task' && this.backgroundTaskCount > 0) {
           this.resultHeld = true;
         } else {
           this.resultHeld = false;
+          this.turnClosed = true;
           emit({ type: 'turn_end' });
         }
         return;
@@ -601,6 +658,7 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
     this.followOnTimer = setTimeout(() => {
       this.followOnTimer = null;
       this.resultHeld = false;
+      this.turnClosed = true;
       emit({ type: 'turn_end' });
     }, FOLLOW_ON_TURN_GRACE_MS);
     this.followOnTimer.unref?.();

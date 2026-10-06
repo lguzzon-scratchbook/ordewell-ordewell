@@ -3,7 +3,9 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import type { ChildProcess } from 'child_process';
 import type { SpawnFn } from '../HeadlessRunner';
-import type { AgentAdapterFactory, AgentEvent } from '../harness/AgentAdapter';
+import type { AgentAdapterFactory, AgentEvent, AgentProcessDeps, TaskModeAgentAdapter } from '../harness/AgentAdapter';
+import { ClaudeCodeAdapter } from '../harness/ClaudeCodeAdapter';
+import { createTaskAdapter } from '../harness/taskAdapters';
 import type { RunnerPluginManifest } from '../../plugins/types';
 
 /**
@@ -247,6 +249,50 @@ export function scriptedAdapter(turns: AgentEvent[][], agentId = 'claude-code'):
     nativeSessionId: () => null,
     dispose: () => {},
   });
+}
+
+/**
+ * The structured runner's `createAdapter`, with Claude Code as it was before
+ * it took messages mid-turn (ADR-0023): the real adapter, `steer` taken away.
+ * The transcripts recorded before `--replay-user-messages` carry no
+ * echoes, so the scenarios that play them keep covering the turn-end queue
+ * and taking a message back.
+ */
+export function claudeTurnEndQueue(runner: string, deps: AgentProcessDeps): TaskModeAgentAdapter {
+  const adapter = createTaskAdapter(runner, deps);
+  return adapter instanceof ClaudeCodeAdapter ? Object.assign(adapter, { steer: undefined }) : adapter;
+}
+
+/**
+ * A Claude Code task turn recorded from `claude` 2.1.291 under
+ * `--replay-user-messages` (ADR-0023), cut where the steer was written so the
+ * rest arrives only once it is, as from the CLI. `before` answers the prompt;
+ * `answer` answers the steer, echoing the uuid it was written under.
+ *
+ * - `mid-turn`: written during a `sleep`, after the Bash call went out; read
+ *   with the call's result, inside the turn.
+ * - `after-result`: written while a text-only reply streamed; the turn ends,
+ *   then the CLI runs the message as a turn of its own.
+ */
+export function claudeSteerRecording(when: 'mid-turn' | 'after-result'): { before: string; answer: ScriptedReply } {
+  const name = when === 'mid-turn' ? 'task-steer' : 'task-steer-after-result';
+  const lines = fixture('claude-code', name).split('\n');
+  const cut = when === 'mid-turn'
+    ? lines.findIndex((line) => line.includes('"task_started"'))
+    : lines.findIndex((line) => line.includes('"text_delta"')) + 1;
+  return {
+    before: `${lines.slice(0, cut).join('\n')}\n`,
+    answer: (written, proc) => {
+      const { uuid } = JSON.parse(written) as { uuid: string };
+      const rest = fixture('claude-code', name, { STEER_UUID: uuid }).split('\n').slice(cut);
+      // The CLI's own turn starts a second or so after the `result`, never in
+      // the same chunk: the session has settled the closed turn by then.
+      const opens = rest.findIndex((line) => line.includes('"subtype":"init"'));
+      if (opens < 0) { proc.emitStdout(rest.join('\n')); return; }
+      proc.emitStdout(`${rest.slice(0, opens).join('\n')}\n`);
+      setTimeout(() => proc.emitStdout(rest.slice(opens).join('\n')), 5);
+    },
+  };
 }
 
 /**

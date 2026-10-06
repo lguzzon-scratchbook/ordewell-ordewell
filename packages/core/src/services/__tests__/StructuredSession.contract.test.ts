@@ -11,7 +11,7 @@ import type { AgentEvent, AgentProcessDeps, AgentStartOptions, TaskModeAgentAdap
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import { FakeStructuredSession, FakeTerminalSession } from '../../testing';
 import { OrdewellMcpServer, type CheckpointAnswer, type McpClientConfig } from '../mcp';
-import { fakeSpawn, fixture, sseResponse, type FakeAgentProcess, type FakeEventStream, type ScriptedReply } from './harnessTestKit';
+import { claudeSteerRecording, fakeSpawn, fixture, sseResponse, type FakeAgentProcess, type FakeEventStream, type ScriptedReply } from './harnessTestKit';
 
 /**
  * The `ITerminalSession` contract a structured task keeps (ADR-0018, O1a/S2):
@@ -706,6 +706,48 @@ describe('a message sent mid-turn (ADR-0023)', () => {
     await until(() => adapters[0].sent.length === 2);
 
     expect(turn.events.some((e) => e.type === 'message_handed_over' || e.type === 'message_delivered')).toBe(false);
+    turn.session.kill();
+  });
+
+  it('reaches the real Claude Code adapter as a user line, and leaves the queue when the CLI echoes it after the tool result', async () => {
+    const recording = claudeSteerRecording('mid-turn');
+    const { runner, spawned } = recorded([recording.before, recording.answer]);
+    const turn = observe(await runner.spawn(options({ mode: 'bypassPermissions' })));
+    await until(() => turn.events.some((e) => e.type === 'tool_call'));
+
+    const id = turn.session.sendMessage('Also include the word PINEAPPLE in your final reply.');
+    await until(() => turn.turnEnds.length === 1);
+
+    // The fake answers within the write, so the echo can beat the handover's own report; delivery is what counts.
+    const at = (match: (e: StructuredEvent) => boolean) => turn.events.findIndex(match);
+    expect(at((e) => e.type === 'message_delivered' && e.messageId === id)).toBeGreaterThan(at((e) => e.type === 'tool_result'));
+    expect(turn.events.filter((e) => e.type === 'turn_start')).toEqual([{ type: 'turn_start', text: 'Do the task' }]);
+    expect(turn.session.getOutput()).toContain('PINEAPPLE');
+    expect(turn.session.queued()).toEqual([]);
+    expect(turn.session.turnState()).toBe('idle');
+    expect(spawned.processes[0].written.filter((w) => w.includes('PINEAPPLE'))).toHaveLength(1);
+    turn.session.kill();
+  });
+
+  it('keeps a Claude Code task working past a turn end with a message owed, and gives the turn the CLI opens for it to that message', async () => {
+    const recording = claudeSteerRecording('after-result');
+    const { runner, spawned } = recorded([recording.before, recording.answer]);
+    const turn = observe(await runner.spawn(options({ mode: 'bypassPermissions' })));
+    const states: string[] = [];
+    turn.session.onTurnEnd(() => states.push(turn.session.turnState()));
+    await until(() => turn.events.some((e) => e.type === 'assistant_text_delta'));
+
+    const id = turn.session.sendMessage('Now reply with only the word PINEAPPLE.');
+    await until(() => turn.turnEnds.length === 2);
+
+    expect(states).toEqual(['working', 'idle']);
+    expect(turn.events.filter((e) => e.type === 'turn_start')).toEqual([
+      { type: 'turn_start', text: 'Do the task' },
+      { type: 'turn_start', text: 'Now reply with only the word PINEAPPLE.', messageId: id },
+    ]);
+    expect(turn.session.getOutput().trim().endsWith('PINEAPPLE')).toBe(true);
+    expect(turn.session.queued()).toEqual([]);
+    expect(spawned.processes[0].written.filter((w) => w.includes('PINEAPPLE'))).toHaveLength(1);
     turn.session.kill();
   });
 

@@ -14,7 +14,7 @@ import { isStructuredSession, type ITerminalRunner, type ITerminalSession } from
 import { listTaskLogAttempts, readTaskLog, type TaskLogLocation } from '../../utils/taskLogStore';
 import { sessionDataDir } from '../../utils/sessionStore';
 import { FakeStructuredSession } from '../../testing';
-import { fakeSpawn, fixture, type ScriptedReply } from './harnessTestKit';
+import { claudeTurnEndQueue, fakeSpawn, fixture, type ScriptedReply } from './harnessTestKit';
 
 /**
  * A structured task's log on disk against what surfaces drew live (ADR-0018,
@@ -41,6 +41,7 @@ function recording(replies: ScriptedReply[], wrap: (runner: ITerminalRunner) => 
   const spawned = fakeSpawn(replies);
   const structured = new StructuredRunner({
     process: { spawn: spawned.spawn, resolvePath: async () => '/usr/bin', platform: 'linux', isDirectory: () => true, exists: () => true },
+    createAdapter: claudeTurnEndQueue,
     interruptGraceMs: 1000,
   });
   const sent: SessionMessage[] = [];
