@@ -1,4 +1,4 @@
-import { capConflictFiles, describeMergeResult, type IsolationMergeResult } from '@ordewell/core';
+import { capConflictFiles, describeMergeResult, namedRepos, type IsolationMergeResult } from '@ordewell/core';
 import type { HandoffRepoView, HandoffView, LandedTaskView, TaskIsolationView } from './tui/state';
 
 /**
@@ -165,9 +165,8 @@ export function repoResultLines(handoff: HandoffView): string[] {
   });
 }
 
-/** The repos a task changed, for a row that names them; none for a group of one. */
 export function taskRepoNames(isolation: TaskIsolationView | undefined): string[] {
-  return (isolation?.repos ?? []).filter((r) => r !== '.');
+  return namedRepos(isolation?.repos);
 }
 
 /**

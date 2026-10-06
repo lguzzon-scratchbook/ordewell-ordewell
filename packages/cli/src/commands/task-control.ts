@@ -1,7 +1,7 @@
 import { flag, hasFlag, positionals, readLastSession, resolveTaskId } from '../utils';
 import { askYesNo, fail } from './shared';
 import { ensureDaemon, ApiClient, resolvePort } from '../daemonClient';
-import type { SerializedPlan } from '@ordewell/core';
+import { pastGateConfirmation, titledTaskRef, type SerializedPlan } from '@ordewell/core';
 
 type Action = 'run' | 'force-start' | 'retry' | 'cancel';
 
@@ -71,7 +71,7 @@ async function confirmPastGate(subArgs: string[], api: ApiClient, sessionId: str
   // left to answer the start itself.
   const unmerged = await api.getMergeGate(sessionId, taskId).catch(() => []);
   if (unmerged.length === 0) return;
-  const question = `This task waits for Merge all: the work of ${unmerged.map((d) => `#${d.order} ${d.title}`).join(', ')} is not merged into your branch yet, so it would act without it. Starting it now is kept on the task. Start it anyway?`;
+  const question = `${pastGateConfirmation(unmerged.map((d) => titledTaskRef(d)))} Start it anyway?`;
   if (!(await confirm(question))) fail('Not started — nothing was changed. Pass --yes to start it without a prompt.');
 }
 

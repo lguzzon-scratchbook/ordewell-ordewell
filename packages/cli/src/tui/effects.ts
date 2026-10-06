@@ -1,6 +1,6 @@
 import { execSync } from 'child_process';
 import {
-  ALL_PROVIDERS, autonomyLevelLabel, clipboardCopyCommand, isCliProvider, type AiProvider, type ApprovalAnswer, type HasBinFn, type LegacyPlanState,
+  ALL_PROVIDERS, autonomyLevelLabel, clipboardCopyCommand, isCliProvider, markRequestFor, newTaskFields, type AiProvider, type ApprovalAnswer, type HasBinFn, type LegacyPlanState,
   type PlannerModelRecall, type SerializedPlan, type SessionMeta, type TaskLogEvent,
 } from '@ordewell/core';
 import { describeConnectionRefused, isConnectionRefused } from '../daemonClient';
@@ -250,14 +250,12 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
 
     case 'taskAction': {
       const { sessionId, taskId, action } = effect;
-      // The daemon has no skip endpoint: the VS Code extension implements skip
-      // as "mark it done and move on", so the TUI does the same thing.
       const request =
-        action === 'complete' || action === 'skip'
-          ? () => api.markTaskComplete(sessionId, taskId)
-          : action === 'uncomplete'
+        action === 'cancel' || action === 'retry' || action === 'force-start'
+          ? () => api.taskControl(sessionId, taskId, action)
+          : markRequestFor(action) === 'uncomplete'
             ? () => api.markTaskIncomplete(sessionId, taskId)
-            : () => api.taskControl(sessionId, taskId, action);
+            : () => api.markTaskComplete(sessionId, taskId);
       // A spawning action (see `taskActionEffect`) reports its progress the same
       // way a whole run does, so it needs the same stream open around it.
       await (effect.watch ? withExecutionStream(deps, sessionId, request) : request());
@@ -265,15 +263,13 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       return;
     }
 
-    case 'addTask':
-      await api.addTask(effect.sessionId, {
-        title: effect.title,
-        description: effect.title,
-        prompt: effect.title,
-        type: 'ai',
-      });
+    case 'addTask': {
+      const fields = newTaskFields(effect.title);
+      if (!fields) return;
+      await api.addTask(effect.sessionId, { ...fields });
       await refreshPlan(deps, effect.sessionId);
       return;
+    }
 
     case 'updateTask':
       await api.updateTask(effect.sessionId, effect.taskId, effect.changes);

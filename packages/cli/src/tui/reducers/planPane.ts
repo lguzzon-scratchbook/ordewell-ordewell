@@ -1,3 +1,4 @@
+import { markAction, taskRef } from '@ordewell/core';
 import { applyKey, emptyEditor, type EditorState } from '../editor';
 import { taskEditorRoom } from '../geometry';
 import { findTask, planRows, selectedPlanRow, type TaskView, type TuiState } from '../state';
@@ -30,14 +31,6 @@ export function taskActionEffect(state: TuiState, sessionId: string, taskId: str
   return watch
     ? { type: 'taskAction', sessionId, taskId, action, watch: true }
     : { type: 'taskAction', sessionId, taskId, action };
-}
-
-/**
- * `m` is one key in both directions: a done task un-marks, anything else marks.
- * A second key for the reverse of a toggle is a key nobody remembers.
- */
-export function markAction(task: { status: string }): TaskAction {
-  return task.status === 'completed' ? 'uncomplete' : 'complete';
 }
 
 export function handlePlanKey(state: TuiState, key: Key): Step {
@@ -142,6 +135,6 @@ function commitTaskEdit(state: TuiState, task: TaskView, editor: EditorState): S
     sessionId: state.sessionId,
     taskId: task.id,
     changes: { prompt },
-    message: `Task #${task.order} prompt updated.`,
+    message: `Task ${taskRef(task)} prompt updated.`,
   }]);
 }

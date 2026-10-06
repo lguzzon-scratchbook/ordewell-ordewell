@@ -1,4 +1,4 @@
-import type { AiProvider } from '@ordewell/core';
+import { taskRef, type AiProvider } from '@ordewell/core';
 import { bodyRows, helpScrollMax } from '../layout';
 import { findTask, visibleItems, type PickerItem, type PickerState, type TuiState } from '../state';
 import type { Key } from '../keys';
@@ -193,8 +193,8 @@ function choose(state: TuiState, picker: PickerState, item: PickerItem | undefin
       taskId: task.id,
       changes: { dependencies: picker.chosen },
       message: picker.chosen.length > 0
-        ? `Task #${task.order} now depends on ${picker.chosen.length} task${picker.chosen.length === 1 ? '' : 's'}.`
-        : `Task #${task.order} no longer depends on anything.`,
+        ? `Task ${taskRef(task)} now depends on ${picker.chosen.length} task${picker.chosen.length === 1 ? '' : 's'}.`
+        : `Task ${taskRef(task)} no longer depends on anything.`,
     }]);
   }
   if (!item) return step(state);

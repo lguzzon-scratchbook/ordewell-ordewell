@@ -10,6 +10,16 @@ export function taskOrderLabel(task: { order: number }, parent?: { order: number
   return parent ? `${parent.order}.${task.order}` : String(task.order);
 }
 
+/** How a surface refers to a task in prose: "#2", or "#2.1" for a subtask. */
+export function taskRef(task: { order: number }, parent?: { order: number }): string {
+  return `#${taskOrderLabel(task, parent)}`;
+}
+
+/** A task named in full, as a confirmation or a picker title does: "#2 Deploy". */
+export function titledTaskRef(task: { order: number; title: string }, parent?: { order: number }): string {
+  return `${taskRef(task, parent)} ${task.title}`;
+}
+
 /** Resolve a dotted label to a task in a plan's top-level task list. */
 export function resolveOrderLabel(tasks: Task[], label: string): Task | undefined {
   const parts = label.split('.');

@@ -2,6 +2,7 @@ import { Task, RunnerId, DiscoveredModel, TaskModelAssignment, TaskMode } from '
 import { canSetDependencies } from './TaskOps';
 import { effectiveAllowlist } from './ModelAllowlistResolver';
 import type { RunnerModeInfo } from './ModeResolver';
+import { NOT_STARTED } from '../taskRow/status';
 
 /**
  * Who is making the edit. The planner (`applyTaskOps`) and the direct-edit
@@ -112,9 +113,6 @@ function typeCoherenceCheck(target: Task, changes: Partial<Task>): TaskEditCheck
   }
   return { ok: true, clear: target.userSteps && target.userSteps.length > 0 ? ['userSteps'] : [] };
 }
-
-/** Statuses of a task that has not started: the only ones whose ops flag may still change (ADR-0020). */
-const NOT_STARTED: ReadonlySet<Task['status']> = new Set<Task['status']>(['pending', 'approved', 'blocked']);
 
 /**
  * Whether a task may become an ops task, or stop being one (ADR-0020). Only a

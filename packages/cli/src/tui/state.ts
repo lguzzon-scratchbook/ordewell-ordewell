@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_PARALLEL, EMPTY_CONVERSATION, EMPTY_HOLD, NO_TURN, type ApprovalBlock, type AwaitingReason, type ConversationView, type PromptHold, type RunnerTransport, type TaskLogEvent, type TaskLogView, type TaskTransport, type TurnGate } from '@ordewell/core';
+import { DEFAULT_MAX_PARALLEL, EMPTY_CONVERSATION, EMPTY_HOLD, NO_TURN, isTaskRunning, type ApprovalBlock, type AwaitingReason, type ConversationView, type PromptHold, type RunnerTransport, type TaskLogEvent, type TaskLogView, type TaskTransport, type TurnGate } from '@ordewell/core';
 import { emptyEditor, type EditorState } from './editor';
 
 export type RunStatus = 'idle' | 'planning' | 'researching' | 'executing';
@@ -441,9 +441,7 @@ export interface TuiState {
   spinnerFrame: number;
 }
 
-/** A task with a runner live behind it. `in_progress` is the store's own status. */
-export const isTaskRunning = (task: { status: string }): boolean =>
-  task.status === 'in_progress' || task.status === 'running';
+export { isTaskRunning };
 
 /**
  * Whether the plan pane has a spinner to animate. Deliberately not

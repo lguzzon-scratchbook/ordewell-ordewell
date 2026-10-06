@@ -4,10 +4,9 @@ import ModelSelector, { getModelClass, providerLabel } from './ModelSelector';
 import DependencyPicker from './DependencyPicker';
 import { lastLine } from '../taskOutput';
 import { checkLabel } from '../checkLabel';
-import { awaitingLabel } from '../awaitingLabel';
 import { useFollowOutput } from '../followOutput';
-import { dependencyCandidates, capConflictFiles } from '@ordewell/core/plan-utils';
-import { Task, DiscoveredModel, TaskModelAssignment, TaskIsolation } from '@ordewell/core';
+import { dependencyCandidates, capConflictFiles, taskRowView } from '@ordewell/core/plan-utils';
+import type { Task, DiscoveredModel, TaskModelAssignment, TaskIsolation, TaskRowAction, TaskRowView, TaskStatusKind } from '@ordewell/core';
 
 export interface RunnerMode {
   id: string;
@@ -77,23 +76,32 @@ interface TaskCardProps {
   onExpandedChange?: (expanded: boolean) => void;
 }
 
-const STATUS_CONFIG: Record<string, { label: string; cls: string }> = {
-  completed: { label: 'Done', cls: 'status-completed' },
+export const STATUS_BADGE: Record<TaskStatusKind, { label: string; cls: string }> = {
+  done: { label: 'Done', cls: 'status-completed' },
   failed: { label: 'Failed', cls: 'status-failed' },
-  in_progress: { label: 'Running', cls: 'status-running' },
+  running: { label: 'Running', cls: 'status-running' },
+  quiet: { label: 'Stalled', cls: 'status-stalled' },
   blocked: { label: 'Blocked', cls: 'status-blocked' },
-  pending: { label: 'To do', cls: 'status-pending' },
-  approved: { label: 'To do', cls: 'status-pending' },
-  awaiting_user: { label: 'Awaiting User', cls: 'status-blocked' },
-  stalled: { label: 'Stalled', cls: 'status-stalled' },
+  todo: { label: 'To do', cls: 'status-pending' },
+  awaiting: { label: 'Awaiting User', cls: 'status-blocked' },
+};
+
+/** The status badge: what an awaiting task waits on, where it was saved, outranks the generic word. */
+export function statusBadge(row: Pick<TaskRowView, 'status' | 'awaiting'>): { label: string; cls: string } {
+  const badge = STATUS_BADGE[row.status];
+  return { ...badge, label: row.awaiting ?? badge.label };
+}
+
+const CHECK_STATE: Record<TaskStatusKind, 'done' | 'running' | 'stalled' | 'todo'> = {
+  done: 'done', running: 'running', quiet: 'stalled', todo: 'todo', awaiting: 'todo', blocked: 'todo', failed: 'todo',
 };
 
 /** Minimal to-do / done indicator: empty ring → pulsing ring → filled check.
  *  The ring is a toggle: clicking an unfinished task marks it executed, clicking
  *  a done one takes it back to not-executed. */
-export function TaskCheck({ status, taskId, stalled, onMarkComplete, onMarkIncomplete }: { status: string; taskId?: string; stalled?: boolean; onMarkComplete?: (taskId: string) => void; onMarkIncomplete?: (taskId: string) => void }) {
-  const state = status === 'completed' ? 'done' : status === 'in_progress' ? (stalled ? 'stalled' : 'running') : 'todo';
-  const toggle = state === 'done' ? onMarkIncomplete : onMarkComplete;
+export function TaskCheck({ row, taskId, onMarkComplete, onMarkIncomplete }: { row: Pick<TaskRowView, 'status' | 'mark'>; taskId?: string; onMarkComplete?: (taskId: string) => void; onMarkIncomplete?: (taskId: string) => void }) {
+  const state = CHECK_STATE[row.status];
+  const toggle = row.mark === 'uncomplete' ? onMarkIncomplete : onMarkComplete;
   const clickable = !!toggle && !!taskId;
   const title = state === 'done'
     ? (clickable ? 'Executed — click to mark not done' : 'Executed')
@@ -118,6 +126,35 @@ export function TaskCheck({ status, taskId, stalled, onMarkComplete, onMarkIncom
         </svg>
       )}
     </span>
+  );
+}
+
+const ACTION_CLASS: Record<TaskRowAction, string> = {
+  cancel: 'cancel', skip: 'skip', 'force-start': 'start', complete: 'start', uncomplete: 'skip',
+};
+
+const ACTION_LABELS: Record<TaskRowAction, string> = {
+  cancel: 'Cancel', skip: 'Skip', 'force-start': 'Start', complete: 'Mark Complete', uncomplete: 'Mark Not Done',
+};
+
+/** The buttons a running plan offers on a card, in the order core lays them out. */
+export function TaskActions({ taskId, actions, labels, handlers }: {
+  taskId: string;
+  actions: TaskRowAction[];
+  labels: Record<TaskRowAction, string>;
+  handlers: Partial<Record<TaskRowAction, (taskId: string) => void>>;
+}) {
+  return (
+    <div className="task-actions">
+      {actions.map((action) => {
+        const handler = handlers[action];
+        return handler && (
+          <button key={action} className={`task-action-btn ${ACTION_CLASS[action]}`} onClick={(e) => { e.stopPropagation(); handler(taskId); }}>
+            {labels[action]}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -157,28 +194,17 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
   const [offeringResolve, setOfferingResolve] = useState(false);
   const sortedSubtasks = [...task.subtasks].sort((a, b) => a.order - b.order);
 
-  const hasConflict = isolation?.state === 'conflict';
-  // Still running, so it reads as progress, not a blocker like a conflict (ADR-0015).
-  const isRepairing = isolation?.state === 'repairing';
   const isolatedWork = isolation && isolation.state !== 'none' ? isolation : null;
-  // A lone repository at the workspace root is not named: the group of one
-  // reads exactly as it did before repo groups existed.
-  const changedRepos = isolatedWork ? (isolatedWork.repos ?? []).filter((r) => r !== '.') : [];
-  const conflictRepo = isolatedWork?.conflictRepo && isolatedWork.conflictRepo !== '.' ? isolatedWork.conflictRepo : null;
+  const activeModes = modes && modes.length > 0 ? modes : DEFAULT_MODES;
+  const row = taskRowView({ ...task, idleSince, awaitingApproval, isolation, mergeGate }, { orderOf: taskOrderMap, modes: activeModes });
   const conflictFiles = isolatedWork?.conflictFiles ?? [];
   const repair = isolatedWork?.repair ?? null;
-  const repairedFiles = isolatedWork?.repairedFiles ?? [];
 
   const outputRef = useFollowOutput<HTMLPreElement>(output);
 
   const modelClass = task.assignedModel ? getModelClass(task.assignedModel.modelId) : '';
-  // Stalled overrides the spinning "Running" badge — same status, distinct
-  // visual, and reverts the instant idleSince clears on resumed output.
-  const isStalled = task.status === 'in_progress' && !!idleSince;
-  const baseStatus = isStalled ? STATUS_CONFIG.stalled : (STATUS_CONFIG[task.status] ?? STATUS_CONFIG.pending);
-  const status = { ...baseStatus, label: awaitingLabel(task) ?? baseStatus.label };
+  const status = statusBadge(row);
   const isUserTask = task.type === 'user';
-  const activeModes = modes && modes.length > 0 ? modes : DEFAULT_MODES;
 
   const handlePromptSave = () => {
     if (editingPrompt !== null && editingPrompt !== task.prompt) {
@@ -203,9 +229,6 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
   const allStepsComplete = task.userSteps?.every((s) => completedSteps.has(s.order)) ?? false;
 
   const runnerAbbrev = effectiveRunner ? (RUNNER_ABBREV[effectiveRunner] ?? effectiveRunner.slice(0, 2).toUpperCase()) : null;
-  // Autonomy is a manifest tag on the task's own mode, not a mode name — so this
-  // looks the tag up rather than string-matching a mode id (ADR-0001: no
-  // hardcoded mode names).
   const modeInfo = activeModes.find((m) => m.id === task.taskMode);
 
   // A structured task has a log tab to open (ADR-0018, V1); a terminal one has
@@ -218,20 +241,20 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
   return (
     <div className={`task-card task-${task.type} ${expanded ? 'expanded' : ''}`}>
       <div className="task-card-header" onClick={() => setExpanded(!expanded)}>
-        <TaskCheck status={task.status} taskId={task.id} stalled={isStalled} onMarkComplete={onMarkComplete} onMarkIncomplete={onMarkIncomplete} />
-        <span className="task-order">{task.order}</span>
+        <TaskCheck row={row} taskId={task.id} onMarkComplete={onMarkComplete} onMarkIncomplete={onMarkIncomplete} />
+        <span className="task-order">{row.orderLabel}</span>
         <span className={`task-type-badge ${task.type}`}>
           {isUserTask ? 'Manual' : 'AI'}
         </span>
-        {task.ops && !isUserTask && (
+        {row.kind === 'ops' && (
           <span className="task-type-badge ops" title="An ops task: it changes no repository files and runs in your checkout, once the work it depends on is merged">Ops</span>
         )}
         <span className="task-title-text">{task.title}</span>
 
         {/* As plain as a task that waits on the user (ADR-0020). */}
-        {mergeGate && mergeGate.length > 0 && (
+        {row.mergeGate && (
           <span className="task-isolation-badge gate"
-            title={`The work of ${mergeGate.map((id) => `#${taskOrderMap?.get(id) ?? id}`).join(', ')} is not merged into your branch yet. Merge all lets this task go on.`}>
+            title={`The work of ${row.mergeGate.join(', ')} is not merged into your branch yet. Merge all lets this task go on.`}>
             Waits for Merge all
           </span>
         )}
@@ -239,15 +262,16 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
         {/* A stopped integration is not a hidden failure (US33) — visible on the
             collapsed card, since it is the one isolation state that needs a
             decision, not just inspection. */}
-        {hasConflict && (
-          <span className="task-isolation-badge conflict" title={`Integrating this task conflicted${conflictRepo ? ` in ${conflictRepo}` : ''}${conflictFiles.length > 0 ? `: ${capConflictFiles(conflictFiles)}` : ''}. Its worktree and branch are kept.`}>
-            Conflict{conflictRepo ? ` in ${conflictRepo}` : ''}
+        {row.conflict && (
+          <span className="task-isolation-badge conflict" title={`Integrating this task conflicted${row.conflict.repo ? ` in ${row.conflict.repo}` : ''}${row.conflict.files ? `: ${row.conflict.files}` : ''}. Its worktree and branch are kept.`}>
+            Conflict{row.conflict.repo ? ` in ${row.conflict.repo}` : ''}
           </span>
         )}
 
-        {isRepairing && (
-          <span className="task-isolation-badge repairing" title={`Repairing the conflict in its own worktree${conflictFiles.length > 0 ? `: ${capConflictFiles(conflictFiles)}` : ''}.`}>
-            Repairing{repair ? ` (${repair.attempt} of ${repair.limit})` : ''}
+        {/* Still running, so it reads as progress, not a blocker like a conflict (ADR-0015). */}
+        {row.repairing && (
+          <span className="task-isolation-badge repairing" title={`Repairing the conflict in its own worktree${row.repairing.files ? `: ${row.repairing.files}` : ''}.`}>
+            Repairing{row.repairing.attempt ? ` (${row.repairing.attempt.attempt} of ${row.repairing.attempt.limit})` : ''}
           </span>
         )}
 
@@ -263,11 +287,11 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
         {/* Approvals arrive mid-turn and leave the status alone (ADR-0018,
             A1), so waiting on one is a badge beside it, which opens the log
             where the request is answered. */}
-        {awaitingApproval > 0 && (
+        {row.approvals && (
           <button type="button" className="task-approval-badge"
             onClick={(e) => { e.stopPropagation(); onOpenLog?.(task.id); }}
             title="The runner is waiting for you to allow or deny a tool call — open the log to answer">
-            {awaitingApproval > 1 ? `Waiting for approval (${awaitingApproval})` : 'Waiting for approval'}
+            {row.approvals}
           </button>
         )}
 
@@ -282,7 +306,7 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
         {/* The awaiting reason is a badge in its own right (ADR-0018, W1): a
             task held for the user must read as such whether or not a run is
             still being drawn as active. */}
-        {(isExecuting || task.status === 'failed' || task.status === 'awaiting_user') && (
+        {(isExecuting || row.status === 'failed' || row.status === 'awaiting') && (
           <>
             <span className={`task-status-dot ${status.cls}`} title={status.label} />
             <span className={`task-status-badge ${status.cls}`}>{status.label}</span>
@@ -311,22 +335,22 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
 
         {!isExecuting && task.taskMode && (
           <span className="task-type-badge" style={{ background: 'rgba(210,153,29,0.15)', color: 'var(--orange)' }}
-            title={modeInfo?.autonomous ? 'Full: runs without permission prompts — the level is set by the "ordewell.autonomousMode" setting' : undefined}>
+            title={row.autonomous ? 'Full: runs without permission prompts — the level is set by the "ordewell.autonomousMode" setting' : undefined}>
             {modeInfo?.label ?? task.taskMode}
-            {modeInfo?.autonomous && ' ⚡'}
+            {row.autonomous && ' ⚡'}
           </span>
         )}
 
         {canEditDeps ? (
           <button className="task-dep-badge dep-in task-dep-badge-btn"
             title={task.dependencies.length > 0
-              ? `Depends on: ${task.dependencies.map((id) => `#${taskOrderMap?.get(id) ?? id}`).join(', ')} — click to edit`
+              ? `Depends on: ${row.dependencies.join(', ')} — click to edit`
               : 'Click to set dependencies'}
             onClick={(e) => { e.stopPropagation(); setExpanded(true); setEditingDeps(true); }}>
             &#8593;{task.dependencies.length}
           </button>
         ) : task.dependencies.length > 0 && (
-          <span className="task-dep-badge dep-in" title={`Depends on: ${task.dependencies.map((id) => `#${taskOrderMap?.get(id) ?? id}`).join(', ')}`}>
+          <span className="task-dep-badge dep-in" title={`Depends on: ${row.dependencies.join(', ')}`}>
             &#8593;{task.dependencies.length}
           </span>
         )}
@@ -363,11 +387,11 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
             <div className="task-isolation">
               <div className="task-isolation-row"><span className="task-isolation-label">Branch</span><code>{isolatedWork.branch}</code></div>
               <div className="task-isolation-row"><span className="task-isolation-label">Worktree</span><code>{isolatedWork.worktree}</code></div>
-              {changedRepos.length > 0 && (
-                <div className="task-isolation-row task-isolation-repos"><span className="task-isolation-label">Repos</span><code>{changedRepos.join(', ')}</code></div>
+              {row.repos.length > 0 && (
+                <div className="task-isolation-row task-isolation-repos"><span className="task-isolation-label">Repos</span><code>{row.repos.join(', ')}</code></div>
               )}
-              {conflictRepo && (
-                <div className="task-isolation-row task-isolation-conflict-repo"><span className="task-isolation-label">Conflict</span><code>{conflictRepo}</code></div>
+              {row.conflict?.repo && (
+                <div className="task-isolation-row task-isolation-conflict-repo"><span className="task-isolation-label">Conflict</span><code>{row.conflict.repo}</code></div>
               )}
               {conflictFiles.length > 0 && (
                 <div className="task-isolation-row task-isolation-conflict-files"><span className="task-isolation-label">Files</span><code>{capConflictFiles(conflictFiles)}</code></div>
@@ -375,10 +399,10 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
               {repair && (
                 <div className="task-isolation-row task-isolation-repair"><span className="task-isolation-label">Repair</span><code>{repair.attempt} of {repair.limit}</code></div>
               )}
-              {repairedFiles.length > 0 && (
-                <div className="task-isolation-row task-isolation-repaired-note">Landed after repairing a conflict in {capConflictFiles(repairedFiles)}.</div>
+              {row.repaired && (
+                <div className="task-isolation-row task-isolation-repaired-note">Landed after repairing a conflict in {row.repaired.files}.</div>
               )}
-              {hasConflict && onResolveConflict && (
+              {row.conflict && onResolveConflict && (
                 offeringResolve ? (
                   <div className="task-isolation-resolve">
                     <span>Resolve this conflict as a new AI task?</span>
@@ -392,11 +416,11 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
             </div>
           )}
 
-          {task.status === 'awaiting_user' && task.awaitingReason === 'files-changed' && (
+          {row.opsChangedFiles && (
             <div className="task-ops-note warn">This ops task changed tracked files in your checkout, and nothing was committed. Check the changes, then mark it complete or retry it.</div>
           )}
-          {task.forcedPastGate && task.forcedPastGate.length > 0 && (
-            <div className="task-ops-note">Force-started before the work of {task.forcedPastGate.join(', ')} was merged into your branch.</div>
+          {row.forcedPastGate && (
+            <div className="task-ops-note">Force-started before the work of {row.forcedPastGate.join(', ')} was merged into your branch.</div>
           )}
 
           {output && (
@@ -410,9 +434,7 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
             <div className="task-deps">
               <span className="task-deps-label" onClick={(e) => { e.stopPropagation(); setEditingDeps(!editingDeps); }}
                 title="Edit dependencies">
-                Depends on: {task.dependencies.length > 0
-                  ? task.dependencies.map((depId) => `#${taskOrderMap?.get(depId) ?? depId}`).join(', ')
-                  : 'nothing'}
+                Depends on: {row.dependencies.length > 0 ? row.dependencies.join(', ') : 'nothing'}
                 <span className="task-prompt-edit-icon">&#9998;</span>
               </span>
               {editingDeps && (
@@ -423,10 +445,7 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
               )}
             </div>
           ) : task.dependencies.length > 0 && (
-            <div className="task-deps">Depends on: {task.dependencies.map((depId) => {
-              const order = taskOrderMap?.get(depId);
-              return order != null ? `#${order}` : depId;
-            }).join(', ')}</div>
+            <div className="task-deps">Depends on: {row.dependencies.join(', ')}</div>
           )}
 
           {task.verdict && (
@@ -542,7 +561,7 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
             </div>
           )}
 
-          {!isExecuting && task.type === 'ai' && onOpsChange && (task.status === 'pending' || task.status === 'approved' || task.status === 'blocked') && (
+          {!isExecuting && onOpsChange && row.opsEditable && (
             <label className="task-ops-toggle" title="An ops task changes no repository files: it acts on outside systems or on your branch's refs, from your checkout, once the work it depends on is merged.">
               <input type="checkbox" checked={!!task.ops} onChange={(e) => onOpsChange(task.id, e.target.checked)} />
               Ops task — runs in your checkout, not a worktree
@@ -586,23 +605,8 @@ export default function TaskCard({ task, models, modes, modelsByRunner, modesByR
           )}
 
           {isExecuting && (
-            <div className="task-actions">
-              {task.status === 'in_progress' && onCancel && (
-                <button className="task-action-btn cancel" onClick={(e) => { e.stopPropagation(); onCancel(task.id); }}>Cancel</button>
-              )}
-              {task.status === 'blocked' && onSkip && (
-                <button className="task-action-btn skip" onClick={(e) => { e.stopPropagation(); onSkip(task.id); }}>Skip</button>
-              )}
-              {(task.status === 'blocked' || task.status === 'pending' || task.status === 'approved') && task.type === 'ai' && onForceStart && (
-                <button className="task-action-btn start" onClick={(e) => { e.stopPropagation(); onForceStart(task.id); }}>Start</button>
-              )}
-              {(task.status === 'awaiting_user' || task.type === 'user') && onMarkComplete && (
-                <button className="task-action-btn start" onClick={(e) => { e.stopPropagation(); onMarkComplete(task.id); }}>Mark Complete</button>
-              )}
-              {task.status === 'completed' && onMarkIncomplete && (
-                <button className="task-action-btn skip" onClick={(e) => { e.stopPropagation(); onMarkIncomplete(task.id); }}>Mark Not Done</button>
-              )}
-            </div>
+            <TaskActions taskId={task.id} actions={row.actions} labels={ACTION_LABELS}
+              handlers={{ cancel: onCancel, skip: onSkip, 'force-start': onForceStart, complete: onMarkComplete, uncomplete: onMarkIncomplete }} />
           )}
         </div>
       )}

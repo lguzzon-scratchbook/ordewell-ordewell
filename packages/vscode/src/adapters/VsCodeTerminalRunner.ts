@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 
-import { HeadlessRunner, ITerminalSession, RunnerSpawnOptions } from '@ordewell/core';
+import { HeadlessRunner, ITerminalSession, RunnerSpawnOptions, titledTaskRef } from '@ordewell/core';
 
 const DEFAULT_COLUMNS = 120;
 const DEFAULT_ROWS = 30;
@@ -48,7 +48,7 @@ export class VsCodeTerminalRunner extends HeadlessRunner {
     // Planner ids share prefixes ("task-multiply-…"), so a slice of the id
     // gave parallel tasks identical tab names; the order and title tell them apart.
     const label = opts.order !== undefined && opts.title
-      ? `#${opts.order} ${opts.title.length > 40 ? `${opts.title.slice(0, 39)}…` : opts.title}`
+      ? titledTaskRef({ order: opts.order, title: opts.title.length > 40 ? `${opts.title.slice(0, 39)}…` : opts.title })
       : opts.taskId.slice(0, 8);
     const id = this.nextSessionId(opts.taskId);
     const session = this.createSession(id, opts.taskId);
