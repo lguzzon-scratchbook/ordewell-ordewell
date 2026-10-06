@@ -1,7 +1,7 @@
 import {
   Task, TaskSnapshot, TaskStatus, RunnerId, AwaitingReason, flattenTasks,
   addTaskToPlan, removeTaskFromPlan, updateTaskInPlan,
-  createTask, renumberTasks,
+  createTask, renumberTasks, opsFlag, inheritedOps,
 } from '../models/Task';
 
 /** Deep copy of a task tree, down to the arrays the store rewrites. */
@@ -59,7 +59,7 @@ export class PlanStore {
    */
   isOps(taskId: string): boolean {
     const root = this._rootMap.get(taskId);
-    return root?.type === 'ai' && root.ops === true;
+    return opsFlag(root?.ops, root?.type) === true;
   }
 
   /** A copy of the task tree, detached from the store: later status changes do not reach it. */
@@ -181,7 +181,7 @@ export class PlanStore {
       assignedRunner: taskA.assignedRunner,
       assignedModel: taskA.assignedModel,
       taskMode: taskA.taskMode,
-      ops: taskA.ops === true && taskB.ops === true,
+      ops: inheritedOps([taskA, taskB]),
       order: Math.min(taskA.order, taskB.order),
     });
 
@@ -224,7 +224,7 @@ export class PlanStore {
         autonomy: spec.autonomy ?? original.autonomy,
         sliceType: spec.sliceType ?? original.sliceType,
         userStoriesCovered: spec.userStoriesCovered ?? original.userStoriesCovered,
-        ops: spec.ops ?? original.ops,
+        ops: inheritedOps([original], spec.ops),
       }));
     });
 

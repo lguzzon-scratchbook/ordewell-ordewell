@@ -554,8 +554,30 @@ export function createTask(overrides: Partial<Task> = {}): Task {
     autonomy: overrides.autonomy,
     sliceType: overrides.sliceType,
     userStoriesCovered: overrides.userStoriesCovered,
-    ...(overrides.ops === true && (overrides.type ?? 'ai') === 'ai' ? { ops: true } : {}),
+    ...(opsFlag(overrides.ops, overrides.type) ? { ops: true } : {}),
   };
+}
+
+/**
+ * The `ops` flag as a task stores it (ADR-0020), however it arrived. Only a
+ * literal `true` on an AI task marks an ops task: the planner's JSON is
+ * untyped, and a quoted "true" read as ops would move a task out of its
+ * worktree. Anything else is a change task, stored absent so saved plans need
+ * no migration. Whether the task may be ops at all — a subtask may not — is
+ * for whoever knows where it sits: parsing drops the flag, an edit refuses it.
+ */
+export function opsFlag(value: unknown, type: Task['type'] = 'ai'): true | undefined {
+  return value === true && type === 'ai' ? true : undefined;
+}
+
+/**
+ * The flag of a task a merge or a split makes from others: what the edit
+ * chose, else ops only when every task it came from was. A merge that takes
+ * in a change edits files, so it is a change; a split part runs where its
+ * task did.
+ */
+export function inheritedOps(from: readonly Pick<Task, 'ops'>[], chosen?: boolean): boolean {
+  return chosen ?? from.every((t) => opsFlag(t.ops) === true);
 }
 
 export function createEmptyPlan(): LegacyPlanState {

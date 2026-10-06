@@ -9,7 +9,7 @@ import type { PlanStore } from './PlanStore';
 import type { TaskOrchestrator } from './TaskOrchestrator';
 import type { IsolationRunController } from './IsolationRunController';
 import type { SessionBroadcaster } from './SessionMessage';
-import type { DiscoveredModel, LegacyPlanState, RunnerId, Task } from '../models/Task';
+import { opsFlag, type DiscoveredModel, type LegacyPlanState, type RunnerId, type Task } from '../models/Task';
 
 /** The catalogs an edit reads, as the session holds them at the moment of the edit. */
 export interface PlanEditCatalog {
@@ -84,7 +84,7 @@ export class PlanEditor {
    * falls through to the no-op `store.update` below instead of throwing.
    */
   async updateTask(taskId: string, changes: Partial<Task>): Promise<LegacyPlanState | null> {
-    if ('ops' in changes) changes = { ...changes, ops: changes.ops === true ? true : undefined };
+    if ('ops' in changes) changes = { ...changes, ops: opsFlag(changes.ops) };
     if ((changes.dependencies || changes.type || changes.assignedModel || changes.taskMode || 'ops' in changes) && this.store.get(taskId)) {
       const check = validateTaskEdit('direct', this.store.planTasks, taskId, changes, this.catalog.edit());
       if (!check.ok) throw new PlanEditError(check.error ?? 'Those changes are not valid');

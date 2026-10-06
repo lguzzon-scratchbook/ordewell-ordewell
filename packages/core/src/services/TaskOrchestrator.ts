@@ -3,7 +3,7 @@ import { Task, TaskSnapshot, Verdict, QueuedMessage, RunnerId, flattenTasksWithP
 import { IConfig } from '../interfaces/IConfig';
 import { INotification } from '../interfaces/INotification';
 import { isStructuredSession, type ITerminalRunner, type ITerminalSession, type QueuedTaskMessage, type RunnerTransport, type StructuredSessionCapability } from '../interfaces/ITerminalRunner';
-import { composeAugmentedPrompt, composeContinuationPrompt, summarizeOutput } from './promptAugment';
+import { summarizeOutput } from './promptAugment';
 import { VerdictEngine } from './VerdictEngine';
 import { BufferedTaskOutputSource } from './BufferedTaskOutputSource';
 import type { LiveTail, LiveTailOptions, TaskOutputSource } from '../interfaces/TaskOutputSource';
@@ -18,11 +18,15 @@ import type {
 import { createWorktreeIsolation } from './GitWorktreeIsolation';
 import { SELF_REPO } from './isolationRecord';
 import { IsolationRunController } from './IsolationRunController';
-import { completesTask, Landing, type LandingMessage, type LandingOutcome, type RepairAttempt, type UnlandedOutcome } from './Landing';
+import { completesTask, Landing, type LandingMessage, type LandingOutcome, type UnlandedOutcome } from './Landing';
 import { watchBlockingPrompts } from './blockingPrompts';
 import { classifyRunnerStop, keepsTerminalReadable, stopsRunner, LingeringRunners, type AttemptEnd } from './runnerExit';
 import { MessageQueue } from './MessageQueue';
 import { mergeGate, selectReadyTasks, type Readiness } from './readiness';
+import {
+  attemptCwd, attemptPrompt, attemptTransport, checksTree, classifyAttempt, decidesIsolation, mergeExcludes,
+  type AttemptKind, type Continuation,
+} from './attemptKind';
 import { capConflictFiles } from './conflictFiles';
 import { resolveWorkspaceEnv, type WorkspaceEnv } from './workspaceEnv';
 import { givesCompletionTool, routeTransport } from './TransportRouter';
@@ -96,19 +100,15 @@ interface TaskAttempt {
   phase: AttemptPhase;
   session: ITerminalSession | null;
   readonly runner: string;
-  /** Null until {@link IsolationRunController.attemptCwd} settles. */
+  /** Null until {@link attemptCwd} settles. */
   cwd: string | null;
   /** Whether `cwd` is a worktree prepared for this attempt rather than the workspace root. */
   worktree: boolean;
   /** The landing in flight, so a cancel waits for it before tearing the worktree down. */
   integration: Promise<LandingOutcome> | null;
-  /** Set when this attempt is a conflict repair (ADR-0015) of work that already passed. */
-  readonly repair: RepairAttempt | null;
-  /** Set when this attempt continues the task's saved runner session (ADR-0018, K1). */
-  readonly continuation: Continuation | null;
-  /** An ops task's attempt (ADR-0020): it runs at the workspace root and lands nothing. */
-  readonly ops: boolean;
-  /** The workspace's tracked state as an ops attempt started; what its tree check compares with. */
+  /** What this attempt is, which decides where it runs, what it is told and what is checked; see {@link AttemptKind}. */
+  readonly kind: AttemptKind;
+  /** The workspace's tracked state as the attempt started, when its tree is checked; what that check compares with. */
   snapshot: TreeSnapshot | null;
   readonly startedAt: string;
   /**
@@ -120,11 +120,6 @@ interface TaskAttempt {
 }
 
 type AttemptPhase = 'starting' | 'running' | 'integrating';
-
-interface Continuation {
-  message: string;
-  resumeSessionId: string;
-}
 
 /** Read-only view of a task's live attempt. */
 export interface TaskAttemptSnapshot {
@@ -555,13 +550,12 @@ export class TaskOrchestrator {
    * "Merge all"; a settled run that merged everything is cleared up and
    * forgotten. During a run it merges what has landed and the run goes on:
    * the tasks waiting at a merge gate for that work then start (ADR-0020).
-   * Never while an ops task runs, and no ops task starts until it ends — the
-   * one overlap the plan cannot order, because the merge is the user's.
+   * Never alongside ops work, either way round ({@link mergeExcludes}).
    */
   async mergeRun(): Promise<IsolationMergeResult> {
-    const ops = [...this.attempts.values()].find((a) => a.ops);
-    if (ops) {
-      const title = this.store.get(ops.taskId)?.title ?? ops.taskId;
+    const excluded = [...this.attempts.values()].find((a) => mergeExcludes(a.kind));
+    if (excluded) {
+      const title = this.store.get(excluded.taskId)?.title ?? excluded.taskId;
       throw new TaskControlError(`Ops task "${title}" is running in your checkout — Merge all once it has finished.`);
     }
     this.merging = true;
@@ -645,7 +639,7 @@ export class TaskOrchestrator {
 
   loadPlan(tasks: readonly Task[], planRunners: RunnerId[] = ['claude-code']): void {
     this.store.load(tasks, planRunners);
-    const repairs = this.endAllAttempts('load').filter((a) => a.repair && a.worktree);
+    const repairs = this.endAllAttempts('load').filter((a) => a.kind.kind === 'repair' && a.worktree);
     for (const a of repairs) void this.runs.release(a.taskId, { keep: true }, a.integration);
     // A plan committed while the scheduler runs keeps that run, and its mode
     // with it; otherwise the next start decides afresh.
@@ -722,7 +716,7 @@ export class TaskOrchestrator {
     // `active` so a crash-recovery prune does not sweep it away. A stopped
     // repair did not land, so its task waits on the user as its conflict did.
     for (const a of this.endAllAttempts('stop')) {
-      if (a.repair) this.store.markAwaitingUser(a.taskId, 'conflict');
+      if (a.kind.kind === 'repair') this.store.markAwaitingUser(a.taskId, 'conflict');
       if (a.worktree) void this.runs.release(a.taskId, { keep: true }, a.integration);
     }
     this.runs.interrupt();
@@ -743,7 +737,7 @@ export class TaskOrchestrator {
     console.error(`[TaskOrchestrator] Task #${task.order} "${task.title}" verdict=${verdict.outcome}`);
     console.error(`[TaskOrchestrator] Runner: ${task.assignedRunner}, Model: ${task.assignedModel?.modelId ?? 'default'}`);
     console.error(`[TaskOrchestrator] Prompt preview: ${(task.prompt ?? '').slice(0, 200)}`);
-    if (attempt.repair) return this.settleRepair(task, attempt, verdict);
+    if (attempt.kind.kind === 'repair') return this.settleRepair(task, attempt, verdict);
 
     // The terminal stays the source of truth for the verdict itself; this only
     // changes what gets summarized for downstream consumers.
@@ -754,7 +748,7 @@ export class TaskOrchestrator {
     // task since. A stale verdict must not overwrite that decision.
     if (this.attempts.get(taskId) !== attempt) return;
     const landing = verdict.outcome === 'pass' ? await this.land(attempt, () => this.landing.landPassed(task, attempt)) : null;
-    const changedFiles = landing && attempt.ops ? await this.runs.filesChangedSince(attempt.snapshot) : [];
+    const changedFiles = landing && checksTree(attempt.kind) ? await this.runs.filesChangedSince(attempt.snapshot) : [];
     const unresumedReason = this.unresumed(attempt) ? unresumedMessage(task, `${attempt.runner} could not find its saved session`) : null;
     if (this.attempts.get(taskId) !== attempt) return;
     this.endAttempt(taskId, 'verdict');
@@ -898,14 +892,18 @@ export class TaskOrchestrator {
   }
 
   /**
-   * Open the run a task starts in, and for a change task decide whether it
-   * isolates (ADR-0020): an ops task needs no worktree, so it never waits on
-   * that choice. False while a dirty tree waits on the user; `resume` is what
-   * their choice replays.
+   * Open the run a task starts in, and decide whether it isolates if the
+   * task's next attempt needs that ({@link decidesIsolation}). False while a
+   * dirty tree waits on the user; `resume` is what their choice replays.
    */
   private async openFor(taskId: string, resume: () => Promise<void>): Promise<boolean> {
     this.runs.open();
-    return this.store.isOps(taskId) || this.runs.decide(resume);
+    return !decidesIsolation(this.nextAttemptKind(taskId)) || this.runs.decide(resume);
+  }
+
+  /** The kind a task's next attempt starts as, short of a repair or a continue: what is weighed before one exists. */
+  private nextAttemptKind(taskId: string): AttemptKind {
+    return classifyAttempt(this.store.isOps(taskId));
   }
 
   /**
@@ -1094,7 +1092,7 @@ export class TaskOrchestrator {
   }
 
   private refuseOpsDuringMerge(task: Readonly<Task>): void {
-    if (this.merging && this.store.isOps(task.id)) {
+    if (this.merging && mergeExcludes(this.nextAttemptKind(task.id))) {
       throw new TaskControlError(`A Merge all is under way — ops task "${task.title}" can start once it has finished.`);
     }
   }
@@ -1210,7 +1208,11 @@ export class TaskOrchestrator {
     }
 
     for (const task of ready) {
-      if (this.store.isOps(task.id) ? this.merging : !(await this.runs.decide(() => this.tick()))) continue;
+      const kind = this.nextAttemptKind(task.id);
+      // Readiness was read before this loop awaited any start: a Merge all
+      // may have begun since.
+      if (this.merging && mergeExcludes(kind)) continue;
+      if (decidesIsolation(kind) && !(await this.runs.decide(() => this.tick()))) continue;
       await this.startTask(task);
     }
     this.emit('onTick');
@@ -1241,9 +1243,7 @@ export class TaskOrchestrator {
       cwd: null,
       worktree: false,
       integration: null,
-      repair: this.landing.nextRepair(task.id),
-      continuation,
-      ops: this.store.isOps(task.id),
+      kind: classifyAttempt(this.store.isOps(task.id), { repair: this.landing.nextRepair(task.id), continuation }),
       snapshot: null,
       startedAt: new Date().toISOString(),
       decided: false,
@@ -1260,9 +1260,10 @@ export class TaskOrchestrator {
     // failed spawn (which would tear down the attempt it just announced).
     if (attempt.worktree) this.emit('onIsolationChanged');
     this.emit('onTaskChanged');
-    if (attempt.repair) {
+    if (attempt.kind.kind === 'repair') {
       const group = this.runs.current?.repos.some((r) => r.path !== SELF_REPO);
-      this.tell('info', `Repairing the conflict of task "${task.title}" in its own ${group ? 'worktrees' : 'worktree'} (repair ${attempt.repair.n} of ${attempt.repair.limit}).`);
+      const { n, limit } = attempt.kind.repair;
+      this.tell('info', `Repairing the conflict of task "${task.title}" in its own ${group ? 'worktrees' : 'worktree'} (repair ${n} of ${limit}).`);
     } else {
       this.notifications.info(`Task "${task.title}" ${continuation ? 'continued' : 'started'} (${attempt.runner})`);
     }
@@ -1276,35 +1277,30 @@ export class TaskOrchestrator {
    */
   private async spawnAttempt(task: Task, attempt: TaskAttempt): Promise<boolean> {
     try {
-      const { cwd, worktree } = await this.runs.attemptCwd(task, { repair: attempt.repair !== null, ops: attempt.ops });
+      const { kind } = attempt;
+      const { cwd, worktree } = await attemptCwd(kind, task, this.runs);
       attempt.cwd = cwd;
       attempt.worktree = worktree;
-      if (attempt.ops) attempt.snapshot = await this.runs.snapshotWorkspace();
+      if (checksTree(kind)) attempt.snapshot = await this.runs.snapshotWorkspace();
       if (this.attempts.get(task.id) !== attempt) {
         // Ended while its worktree was being made, so whatever ended it could
         // not release it. A newer attempt's own prepare replaces it instead.
         // A repair's worktree holds work that passed, so it is only handed back.
-        if (attempt.worktree && !this.attempts.has(task.id)) await this.runs.release(task.id, { keep: attempt.repair !== null });
+        if (attempt.worktree && !this.attempts.has(task.id)) await this.runs.release(task.id, { keep: kind.kind === 'repair' });
         this.abandonSpawn(task, attempt);
         return false;
       }
-      // A continue resumes a session only the structured transport can reach,
-      // whatever the plan's latest run copied: the task already ran that way.
-      const transport = attempt.continuation ? 'structured' : this.planTransport ?? 'terminal';
+      const transport = attemptTransport(kind, this.planTransport);
       const completionTool = givesCompletionTool(transport, attempt.runner, this.registry);
-      // Through the same augmenting as any spawn, so the marker is the task's
-      // own and the VerdictEngine watches for it unchanged.
-      const finalPrompt = attempt.continuation
-        ? composeContinuationPrompt(task, attempt.continuation.message, { ops: attempt.ops, completionTool })
-        : composeAugmentedPrompt(attempt.repair ? { ...task, prompt: this.landing.repairPrompt(task) } : task, this.store.planTasks, {
-          planMapEnabled: this.config.planMapEnabled,
-          // A merge to resolve is not new behaviour to drive test-first.
-          tddEnabled: !attempt.repair && this.tddEnabled(),
-          // An ops task's effects outlive a failed attempt and are never rolled
-          // back, so the next one is told what the last one did (ADR-0020).
-          previousAttempt: attempt.ops ? this.opsPreviousAttempt(task.id) : undefined,
-          completionTool,
-        });
+      const finalPrompt = attemptPrompt(kind, {
+        task,
+        plan: this.store.planTasks,
+        completionTool,
+        planMapEnabled: this.config.planMapEnabled,
+        tddEnabled: () => this.tddEnabled(),
+        repairPrompt: (t) => this.landing.repairPrompt(t),
+        previousAttempt: (taskId) => this.opsPreviousAttempt(taskId),
+      });
       this.lingering.close(task.id);
       const env = await this.envForTask(cwd);
       const session = await this.terminalRunner.spawn({
@@ -1321,7 +1317,7 @@ export class TaskOrchestrator {
         title: task.title,
         env,
         transport,
-        resumeSessionId: attempt.continuation?.resumeSessionId,
+        resumeSessionId: kind.kind === 'continuation' ? kind.resumeSessionId : undefined,
         attempt: attempt.attempt,
       });
 
@@ -1333,7 +1329,7 @@ export class TaskOrchestrator {
         this.abandonSpawn(task, attempt, session);
         return false;
       }
-      if (attempt.continuation && !isStructuredSession(session)) {
+      if (kind.kind === 'continuation' && !isStructuredSession(session)) {
         // A terminal session ignored the resume and started fresh, with none of
         // what the message refers to.
         session.kill();
@@ -1356,7 +1352,7 @@ export class TaskOrchestrator {
         return false;
       }
       this.endAttempt(task.id, 'spawn-failed');
-      if (attempt.continuation) {
+      if (attempt.kind.kind === 'continuation') {
         await this.runs.release(task.id, { keep: false });
         const reason = unresumedMessage(task, `could not start: ${err instanceof Error ? err.message : String(err)}`);
         this.store.markFailed(task.id);
@@ -1367,7 +1363,7 @@ export class TaskOrchestrator {
         await this.tick();
         return false;
       }
-      if (attempt.repair) {
+      if (attempt.kind.kind === 'repair') {
         this.settleUnlanded(task, await this.landing.unrepaired(task, `could not start: ${err instanceof Error ? err.message : String(err)}`));
         this.emit('onTaskSettled', { taskId: task.id });
         this.emit('onTaskChanged');
@@ -1411,7 +1407,7 @@ export class TaskOrchestrator {
    */
   private unresumed(attempt: TaskAttempt): boolean {
     const session = attempt.session;
-    return attempt.continuation !== null && session !== null && isStructuredSession(session) && !session.nativeSessionId();
+    return attempt.kind.kind === 'continuation' && session !== null && isStructuredSession(session) && !session.nativeSessionId();
   }
 
   /**
@@ -1422,7 +1418,7 @@ export class TaskOrchestrator {
   private abandonSpawn(task: Task, attempt: TaskAttempt, session?: ITerminalSession): void {
     session?.kill();
     if (this.attempts.has(task.id) || this.store.get(task.id)?.status !== 'in_progress') return;
-    if (attempt.repair) this.store.markAwaitingUser(task.id, 'conflict');
+    if (attempt.kind.kind === 'repair') this.store.markAwaitingUser(task.id, 'conflict');
     else this.store.markPending(task.id);
     this.emit('onTaskChanged');
   }
