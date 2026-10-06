@@ -188,3 +188,26 @@ describe('a log that cannot be created', () => {
     expect(listTaskLogAttempts(where, TASK)).toEqual([]);
   });
 });
+
+
+describe('undelivered messages in the saved task log', () => {
+  it('replays the notice and removes each message from the queue after a kill', async () => {
+    const run = recording([() => {}]);
+    const session = await run.spawn();
+    await vi.waitFor(() => expect(run.spawned.processes[0].written).toHaveLength(1));
+    const first = session.sendMessage('use Postgres');
+    const second = session.sendMessage('add tests');
+    session.kill();
+    const events = saved(1);
+    expect(events.filter((event) => event.type === 'message_undelivered')).toEqual([
+      { type: 'message_undelivered', messageId: first, text: 'use Postgres' },
+      { type: 'message_undelivered', messageId: second, text: 'add tests' },
+    ]);
+    const replayed = replayTaskLog(events);
+    expect(replayed).toEqual(run.live(1));
+    expect(replayed.queued).toEqual([]);
+    expect(replayed.blocks.filter((block) => block.type === 'message' && block.role === 'system').map((block) => block.type === 'message' ? block.text : '')).toEqual([
+      'use Postgres · not delivered', 'add tests · not delivered',
+    ]);
+  });
+});

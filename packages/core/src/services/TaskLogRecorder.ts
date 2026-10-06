@@ -7,7 +7,7 @@ import type { SessionBroadcaster } from './SessionMessage';
 /** Long enough to gather a burst of deltas into one message, short enough to read as live. */
 const DEFAULT_FLUSH_MS = 50;
 
-const FLUSHED_AT_ONCE: ReadonlySet<TaskLogEvent['type']> = new Set(['turn_end', 'approval_requested', 'approval_decided', 'approval_withdrawn']);
+const FLUSHED_AT_ONCE: ReadonlySet<TaskLogEvent['type']> = new Set(['turn_end', 'approval_requested', 'approval_decided', 'approval_withdrawn', 'message_undelivered']);
 
 export interface TaskLogRecorderDeps {
   broadcast: SessionBroadcaster;

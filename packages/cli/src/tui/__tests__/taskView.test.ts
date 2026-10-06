@@ -515,3 +515,16 @@ describe('esc back to the planner', () => {
     expect(effects.some((e) => e.type === 'sendTaskMessage')).toBe(false);
   });
 });
+
+
+it('shows an undelivered message in the task log and removes it from the queue', () => {
+  const before = opened({ taskView: loaded({ view: replayTaskLog([
+    { type: 'message_queued', messageId: 'm1', text: 'use Postgres' },
+  ]) }) });
+  const { state } = reduce(before, {
+    type: 'taskLog', taskId: 't1', attempt: 1, sessionId: 's1',
+    events: [{ type: 'message_undelivered', messageId: 'm1', text: 'use Postgres' }],
+  });
+  expect(state.taskView?.view.queued).toEqual([]);
+  expect(plain(state)).toContain('use Postgres · not delivered');
+});

@@ -259,6 +259,7 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
 
   protected override baseHandleExit(code: number): void {
     this.revokeTools();
+    this.undeliverQueued();
     super.baseHandleExit(code);
   }
 
@@ -293,7 +294,8 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
   sendMessage(text: string): string {
     this.messageCount += 1;
     const id = `msg-${this.messageCount}`;
-    if (this.state === 'idle' && this.adapterStarted && !this.exited) this.deliver(text);
+    if (this.exited) this.emitEvent({ type: 'message_undelivered', messageId: id, text });
+    else if (this.state === 'idle' && this.adapterStarted) this.deliver(text);
     else {
       this.queue.push({ id, text });
       this.emitEvent({ type: 'message_queued', messageId: id, text });
@@ -376,9 +378,9 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
       await this.startAdapter({ ...this.startOptions, resumeSessionId });
     } catch (err) {
       this.text.line(`Could not restart ${this.launch.runner} after the interrupt: ${err instanceof Error ? err.message : String(err)}`);
-      this.endTurn(turn, 'interrupted');
       this.withdrawPermissions();
       this.baseHandleExit(-1);
+      this.endTurn(turn, 'interrupted');
       return;
     }
     this.endTurn(turn, 'interrupted');
@@ -423,6 +425,7 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
       if (generation !== this.generation) return;
       this.route(adapter, turn, event);
     }, turn.abort.signal).catch((err: unknown) => {
+      if (generation !== this.generation || this.exited) return;
       turn.reason = 'failed';
       this.handleEvent({ type: 'error', message: err instanceof Error ? err.message : String(err) });
     }).then(() => {
@@ -498,10 +501,17 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     turn.ended = true;
     this.text.endTurn();
     this.emitEvent({ type: 'turn_end', reason });
-    const next = this.exited ? undefined : this.queue.shift();
-    if (!next) this.state = 'idle';
+    if (reason === 'failed') this.undeliverQueued();
+    this.state = !this.exited && this.queue.length ? 'working' : 'idle';
     this.structuredEmitter.emit('turnEnd', reason);
+    const next = this.exited ? undefined : this.queue.shift();
     if (next) this.deliver(next.text, next.id);
+  }
+
+  private undeliverQueued(): void {
+    const messages = this.queue;
+    this.queue = [];
+    for (const { id, text } of messages) this.emitEvent({ type: 'message_undelivered', messageId: id, text });
   }
 
   private emitEvent(event: StructuredEvent): void {

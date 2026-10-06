@@ -2,6 +2,7 @@ import React from 'react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, act, fireEvent, cleanup } from '@testing-library/react';
 import type { DisplayBlock } from '@ordewell/core';
+import { replayTaskLog } from '@ordewell/core/plan-utils';
 import TaskLogApp from '../TaskLogApp';
 import type { HostToTaskLog, TaskLogStatus } from '../../../shared/taskLogProtocol';
 
@@ -63,6 +64,17 @@ describe('the task log tab (ADR-0018, V1)', () => {
     act(() => { fireEvent.click(screen.getByLabelText('Send')); });
 
     expect(api.postMessage).toHaveBeenCalledWith({ type: 'sendTaskMessage', text: 'use Postgres' });
+  });
+
+  it('shows an undelivered message from the task log with an empty queue', () => {
+    render(<TaskLogApp />);
+    const view = replayTaskLog([
+      { type: 'message_queued', messageId: 'm1', text: 'use Postgres' },
+      { type: 'message_undelivered', messageId: 'm1', text: 'use Postgres' },
+    ]);
+    init({ queued: [...view.queued] }, [...view.blocks]);
+    expect(screen.getByText('use Postgres · not delivered')).toBeTruthy();
+    expect(screen.queryByTitle('Remove this message')).toBeNull();
   });
 
   it('lists queued messages and takes one back', () => {
