@@ -30,6 +30,7 @@ Tasks (<id> is an order number or a task ID):
   ordewell run-task <id>          Run only one task
   ordewell retry <id>             Re-run a failed task
   ordewell continue <id> <msg>    Continue a finished task in its saved runner session
+  ordewell checkpoint <id> approve|reject [reason]  Answer the checkpoint a task waits at
   ordewell cancel <id>            Kill a running task
   ordewell terminal <id>          Open a real terminal attached to a task's runner
 

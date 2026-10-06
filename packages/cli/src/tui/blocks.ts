@@ -299,6 +299,23 @@ function approvalKeysLine(block: ApprovalBlock, cols: number): string {
   return style.grey(truncate(`  ${keys.join(' · ')}`, cols));
 }
 
+/**
+ * The checkpoint a task waits at, in full: it is a question to a person, so no
+ * line of it is cut — a long one wraps and the pane scrolls. The keys come
+ * after it, and say so when a tool request has to be answered first.
+ */
+export function checkpointCardLines(order: number, question: string, cols: number, approvalFirst: boolean): string[] {
+  const room = Math.max(1, cols - 2);
+  const keys = approvalFirst
+    ? 'answer the tool request above first (ctrl-y / ctrl-g), then ctrl-y approves · ctrl-g rejects (composer text is the reason)'
+    : 'ctrl-y approve · ctrl-g reject (composer text is the reason)';
+  return [
+    truncate(`${style.accent('◆')} ${style.bold(`Task ${order} asks`)}`, cols),
+    ...wrap(sanitize(question).trim(), room).map((line) => `  ${line}`),
+    ...wrap(keys, room).map((line) => style.grey(`  ${line}`)),
+  ];
+}
+
 function planLine(block: PlanBlock, cols: number): string {
   const count = block.taskCount === undefined ? '' : ` (${countOf(block.taskCount, 'task')})`;
   const text = block.status === 'building' ? 'Building plan…' : `Plan ${block.status}${count}`;

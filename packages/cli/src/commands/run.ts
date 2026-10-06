@@ -80,7 +80,7 @@ export async function followExecution(
       process.stderr.write(`· ${taskStartedNotice(event.title, event.runner)}\n`);
     }
     if (event.type === 'checkpoint') {
-      process.stderr.write(`· Checkpoint — ${event.taskTitle}: ${truncateCheckpointSummary(event.summary)}\n`);
+      process.stderr.write(`· Checkpoint — ${event.taskTitle}: ${truncateCheckpointSummary(event.summary)} — \`ordewell checkpoint <id> approve|reject [reason]\` answers it\n`);
     }
     if (event.type === 'status_update' && event.tasks) {
       printStatus(event.tasks as TaskStatus[]);

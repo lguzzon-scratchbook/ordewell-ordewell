@@ -438,22 +438,23 @@ describe('execution', () => {
     expect(started).toMatchObject({ taskId: 'a', title: 'Add route', runner: 'opencode' });
   });
 
-  it('shows a checkpoint summary, as the VS Code checkpoint panel does', async () => {
+  it('hands a checkpoint to the reducer, which says where it can be answered', async () => {
     const h = withEvents({ type: 'checkpoint', taskId: 'a', taskTitle: 'Add route', summary: 'Wrote the handler' });
     await runEffect({ type: 'execute', sessionId: 's1' }, h.deps);
 
-    const notice = h.actions.find((a) => a.type === 'notice') as Extract<Action, { type: 'notice' }>;
-    expect(notice.message).toBe('· Checkpoint — Add route: Wrote the handler');
+    expect(h.actions.find((a) => a.type === 'taskCheckpoint')).toMatchObject({ taskId: 'a', title: 'Add route', summary: 'Wrote the handler' });
   });
 
-  it('truncates a long checkpoint summary to a single line', async () => {
+  it('keeps only the first line of a long checkpoint question in the notice', async () => {
     const longSummary = 'Line one of reasoning.\nLine two with more details that goes on and on and on about the checkpoint reasoning from the agent.';
     const h = withEvents({ type: 'checkpoint', taskId: 'a', taskTitle: 'Add route', summary: longSummary });
     await runEffect({ type: 'execute', sessionId: 's1' }, h.deps);
 
-    const notice = h.actions.find((a) => a.type === 'notice') as Extract<Action, { type: 'notice' }>;
-    expect(notice.message).not.toContain('\n');
-    expect(notice.message).toContain('· Checkpoint — Add route:');
+    const arrived = h.actions.find((a): a is Extract<Action, { type: 'taskCheckpoint' }> => a.type === 'taskCheckpoint');
+    const state = reduce(initialState({ sessionId: 's1' }), arrived!).state;
+    const text = messagesOf(state).at(-1)?.text ?? '';
+    expect(text).not.toContain('\n');
+    expect(text).toContain('· Add route asks: Line one of reasoning.');
   });
 
   it('asks for sign-off when the plan needs review', async () => {

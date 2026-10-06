@@ -1,9 +1,9 @@
 import { pad, style, truncate, width, wrap, wrapLines, type WrapLine } from './ansi';
 import { cursorInLines, type CursorPosition } from './editor';
-import { conversationLines, tokenLine } from './blocks';
+import { checkpointCardLines, conversationLines, tokenLine } from './blocks';
 import { chatEditorRoomFor, chatPaneWidth, planPaneWidth } from './geometry';
 import { SLASH_COMMANDS, type SlashCategory } from './slash';
-import { findTask, planRows, plannerInFlight, selectedPlanRow, waitingApproval, type PlanRow, type TaskView, type TuiState } from './state';
+import { findTask, planRows, plannerInFlight, selectedPlanRow, waitingApproval, waitingCheckpoint, type PlanRow, type TaskView, type TuiState } from './state';
 import { modesForTask } from './taskAssignment';
 import { ALL_PROVIDERS, approvalLabel, awaitingLabel, hasHiddenDetail, markAction, runnerForProvider, taskRowView, type AiProvider, type ApprovalBlock, type DisplayBlock, type QueuedTaskMessage, type TaskStatusKind } from '@ordewell/core';
 
@@ -165,7 +165,10 @@ function taskHeaderLines(state: TuiState, tv: NonNullable<TuiState['taskView']>,
   const approval = waitingApproval(tv);
   const hint = approval
     ? ['ctrl-y allow', ...(approval.allowForTask ? ['ctrl-t allow for task'] : []), 'ctrl-g deny (composer text is the note)']
-    : ['ctrl-r remove queued', 'ctrl-x interrupt', 'ctrl-s send now'];
+    : waitingCheckpoint(task)
+      ? ['ctrl-y approve', 'ctrl-g reject (composer text is the reason)', 'ctrl-x interrupt']
+      : ['ctrl-r remove queued', 'ctrl-x interrupt', 'ctrl-s send now'];
+  if (approval && waitingCheckpoint(task)) hint.push('then the checkpoint');
   const index = tv.attempts.indexOf(tv.attempt);
   if (tv.attempts.length > 1) hint.push(`alt←/→ attempt ${index >= 0 ? index + 1 : 1}/${tv.attempts.length}`);
   hint.push('esc back');
@@ -264,7 +267,11 @@ export function chatLayout(state: TuiState, rows: number, cols: number): ChatLay
   // planning conversation and only goes once a plan exists — from then on the
   // plan pane owns the screen and the chat column is too narrow for the art.
   const welcome = !tv && state.tasks.length === 0;
-  const body = chatBodyLines(blocks, cols, state.detailAll, tv ? waitingApproval(tv) : undefined);
+  // Not a block of the runner's log, so it stays out of the memoised body.
+  const checkpoint = tv ? waitingCheckpoint(findTask(state.tasks, tv.taskId)) : undefined;
+  const card = tv && checkpoint ? checkpointCardLines(findTask(state.tasks, tv.taskId)?.order ?? 0, checkpoint, cols, waitingApproval(tv) !== undefined) : [];
+  const answering = chatBodyLines(blocks, cols, state.detailAll, tv ? waitingApproval(tv) : undefined);
+  const body = card.length > 0 ? [...answering, ...card] : answering;
   const transcript = !welcome ? body : body.length === 0 ? welcomeLines(state, cols) : [...welcomeLines(state, cols), '', ...body];
   // The queued prompts paint as part of the tail, newest last — they are the
   // turns that have not gone out yet, and they travel where a sent message
@@ -781,6 +788,7 @@ export function helpLayout(rows: number, cols: number): HelpLayout {
     style.grey('  ctrl-s sends now: interrupts the running step, then delivers the composer text — or, with it empty, the selected queued message'),
     style.grey('  ctrl-n/ctrl-p select a queued message · ctrl-r removes it · ctrl-x interrupts'),
     style.grey('  ctrl-y allows a tool request (its keys sit under it) · ctrl-t allows it for the task · ctrl-g denies it, with the composer text as the note'),
+    style.grey('  at a checkpoint, ctrl-y approves and ctrl-g rejects, with the composer text as the reason · /checkpoint <id> approve|reject [reason] from anywhere'),
     style.grey('  alt←/→ changes attempt · esc returns'),
   );
 

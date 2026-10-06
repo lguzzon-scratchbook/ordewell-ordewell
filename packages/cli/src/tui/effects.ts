@@ -32,6 +32,8 @@ export interface OrdewellApi {
   forceSendTaskMessage(sessionId: string, taskId: string, text: string): Promise<{ id: string }>;
   forceSendQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<{ sent: boolean }>;
   interruptTask(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
+  approveTaskCheckpoint(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
+  rejectTaskCheckpoint(sessionId: string, taskId: string, reason?: string): Promise<{ ok: boolean }>;
   continueTask(sessionId: string, taskId: string, text: string): Promise<{ ok: boolean }>;
   addTask(sessionId: string, task: Record<string, unknown>): Promise<{ ok: boolean }>;
   updateTask(sessionId: string, taskId: string, changes: Record<string, unknown>): Promise<{ ok: boolean }>;
@@ -306,6 +308,14 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       }
       return;
     }
+
+    // The card goes when the daemon's next status says the task left the
+    // checkpoint; a refusal (settled elsewhere, withdrawn) surfaces as the
+    // failure the daemon words.
+    case 'answerTaskCheckpoint':
+      if (effect.answer === 'approve') await api.approveTaskCheckpoint(effect.sessionId, effect.taskId);
+      else await api.rejectTaskCheckpoint(effect.sessionId, effect.taskId, effect.reason);
+      return;
 
     // A task with a saved log ran structured, whatever its `transport` says
     // after a reload; it has no tmux window, so open the log rather than fail.
