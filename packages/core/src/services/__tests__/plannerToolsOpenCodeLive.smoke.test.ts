@@ -29,7 +29,7 @@ const model = process.env.ORDEWELL_LIVE_MODEL ?? 'opencode-go/deepseek-v4.1-flas
 
 const CATALOG: Record<string, DiscoveredModel[]> = {
   opencode: [{ modelId: model, modelLabel: 'Live model', variants: [] }],
-  'claude-code': [{ modelId: 'haiku', modelLabel: 'Haiku', variants: [] }],
+  'claude-code': [{ modelId: 'claude-haiku-4-5-20251001', modelLabel: 'Haiku', variants: [] }],
 };
 
 const cleanup: (() => Promise<void> | void)[] = [];

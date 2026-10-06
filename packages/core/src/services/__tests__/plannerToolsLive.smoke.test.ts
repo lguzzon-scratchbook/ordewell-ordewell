@@ -25,7 +25,7 @@ import { FakeTerminalSession, fakeConfig, makeSession } from './sessionTestKit';
  * not touch — can still be checked there; the planner then cannot read the
  * workspace, which this case never asks of it.
  *
- * The planner runs on the cheapest model — `haiku` for Claude Code,
+ * The planner runs on the cheapest model — Haiku for Claude Code,
  * `gpt-5.6-luna` for Codex — unless ORDEWELL_LIVE_MODEL says otherwise, which
  * applies to both, so set it only with one runner. The catalog offers the same
  * models, so a committed plan never names a dearer one.
@@ -36,7 +36,9 @@ import { FakeTerminalSession, fakeConfig, makeSession } from './sessionTestKit';
 const liveAgents = (process.env.ORDEWELL_LIVE_AGENTS ?? '').split(',').map((s) => s.trim());
 const live = liveAgents.includes('claude-code');
 const liveCodex = liveAgents.includes('codex');
-const claudeModel = process.env.ORDEWELL_LIVE_MODEL ?? 'haiku';
+// The `haiku` alias runs Sonnet under `--permission-mode plan`, which the
+// planner spawns with; the full id is honoured.
+const claudeModel = process.env.ORDEWELL_LIVE_MODEL ?? 'claude-haiku-4-5-20251001';
 const codexModel = process.env.ORDEWELL_LIVE_MODEL ?? 'gpt-5.6-luna';
 
 const CATALOG: Record<string, DiscoveredModel[]> = {
