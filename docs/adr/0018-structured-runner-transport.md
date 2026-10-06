@@ -2,6 +2,8 @@
 
 **Status:** accepted
 
+*Pending (2026-10-06):* [ADR-0023](0023-messages-reach-a-running-task.md) changes M1: a message reaches a running task at the runner's next step boundary instead of when the turn ends, with the turn-end queue as the fallback, and adds force send.
+
 A task's runner is a TUI in tmux (ADR-0007) or a headless one-shot process, and
 Ordewell talks to it through the screen and the keyboard. "Done" and
 checkpoints are found by scanning rendered PTY bytes (`VerdictEngine`,
