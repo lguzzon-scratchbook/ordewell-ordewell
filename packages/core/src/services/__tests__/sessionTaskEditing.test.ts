@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createTask, type LegacyPlanState } from '../../models/Task';
-import { FakeTerminalSession, makeSession, testWorkspace, taskOf } from './sessionTestKit';
+import { FakeTerminalSession, makeSession, testWorkspace, taskOf, saves } from './sessionTestKit';
 import { PlanStore } from '../PlanStore';
 import type { ModelResolver } from '../ModelResolver';
 import type { ITerminalRunner } from '../../interfaces/ITerminalRunner';
@@ -402,5 +402,136 @@ describe('reordering is not part of the plan API', () => {
 
     expect((session as unknown as Record<string, unknown>).reorderTasks).toBeUndefined();
     expect((new PlanStore() as unknown as Record<string, unknown>).reorder).toBeUndefined();
+  });
+});
+
+describe('Session.updateTask — what a field patch saves and announces', () => {
+  function loaded(plan = planWith()) {
+    const broadcast = vi.fn();
+    const session = makeSession({ modelResolver: resolverFor(CLAUDE_CATALOG), broadcast });
+    session.loadPlan(plan, 'goal', testWorkspace, { persist: false });
+    const order: string[] = [];
+    saves(session).mockImplementation(() => { order.push('save'); });
+    broadcast.mockImplementation((m: { type: string }) => { order.push(m.type); });
+    const updates = () => broadcast.mock.calls.map(([m]) => m as { type: string; changes?: Record<string, unknown> }).filter((m) => m.type === 'task_updated');
+    return { session, broadcast, order, updates };
+  }
+
+  it('saves the patch, then announces it as task_updated rather than a whole plan', async () => {
+    const { session, broadcast, order } = loaded();
+
+    await session.updateTask('t1', { title: 'Renamed' });
+
+    expect(broadcast).toHaveBeenCalledWith({ type: 'task_updated', taskId: 't1', changes: { title: 'Renamed' } });
+    expect(order.indexOf('save')).toBeLessThan(order.indexOf('task_updated'));
+    expect(order).not.toContain('plan_generated');
+  });
+
+  it('announces the fields a flip to MAN cleared, so no surface keeps showing them', async () => {
+    const { session, updates } = loaded();
+
+    await session.updateTask('t1', { type: 'user', userSteps: [{ order: 1, instruction: 'by hand', completed: false }] });
+
+    const [update] = updates();
+    expect(update.changes).toHaveProperty('taskMode', undefined);
+    expect(update.changes).toHaveProperty('type', 'user');
+  });
+
+  it('announces an ops flag turned off as cleared, not as false', async () => {
+    const plan = planWith();
+    plan.tasks[1].ops = true;
+    const { session, updates } = loaded(plan);
+
+    await session.updateTask('t2', { ops: false });
+
+    expect(updates()[0].changes).toEqual({ ops: undefined });
+    expect(updates()[0].changes).toHaveProperty('ops');
+  });
+
+  // The direct-edit reschedule covers a field patch as it covers add and remove.
+  it('starts a task its new dependency list frees, on an armed scheduler', async () => {
+    const runner = recordingRunner();
+    const session = makeSession({ runner, modelResolver: resolverFor(CLAUDE_CATALOG) });
+    session.loadPlan(pausedOnUserTask(), 'goal', testWorkspace, { persist: false });
+    await session.executePlan();
+    expect(runner.spawned).toEqual([]);
+
+    await session.setTaskDependencies('c', ['a']);
+
+    expect(runner.spawned).toEqual(['c']);
+  });
+});
+
+describe('Session.addTask — what it saves and announces', () => {
+  it('saves the added task before announcing the plan it is in', async () => {
+    const broadcast = vi.fn();
+    const session = makeSession({ modelResolver: resolverFor(CLAUDE_CATALOG), broadcast });
+    session.loadPlan(planWith(), 'goal', testWorkspace, { persist: false });
+    const order: string[] = [];
+    saves(session).mockImplementation((plan) => { order.push(`save:${plan.tasks.length}`); });
+    broadcast.mockImplementation((m: { type: string }) => { order.push(m.type); });
+
+    await session.addTask({ title: 'Docs', prompt: 'write docs' });
+
+    expect(order.indexOf('save:3')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('save:3')).toBeLessThan(order.indexOf('plan_generated'));
+  });
+});
+
+describe('Session.removeTask of a task not in the plan', () => {
+  it('answers null, saves nothing and stops nothing', async () => {
+    const runner = recordingRunner();
+    const session = makeSession({ runner, modelResolver: resolverFor(CLAUDE_CATALOG) });
+    session.loadPlan(soloPlan(), 'goal', testWorkspace, { persist: false });
+    await session.executePlan();
+
+    expect(await session.removeTask('ghost')).toBeNull();
+
+    expect(runner.stopped).toEqual([]);
+    expect(session.hasLiveWork).toBe(true);
+    expect(saves(session)).not.toHaveBeenCalled();
+  });
+});
+
+describe('plan edits on a session with no plan', () => {
+  it('change nothing, ask discovery nothing, and answer null', async () => {
+    const resolver = resolverFor(CLAUDE_CATALOG);
+    const broadcast = vi.fn();
+    const session = makeSession({ modelResolver: resolver, broadcast });
+
+    expect(await session.updateTask('t1', { title: 'x' })).toBeNull();
+    expect(await session.setTaskDependencies('t1', [])).toBeNull();
+    expect(await session.setTaskRunner('t1', 'codex')).toBeNull();
+    expect(await session.addTask({ title: 'x', prompt: 'x' })).toBeNull();
+    expect(await session.removeTask('t1')).toBeNull();
+    expect(await session.resolveConflictAsTask('t1')).toBeNull();
+
+    expect(resolver.modelsForRunners).not.toHaveBeenCalled();
+    expect(saves(session)).not.toHaveBeenCalled();
+    expect(broadcast).not.toHaveBeenCalled();
+    expect(session.planTasks).toEqual([]);
+  });
+
+  it('refuses a merge or a split before the planner, or whether it has tools, is asked', async () => {
+    const continueConversation = vi.fn();
+    const plannerToolsAttached = vi.fn(() => true);
+    const session = makeSession({ aiService: { continueConversation, plannerToolsAttached } });
+
+    await expect(session.requestMerge(['a', 'b'])).rejects.toThrow('No active plan state');
+    await expect(session.requestSplit('a')).rejects.toThrow('No active plan state');
+
+    expect(continueConversation).not.toHaveBeenCalled();
+    expect(plannerToolsAttached).not.toHaveBeenCalled();
+  });
+});
+
+describe('Session.requestSplit of a task not in the plan', () => {
+  it('refuses before any model call', async () => {
+    const continueConversation = vi.fn();
+    const session = makeSession({ aiService: { continueConversation } });
+    session.loadPlan(planWith(), 'goal', testWorkspace, { persist: false });
+
+    await expect(session.requestSplit('ghost')).rejects.toThrow('Task not found');
+    expect(continueConversation).not.toHaveBeenCalled();
   });
 });

@@ -83,7 +83,8 @@ export {
   OUTPUT_LINES_DEFAULT, OUTPUT_LINES_MAX, TASK_QUERY_ANSWER_MAX_CHARS,
 } from './services/TaskQuery';
 export type { TaskQuery, TaskQueryField, TaskQueryCatalog, LiveOutputLookup } from './services/TaskQuery';
-export { Session, createSession, PlanEditError, sessionRuntimeSettings, resolveSkillInvocation } from './services/createSession';
+export { Session, createSession, sessionRuntimeSettings, resolveSkillInvocation } from './services/createSession';
+export { PlanEditError } from './services/PlanEditError';
 export type { SessionDeps, SessionRuntimeSettings, SessionPlanner, SaveSession, ConversationFork, ConversationRewind } from './services/createSession';
 export { ConversationEditError, ConversationBusyError } from './services/PlannerConversation';
 export type { RewindTarget, ConversationCompaction, PlannerSubmission } from './services/PlannerConversation';

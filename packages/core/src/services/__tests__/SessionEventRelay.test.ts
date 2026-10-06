@@ -25,7 +25,8 @@ function setup() {
     broadcast: (m) => sent.push(m),
     onNotice: (n) => notices.push(n),
     store,
-    orchestrator: { getIdleSince: () => null, getTaskIsolation: () => null, getQueuedTaskMessages: () => [], getMergeGate: () => [], mergeGateView: () => null },
+    orchestrator: { getIdleSince: () => null, getQueuedTaskMessages: () => [], getMergeGate: () => [], mergeGateView: () => null },
+    runs: { taskIsolation: () => null },
     usage,
   });
   const types = () => sent.map((m) => m.type);

@@ -102,7 +102,7 @@ describe('TaskOrchestrator: ops tasks and merge gates (ADR-0020)', () => {
 
       await vi.waitFor(() => expect(env.spawned('o2')[0]?.cwd).toBe('/repo'));
       expect(env.orchestrator.getMergeGate('o2')).toEqual([]);
-      expect(env.orchestrator.isolationRecord).not.toBeNull();
+      expect(env.orchestrator.runs.planIsolation).not.toBeNull();
       expect(env.isolation.calls.map((c) => c.op)).not.toContain('discard');
     });
 
@@ -212,7 +212,7 @@ describe('TaskOrchestrator: ops tasks and merge gates (ADR-0020)', () => {
       await flushMicrotasks();
 
       expect(env.handoffs).toEqual([]);
-      expect(env.orchestrator.isolationRecord).toBeNull();
+      expect(env.orchestrator.runs.planIsolation).toBeNull();
       expect(env.notices).toContainEqual(expect.stringContaining('merged into your branch already'));
     });
   });

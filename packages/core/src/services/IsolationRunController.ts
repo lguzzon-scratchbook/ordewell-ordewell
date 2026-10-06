@@ -19,6 +19,7 @@ import type {
 import { describeMergeResult } from './mergeResultNotice';
 import { handoffOf, integrationBranchNameOf, layoutOf, SELF_REPO, taskIsolationOf } from './isolationRecord';
 import type { IsolatedExecution } from './plannerModes';
+import { PlanEditError } from './PlanEditError';
 
 export type IsolationNoticeLevel = 'info' | 'warn' | 'error';
 
@@ -159,8 +160,9 @@ export class IsolationRunController {
     return this.run ? { run: this.run, resolvers: this.resolvers } : null;
   }
 
+  /** The one guard of every action on the run: a plan that never isolated is a request refused, not a fault. */
   requireRun(): IsolationRun {
-    if (!this.run) throw new Error('This plan has no isolated run');
+    if (!this.run) throw new PlanEditError('This plan has no isolated run');
     return this.run;
   }
 
@@ -414,7 +416,9 @@ export class IsolationRunController {
   /**
    * Mark which added task resolves which conflict. The resolver merges the
    * conflicted task's branch by hand in its own worktree; once that lands, the
-   * conflicted task can land in turn.
+   * conflicted task can land in turn — through the same merge, so a resolver
+   * that did not really bring it along conflicts again instead of being taken
+   * at its word.
    */
   linkResolver(resolverId: string, conflictedId: string): void {
     this.resolvers[resolverId] = conflictedId;

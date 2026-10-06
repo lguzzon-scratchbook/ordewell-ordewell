@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createTask, type LegacyPlanState } from '../../models/Task';
-import { makeSession, testWorkspace } from './sessionTestKit';
+import { makeSession, testWorkspace, saves } from './sessionTestKit';
 import type { ModelResolver } from '../ModelResolver';
 import type { ITerminalRunner } from '../../interfaces/ITerminalRunner';
 
@@ -156,5 +156,39 @@ describe('Session.setTaskRunner', () => {
     expect(state!.tasks[0].assignedRunner).toBe('codex');
     expect(state!.tasks[0].assignedModel!.modelId).toBe('claude-sonnet-4-5');
     expect(state!.tasks[0].taskMode).toBe('fullAccess');
+  });
+});
+
+describe('Session.setTaskRunner on a manual task', () => {
+  it('leaves it on its runner without asking discovery or saving', async () => {
+    const plan = planWith();
+    plan.tasks[0].type = 'user';
+    plan.tasks[0].userSteps = [{ order: 1, instruction: 'by hand', completed: false }];
+    const resolver = resolverFor(CODEX_CATALOG);
+    const session = makeSession({ modelResolver: resolver });
+    session.loadPlan(plan, 'goal', testWorkspace, { persist: false });
+
+    const state = await session.setTaskRunner('t1', 'codex');
+
+    expect(state!.tasks[0].assignedRunner).toBe('claude-code');
+    expect(state!.runners).toEqual(['claude-code']);
+    expect(resolver.modelsForRunners).not.toHaveBeenCalled();
+    expect(saves(session)).not.toHaveBeenCalled();
+  });
+});
+
+describe('Session.setTaskRunner — what it saves and announces', () => {
+  it('saves the retargeted task before announcing the plan', async () => {
+    const broadcast = vi.fn();
+    const session = makeSession({ modelResolver: resolverFor(CODEX_CATALOG), broadcast });
+    session.loadPlan(planWith(), 'goal', testWorkspace, { persist: false });
+    const order: string[] = [];
+    saves(session).mockImplementation((plan) => { order.push(`save:${plan.tasks[0].assignedRunner}`); });
+    broadcast.mockImplementation((m: { type: string }) => { order.push(m.type); });
+
+    await session.setTaskRunner('t1', 'codex');
+
+    expect(order.indexOf('save:codex')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('save:codex')).toBeLessThan(order.indexOf('plan_generated'));
   });
 });
