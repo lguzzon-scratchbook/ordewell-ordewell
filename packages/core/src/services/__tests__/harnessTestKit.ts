@@ -3,7 +3,9 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import type { ChildProcess } from 'child_process';
 import type { SpawnFn } from '../HeadlessRunner';
-import type { AgentAdapterFactory, AgentEvent } from '../harness/AgentAdapter';
+import type { AgentAdapterFactory, AgentEvent, AgentProcessDeps, TaskModeAgentAdapter } from '../harness/AgentAdapter';
+import { ClaudeCodeAdapter } from '../harness/ClaudeCodeAdapter';
+import { createTaskAdapter } from '../harness/taskAdapters';
 import type { RunnerPluginManifest } from '../../plugins/types';
 
 /**
@@ -247,6 +249,18 @@ export function scriptedAdapter(turns: AgentEvent[][], agentId = 'claude-code'):
     nativeSessionId: () => null,
     dispose: () => {},
   });
+}
+
+/**
+ * The structured runner's `createAdapter`, with Claude Code as it was before
+ * it took messages mid-turn (ADR-0023): the real adapter, `steer` taken away.
+ * The transcripts recorded before `--replay-user-messages` carry no
+ * echoes, so the scenarios that play them keep covering the turn-end queue
+ * and taking a message back.
+ */
+export function claudeTurnEndQueue(runner: string, deps: AgentProcessDeps): TaskModeAgentAdapter {
+  const adapter = createTaskAdapter(runner, deps);
+  return adapter instanceof ClaudeCodeAdapter ? Object.assign(adapter, { steer: undefined }) : adapter;
 }
 
 /**
