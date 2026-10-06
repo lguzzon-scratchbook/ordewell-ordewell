@@ -28,6 +28,8 @@ export interface TaskView {
   transport?: TaskTransportView;
   /** What an `awaiting_user` task waits on, when the daemon saved why. */
   awaitingReason?: AwaitingReason;
+  /** The whole question of the checkpoint the task waits at, while it does. */
+  checkpoint?: string;
   /** A finished structured task the daemon can continue in its saved session (ADR-0018, K1). */
   continuable?: boolean;
   /** How many of its runner's tool requests wait for an answer (ADR-0018, A1); absent when none do. */
@@ -499,10 +501,14 @@ export function waitingApproval(tv: TaskLogState): ApprovalBlock | undefined {
 }
 
 /**
- * Finds a task by id anywhere in the tree, subtasks included — `expandedTaskId`
- * names a subtask as often as a top-level task, and a top-level-only lookup
- * would treat every subtask as gone the moment one is expanded.
+ * The question the task view's checkpoint keys answer, while the task waits at
+ * it. The daemon sends it with the status, so a view opened after the question
+ * was asked still has it.
  */
+export function waitingCheckpoint(task: TaskView | undefined): string | undefined {
+  return task?.status === 'awaiting_user' && task.awaitingReason === 'checkpoint' ? task.checkpoint : undefined;
+}
+
 /**
  * A finished structured task the daemon can continue in its saved session
  * (ADR-0018, K1): the composer continues it rather than messaging a turn.
@@ -513,6 +519,11 @@ export function continuesTask(task: TaskView | undefined): boolean {
   return task?.continuable === true && (task.status === 'completed' || task.status === 'failed');
 }
 
+/**
+ * Finds a task by id anywhere in the tree, subtasks included — `expandedTaskId`
+ * names a subtask as often as a top-level task, and a top-level-only lookup
+ * would treat every subtask as gone the moment one is expanded.
+ */
 export function findTask(tasks: TaskView[], id: string): TaskView | undefined {
   for (const task of tasks) {
     if (task.id === id) return task;

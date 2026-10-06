@@ -548,7 +548,7 @@ describe('TUI end to end', () => {
     h.type('/run');
     h.type('\r');
     await vi.waitFor(() => {
-      expect(h.transcript()).toContain('Checkpoint — Add the login route: Route added');
+      expect(h.transcript()).toContain('Task 1 asks: Route added');
       expect(h.transcript()).toContain('Plan needs your sign-off — /approve to continue.');
       expect(h.transcript()).toContain('Added a hardening task.');
       expect(h.transcript()).toContain('Plan approved.');

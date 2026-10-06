@@ -1,5 +1,6 @@
-import { isAwaitingReason, truncateCheckpointSummary, type SessionMessage, type SessionNotice } from '@ordewell/core';
+import { isAwaitingReason, type SessionMessage, type SessionNotice } from '@ordewell/core';
 import type { WsEvent } from '../apiClient';
+import { sanitize } from './ansi';
 import type { Action } from './reducer';
 import type { TaskStatusUpdate } from './reducers/shared';
 
@@ -340,6 +341,7 @@ function dispatchLifecycle(dispatch: Dispatch, event: LifecycleMessage, sessionI
           isolation: task.isolation,
           transport: task.transport,
           awaitingReason: isAwaitingReason(task.awaitingReason) ? task.awaitingReason : undefined,
+          ...(typeof task.checkpoint === 'string' && task.checkpoint ? { checkpoint: sanitize(task.checkpoint) } : {}),
           ...(task.continuable ? { continuable: true } : {}),
           awaitingApproval: typeof task.awaitingApproval === 'number' && task.awaitingApproval > 0 ? task.awaitingApproval : undefined,
           ...(task.mergeGate?.length ? { mergeGate: task.mergeGate.map(String) } : {}),
@@ -356,10 +358,10 @@ function dispatchLifecycle(dispatch: Dispatch, event: LifecycleMessage, sessionI
       dispatch({ type: 'taskStarted', taskId: String(event.taskId), title: String(event.title ?? event.taskId), runner: event.runner, sessionId });
       return;
 
-    // The extension shows these in its checkpoint panel; here they are
-    // transcript lines, which is the TUI's equivalent surface.
+    // The extension shows these in its checkpoint panel; here they are a
+    // transcript line, and the task view carries the card that answers them.
     case 'checkpoint':
-      dispatch({ type: 'notice', message: `· Checkpoint — ${event.taskTitle}: ${truncateCheckpointSummary(event.summary)}` });
+      dispatch({ type: 'taskCheckpoint', taskId: String(event.taskId), title: String(event.taskTitle), summary: event.summary, sessionId });
       return;
 
     case 'review_needed':

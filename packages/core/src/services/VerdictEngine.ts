@@ -48,6 +48,8 @@ export class VerdictEngine {
    * answer is typed into the session instead.
    */
   private toolCheckpoints = new Map<string, (answer: CheckpointAnswer) => void>();
+  /** The question a task's checkpoint asks, whole, for as long as it waits — by either route. */
+  private checkpointQuestions = new Map<string, string>();
   private idleListeners: IdleListener[] = [];
   /**
    * Per-task generation. Replaced on every watch(), clear() and verdict.
@@ -149,7 +151,13 @@ export class VerdictEngine {
     return session.interactive ? `${line}\r` : `\n${line}\n`;
   }
 
+  /** What a task's waiting checkpoint asks, untruncated; undefined when none waits. */
+  getCheckpointQuestion(taskId: string): string | undefined {
+    return this.checkpointQuestions.get(taskId);
+  }
+
   approveCheckpoint(taskId: string): void {
+    this.checkpointQuestions.delete(taskId);
     this.resumeIdle(taskId);
     const toolCall = this.toolCheckpoints.get(taskId);
     if (toolCall) {
@@ -164,6 +172,7 @@ export class VerdictEngine {
   }
 
   rejectCheckpoint(taskId: string, reason: string): void {
+    this.checkpointQuestions.delete(taskId);
     this.resumeIdle(taskId);
     const toolCall = this.toolCheckpoints.get(taskId);
     if (toolCall) {
@@ -208,6 +217,9 @@ export class VerdictEngine {
       this.structuredSessions.set(task.id, session);
       session.onTurnEnd(() => {
         if (this.generations.get(task.id) !== gen) return;
+        // The call lives inside the turn that made it. A runner cut short by an
+        // interrupt does not always cancel it, and left open it would refuse the next one.
+        this.callWentAway(task.id, 'the turn it was asked in has ended.');
         // A queued follow-up supersedes this turn's evidence without ending the attempt.
         const pending = this.pendingVerdicts.get(task.id);
         this.pendingVerdicts.delete(task.id);
@@ -288,7 +300,10 @@ export class VerdictEngine {
     return new Promise((resolve) => {
       const settle = (answer: CheckpointAnswer) => {
         signal.removeEventListener('abort', onAbort);
-        if (this.toolCheckpoints.get(taskId) === settle) this.toolCheckpoints.delete(taskId);
+        if (this.toolCheckpoints.get(taskId) === settle) {
+          this.toolCheckpoints.delete(taskId);
+          this.checkpointQuestions.delete(taskId);
+        }
         resolve(answer);
       };
       const onAbort = () => {
@@ -299,8 +314,18 @@ export class VerdictEngine {
       };
       signal.addEventListener('abort', onAbort, { once: true });
       this.toolCheckpoints.set(taskId, settle);
+      this.checkpointQuestions.set(taskId, question.trim());
       for (const l of this.checkpointListeners) l(taskId, question.trim());
     });
+  }
+
+  /** The open `checkpoint` call can no longer be answered: refuse it, and let the task out of the wait. */
+  private callWentAway(taskId: string, why: string): void {
+    const open = this.toolCheckpoints.get(taskId);
+    if (!open) return;
+    open({ kind: 'withdrawn', why });
+    this.resumeIdle(taskId);
+    for (const l of this.withdrawnListeners) l(taskId);
   }
 
   private withdrawToolCheckpoint(taskId: string): void {
@@ -328,6 +353,7 @@ export class VerdictEngine {
     for (const match of scan.matchAll(CHECKPOINT_RE)) {
       consumed = match.index + match[0].length;
       this.pausedSessions.set(taskId, session);
+      this.checkpointQuestions.set(taskId, match[1].trim());
       for (const l of this.checkpointListeners) l(taskId, match[1].trim());
     }
     this.checkpointCarry.set(taskId, scan.slice(consumed).slice(-CHECKPOINT_CARRY));
@@ -346,6 +372,7 @@ export class VerdictEngine {
     this.checkpointCarry.delete(taskId);
     this.pausedSessions.delete(taskId);
     this.withdrawToolCheckpoint(taskId);
+    this.checkpointQuestions.delete(taskId);
     this.idlePaused.delete(taskId);
     this.openApprovals.delete(taskId);
     this.clearIdle(taskId);
@@ -387,6 +414,7 @@ export class VerdictEngine {
     this.checkpointCarry.clear();
     this.pausedSessions.clear();
     for (const taskId of [...this.toolCheckpoints.keys()]) this.withdrawToolCheckpoint(taskId);
+    this.checkpointQuestions.clear();
     for (const timer of this.idleTimers.values()) clearTimeout(timer);
     this.idleTimers.clear();
     this.idleSince.clear();

@@ -19,6 +19,8 @@ export type SerializedTaskStatus = {
   transport?: Pick<TaskTransport, 'kind' | 'fallback'>;
   /** What an `awaiting_user` task waits on, when it was saved (ADR-0018, W1). */
   awaitingReason?: AwaitingReason;
+  /** The whole question of the checkpoint the task waits at; absent when it waits at none. */
+  checkpoint?: string;
   /** Messages waiting for a structured task's turn to end, oldest first; absent when there are none. */
   queued?: QueuedTaskMessage[];
   /** Set when the task can be continued in its saved runner session (ADR-0018, K1); the id itself stays in the daemon. */
@@ -281,6 +283,7 @@ export function serializeTaskStatus(
   queued: readonly QueuedTaskMessage[] = [],
   awaitingApproval = 0,
   mergeGate: readonly string[] = [],
+  checkpoint = '',
 ): SerializedTaskStatus {
   return {
     id: t.id,
@@ -292,6 +295,7 @@ export function serializeTaskStatus(
     ...(isolation ? { isolation } : {}),
     ...(t.transport ? { transport: t.transport.fallback ? { kind: t.transport.kind, fallback: t.transport.fallback } : { kind: t.transport.kind } } : {}),
     ...(t.status === 'awaiting_user' && t.awaitingReason ? { awaitingReason: t.awaitingReason } : {}),
+    ...(t.status === 'awaiting_user' && t.awaitingReason === 'checkpoint' && checkpoint ? { checkpoint } : {}),
     ...(queued.length > 0 ? { queued: queued.map((m) => ({ ...m })) } : {}),
     ...(canContinue(t) ? { continuable: true as const } : {}),
     ...(awaitingApproval > 0 ? { awaitingApproval } : {}),

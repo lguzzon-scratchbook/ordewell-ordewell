@@ -328,6 +328,7 @@ export function createSession(deps: SessionDeps): Session {
   const events = new SessionEventRelay({
     broadcast: deps.broadcast, onNotice: deps.onNotice, store, orchestrator, runs: orchestrator.runs, usage,
     awaitingApproval: (taskId) => runnerApprovals.waiting(taskId),
+    checkpointQuestion: (taskId) => orchestrator.getCheckpointQuestion(taskId),
   });
 
   const approvalPolicy = new ApprovalPolicy({
@@ -1279,6 +1280,11 @@ export class Session {
 
   rejectCheckpoint(taskId: string, reason?: string): void {
     this.orchestrator.rejectCheckpoint(taskId, reason);
+  }
+
+  /** Whether an answer would reach the task: it waits at a checkpoint and a runner is left to hear it. */
+  awaitsCheckpoint(taskId: string): boolean {
+    return this.orchestrator.awaitsCheckpoint(taskId);
   }
 
   /**

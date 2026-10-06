@@ -295,7 +295,7 @@ export class TaskOrchestrator {
       this.emit('onCheckpoint', { taskId, taskTitle: task.title, summary });
     });
     this.verifier.onCheckpointWithdrawn((taskId) => {
-      if (!this.atCheckpoint(taskId)) return;
+      if (!this.awaitsCheckpoint(taskId)) return;
       this.store.markInProgress(taskId);
       this.emit('onTaskChanged');
     });
@@ -402,17 +402,22 @@ export class TaskOrchestrator {
   }
 
   approveCheckpoint(taskId: string): void {
-    if (!this.atCheckpoint(taskId)) return;
+    if (!this.awaitsCheckpoint(taskId)) return;
     this.verifier.approveCheckpoint(taskId);
     this.store.markInProgress(taskId);
     this.emit('onTaskChanged');
   }
 
   rejectCheckpoint(taskId: string, reason?: string): void {
-    if (!this.atCheckpoint(taskId)) return;
+    if (!this.awaitsCheckpoint(taskId)) return;
     this.verifier.rejectCheckpoint(taskId, reason ?? 'Checkpoint rejected by user');
     this.store.markInProgress(taskId);
     this.emit('onTaskChanged');
+  }
+
+  /** What the task's waiting checkpoint asks, whole; undefined once it settles or when none waits. */
+  getCheckpointQuestion(taskId: string): string | undefined {
+    return this.verifier.getCheckpointQuestion(taskId);
   }
 
   /*
@@ -420,7 +425,7 @@ export class TaskOrchestrator {
    * guard: a checkpoint reloaded from disk has no runner left to answer it,
    * and putting it back to in_progress would strand it with nothing behind it.
    */
-  private atCheckpoint(taskId: string): boolean {
+  awaitsCheckpoint(taskId: string): boolean {
     return this.store.get(taskId)?.awaitingReason === 'checkpoint' && this.attempts.has(taskId);
   }
 

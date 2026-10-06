@@ -119,6 +119,35 @@ export async function handleContinue(subArgs: string[], injectedApi?: ApiClient)
   });
 }
 
+/**
+ * Answer the checkpoint a task waits at. Approving carries no note — what the
+ * runner is told is just "continue" — so one given is refused rather than
+ * dropped; a rejection's reason is the rest of the line.
+ */
+export async function handleCheckpoint(subArgs: string[], injectedApi?: ApiClient): Promise<void> {
+  const usage = 'Usage: ordewell checkpoint <task-id-or-order> approve|reject [reason] [--session-id <id>] [--workspace /path]';
+  const [, answer, ...words] = positionals(subArgs);
+  const reason = words.join(' ').trim();
+  if (answer !== 'approve' && answer !== 'reject') {
+    console.error(usage);
+    process.exit(1);
+  }
+  if (answer === 'approve' && reason) {
+    console.error(`Approving takes no note — reject with a reason to tell the task something.\n${usage}`);
+    process.exit(1);
+  }
+  await withResolvedTask(subArgs, usage, injectedApi, async (api, sessionId, taskId) => {
+    try {
+      if (answer === 'approve') await api.approveTaskCheckpoint(sessionId, taskId);
+      else await api.rejectTaskCheckpoint(sessionId, taskId, reason || undefined);
+      console.log(answer === 'approve' ? 'Checkpoint approved.' : 'Checkpoint rejected.');
+    } catch (err) {
+      console.error(`Failed to ${answer} checkpoint: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  });
+}
+
 export const handleRunTask = makeHandler('run', 'run-task');
 export const handleForceStart = makeHandler('force-start');
 export const handleRetry = makeHandler('retry');

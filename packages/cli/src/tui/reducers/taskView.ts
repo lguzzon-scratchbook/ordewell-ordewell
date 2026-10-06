@@ -1,7 +1,7 @@
-import { EMPTY_TASK_LOG, reduceTaskLog, replayTaskLog, runnerToolSubject, type ApprovalDecision, type TaskLogEvent } from '@ordewell/core';
+import { EMPTY_TASK_LOG, reduceTaskLog, replayTaskLog, runnerToolSubject, truncateCheckpointSummary, type ApprovalDecision, type TaskLogEvent } from '@ordewell/core';
 import { commit } from '../editor';
 import type { Key } from '../keys';
-import { continuesTask, findTask, waitingApproval, type TaskLogState, type TuiState } from '../state';
+import { continuesTask, findTask, waitingApproval, waitingCheckpoint, type TaskLogState, type TuiState } from '../state';
 import { say } from '../transcript';
 import { step, type Step, type Action } from './shared';
 
@@ -122,6 +122,19 @@ export function announceApprovals(state: TuiState, action: Extract<Action, { typ
 }
 
 /**
+ * A task's checkpoint question, said in the chat pane wherever the user is:
+ * the first line of it, and where the whole of it can be answered. A task with
+ * no view of its own is answered by `/checkpoint`.
+ */
+export function announceCheckpoint(state: TuiState, action: Extract<Action, { type: 'taskCheckpoint' }>): TuiState {
+  const task = findTask(state.tasks, action.taskId) ?? state.tasks.find((t) => t.title === action.title);
+  const label = task ? `Task ${task.order}` : action.title;
+  const where = task?.transport?.kind === 'structured' ? 't on it to answer' : `/checkpoint ${task?.order ?? '<id>'} approve|reject to answer`;
+  const spoken = say(state, 'system', `· ${label} asks: ${truncateCheckpointSummary(action.summary)} — ${where}`);
+  return { ...spoken, scroll: state.scroll };
+}
+
+/**
  * A saved log (or its absence): replay it, then catch up on buffered live
  * batches. A batch for the attempt just replayed is dropped — the recorder
  * appends before it broadcasts, so the file already holds it; a batch for any
@@ -161,6 +174,30 @@ function answerApproval(state: TuiState, tv: TaskLogState, sessionId: string, de
   const answer: ApprovalDecision = decision === 'deny' ? { decision, ...(note ? { note } : {}) } : { decision };
   const next = note ? { ...state, editor: { ...state.editor, text: '', cursor: 0 } } : state;
   return step(next, [{ type: 'answerTaskApproval', sessionId, approvalId: approval.approvalId, answer }]);
+}
+
+/**
+ * Answer the checkpoint a task waits at. Only a rejection carries a reason, so
+ * an approval has nowhere to put a note. The daemon says if the task is no
+ * longer waiting, so a checkpoint settled elsewhere is not pre-judged here.
+ */
+export function answerCheckpoint(state: TuiState, sessionId: string, taskId: string, answer: 'approve' | 'reject', reason = ''): Step {
+  const task = findTask(state.tasks, taskId);
+  if (!waitingCheckpoint(task)) return step(say(state, 'system', `Task ${task?.order ?? taskId} is not waiting at a checkpoint.`));
+  const note = answer === 'reject' ? reason.trim() : '';
+  return step(state, [{ type: 'answerTaskCheckpoint', sessionId, taskId, answer, ...(note ? { reason: note } : {}) }]);
+}
+
+/**
+ * ctrl-y and ctrl-g: a waiting tool request answers first, then the checkpoint.
+ * A rejection takes the composer's text as its reason, as a denial takes its
+ * note, and empties the composer once sent.
+ */
+function answerWaiting(state: TuiState, tv: TaskLogState, sessionId: string, decision: 'allow' | 'deny'): Step {
+  if (waitingApproval(tv) || !waitingCheckpoint(findTask(state.tasks, tv.taskId))) return answerApproval(state, tv, sessionId, decision);
+  if (decision === 'allow') return answerCheckpoint(state, sessionId, tv.taskId, 'approve');
+  const answered = answerCheckpoint(state, sessionId, tv.taskId, 'reject', state.editor.text);
+  return state.editor.text.trim() ? { ...answered, state: { ...answered.state, editor: { ...answered.state.editor, text: '', cursor: 0 } } } : answered;
 }
 
 /**
@@ -217,9 +254,9 @@ export function handleTaskViewKey(state: TuiState, key: Key): Step | null {
     return step(state, [{ type: 'interruptTask', sessionId: state.sessionId, taskId: tv.taskId }]);
   }
 
-  if (key.name === 'ctrl-y') return answerApproval(state, tv, state.sessionId, 'allow');
+  if (key.name === 'ctrl-y') return answerWaiting(state, tv, state.sessionId, 'allow');
   if (key.name === 'ctrl-t') return answerApproval(state, tv, state.sessionId, 'allowForTask');
-  if (key.name === 'ctrl-g') return answerApproval(state, tv, state.sessionId, 'deny');
+  if (key.name === 'ctrl-g') return answerWaiting(state, tv, state.sessionId, 'deny');
 
   if (key.name === 'ctrl-n' || key.name === 'ctrl-p') {
     const count = tv.view.queued.length;

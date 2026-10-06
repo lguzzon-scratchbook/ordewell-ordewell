@@ -382,6 +382,28 @@ export class ApiClient {
     return res.data;
   }
 
+  /** Let a task go on from the checkpoint it waits at; refused, with the reason, when none waits. */
+  async approveTaskCheckpoint(sessionId: string, taskId: string): Promise<{ ok: boolean }> {
+    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/checkpoint/approve`);
+    if (res.status !== 200) {
+      throw new Error(res.data?.error || 'Approve checkpoint failed');
+    }
+    return res.data;
+  }
+
+  /** Turn a task back at its checkpoint; `reason` is what the agent is told. */
+  async rejectTaskCheckpoint(sessionId: string, taskId: string, reason?: string): Promise<{ ok: boolean }> {
+    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>(
+      'POST',
+      `/api/plans/${sessionId}/tasks/${taskId}/checkpoint/reject`,
+      reason ? { reason } : {},
+    );
+    if (res.status !== 200) {
+      throw new Error(res.data?.error || 'Reject checkpoint failed');
+    }
+    return res.data;
+  }
+
   async addTask(sessionId: string, task: Record<string, unknown>): Promise<{ ok: boolean }> {
     const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks`, task);
     if (res.status !== 200) {

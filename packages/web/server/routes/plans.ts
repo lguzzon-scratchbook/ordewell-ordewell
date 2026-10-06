@@ -16,6 +16,8 @@ function editFailure(c: Context, err: unknown) {
   return c.json({ error: e.message || 'Internal error' }, 500);
 }
 
+const NO_CHECKPOINT = 'The task is not waiting at a checkpoint — it was answered already, withdrawn, or has no runner left to hear it.';
+
 /**
  * A refused conversation edit is either the request being wrong (400) or
  * arriving mid-turn (409) — the same call succeeds once the reply lands, and a
@@ -186,6 +188,35 @@ export function plansRoute(pool: OrchestratorPool) {
   router.post('/:sessionId/tasks/:taskId/interrupt', async (c) => {
     try {
       await pool.session(c.req.param('sessionId')).interruptTask(c.req.param('taskId'));
+      return c.json({ ok: true });
+    } catch (err) {
+      return editFailure(c, err);
+    }
+  });
+
+  // Answer the checkpoint a task waits at: approve lets it go on, reject sends
+  // it the reason. Nothing waiting — settled elsewhere, withdrawn, or no runner
+  // left to hear it — is a 409, so a surface says so instead of claiming success.
+  router.post('/:sessionId/tasks/:taskId/checkpoint/approve', (c) => {
+    try {
+      const session = pool.session(c.req.param('sessionId'));
+      const taskId = c.req.param('taskId');
+      if (!session.awaitsCheckpoint(taskId)) return c.json({ error: NO_CHECKPOINT }, 409);
+      session.approveCheckpoint(taskId);
+      return c.json({ ok: true });
+    } catch (err) {
+      return editFailure(c, err);
+    }
+  });
+
+  router.post('/:sessionId/tasks/:taskId/checkpoint/reject', async (c) => {
+    try {
+      const body: unknown = await c.req.json().catch(() => ({}));
+      const reason = typeof body === 'object' && body !== null && 'reason' in body && typeof body.reason === 'string' ? body.reason.trim() : '';
+      const session = pool.session(c.req.param('sessionId'));
+      const taskId = c.req.param('taskId');
+      if (!session.awaitsCheckpoint(taskId)) return c.json({ error: NO_CHECKPOINT }, 409);
+      session.rejectCheckpoint(taskId, reason || undefined);
       return c.json({ ok: true });
     } catch (err) {
       return editFailure(c, err);

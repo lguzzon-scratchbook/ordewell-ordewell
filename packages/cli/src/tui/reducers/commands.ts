@@ -8,7 +8,7 @@ import { modelsForRunner } from '../taskAssignment';
 import { say } from '../transcript';
 import { DEFAULT_EFFORT, picker, pickerItemsFor, plannerEffortItems, plannerItems, providerErrorHint } from './pickers';
 import { taskActionEffect } from './planPane';
-import { continueTaskStep, openTaskTerminalOrView } from './taskView';
+import { answerCheckpoint, continueTaskStep, openTaskTerminalOrView } from './taskView';
 import {
   addTask, confirmForceStartPastGate, openTaskDepsPicker, taskCommand, taskOpsCommand, taskEffortCommand, taskModeCommand, taskModelCommand, taskRunnerCommand,
 } from './taskEdits';
@@ -114,6 +114,14 @@ export function runCommand(state: TuiState, { name, args }: ParsedCommand): Step
         if (!text) return fail(state, 'Usage: /continue <id> <message>');
         // The daemon owns the rule and says why it refuses, so nothing is pre-judged here.
         return continueTaskStep(state, sessionId, taskId, text);
+      });
+    case 'checkpoint':
+      return taskCommand(state, args[0], (sessionId, taskId) => {
+        const answer = args[1]?.toLowerCase();
+        const reason = args.slice(2).join(' ').trim();
+        if (answer !== 'approve' && answer !== 'reject') return fail(state, 'Usage: /checkpoint <id> approve|reject [reason]');
+        if (answer === 'approve' && reason) return fail(state, 'Approving takes no note — reject with a reason to tell the task something.');
+        return answerCheckpoint(state, sessionId, taskId, answer, reason);
       });
     case 'task-runner':
       return taskRunnerCommand(state, args);

@@ -13,6 +13,7 @@ export interface TaskStatusUpdate {
   isolation?: TaskIsolationView;
   transport?: TaskTransportView;
   awaitingReason?: AwaitingReason;
+  checkpoint?: string;
   continuable?: boolean;
   awaitingApproval?: number;
   mergeGate?: string[];
@@ -89,6 +90,8 @@ export type Effect =
   | { type: 'respondApproval'; sessionId: string; approvalId: string; granted: boolean }
   /** A task runner's tool request, answered from its task view (ADR-0018, A1). */
   | { type: 'answerTaskApproval'; sessionId: string; approvalId: string; answer: ApprovalDecision }
+  /** The checkpoint a task waits at, answered; only a rejection carries a reason. */
+  | { type: 'answerTaskCheckpoint'; sessionId: string; taskId: string; answer: 'approve' | 'reject'; reason?: string }
   /** Startup refreshes silently; only a typed `/refresh` sets `announce`. */
   | { type: 'refresh'; announce?: boolean }
   | { type: 'exit' };
@@ -111,6 +114,8 @@ export type Action =
   /** A task whose terminal does not exist but whose saved log does: show the log instead. */
   | { type: 'taskViewRequested'; taskId: string; sessionId: string }
   | { type: 'taskStarted'; taskId: string; title: string; runner?: string; sessionId?: string }
+  /** A task asked a checkpoint question; the chat pane says so, and where to answer. */
+  | { type: 'taskCheckpoint'; taskId: string; title: string; summary: string; sessionId?: string }
   | { type: 'taskStatus'; taskId: string; status: string; sessionId?: string }
   | { type: 'tasksStatus'; updates: Record<string, TaskStatusUpdate>; gate?: GateView | null; sessionId?: string }
   | { type: 'isolationBlocked'; message: string; repos?: string[]; sessionId?: string }
