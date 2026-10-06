@@ -351,6 +351,46 @@ OpenCode, or a plugin) that runs *one task* in its own session. Identity and
 invocation flow through the `RunnerRegistry` + manifest engine.
 *Avoid:* "backend", "provider" (provider means the LLM vendor, below).
 
+**Runner connector** (`RunnerConnector`, in the `CONNECTORS` registry) — what
+Ordewell holds for a runner it drives over the runner's own protocol: the
+adapter that serves it as a harness planner (ADR-0009) and as a structured
+task's runner (ADR-0018), and its *Ordewell tool binding*. The registry is
+keyed by runner id, and being in it is what makes a runner structured-capable;
+`connectorFor` answers undefined for a plugin runner. Adding a runner to it is
+the one place a runner's planner, task connector and Ordewell tools are
+declared, so none of the three can drift apart.
+*Avoid:* conflating it with `RunnerRegistry`, which holds *manifests* (identity
+and invocation, and exists for every runner, plugin included); "adapter table".
+
+**Ordewell tool binding** (`OrdewellToolBinding`) — how one connector hands its
+runner the Ordewell MCP server (ADR-0022). It covers the runner's names for the
+server's tools (`toolName`/`toolNames`), which of the runner's permission
+requests are for them and so are never refused or left waiting
+(`isOrdewellAsk`), what the runner's own status word for the server means
+(`attachState`), and the runner-specific injection that writes the server into
+its launch or configuration. A connector without one is never given the server:
+its tasks complete by marker and its planner submits by envelope.
+*Avoid:* "MCP adapter", "tool prefix" (a prefix is how two of the runners happen
+to name a tool, not the concept).
+
+**Attach state** (`AttachState`: `connected | pending | failed`) — a runner's
+report on the Ordewell server's connection, in one vocabulary for every runner.
+`pending` is the only state worth waiting through; `awaitAttach` polls until the
+runner says `connected` or `failed` or the deadline passes, and a runner that
+never attaches falls back to the marker.
+*Avoid:* "healthy", "ready" (this is a report by the runner, not a probe of ours).
+
+**OpenCode server API** (`openCodeTransport`) — the HTTP protocol work OpenCode's
+two server APIs share: 1.x (`/event`, `OpenCodeAdapter`) and 2.x (`/api/event`,
+`OpenCodeV2`). The event names and shapes differ, so each version reads its own
+frames; how a turn is streamed, how a permission request is answered, how a
+child session is tied to the call that spawned it (held until named, then
+replayed tagged with that subagent) and how a turn is settled are one
+implementation, so a behaviour fixed for one version is fixed for both.
+*Avoid:* "transport" alone for this — **Transport** above is terminal vs
+structured, and OpenCode's HTTP protocol is only one way a runner is driven
+structured.
+
 **Transport** (`runnerTransport: terminal | structured`) — how Ordewell drives
 a task's runner (ADR-0018). *Terminal*: a TUI in tmux, or a headless one-shot
 process, read through its screen and written to with keystrokes (ADR-0007).
@@ -477,8 +517,9 @@ everything that has to die with the run: the attempt number, the phase
 (`starting` while the async spawn is in flight, `running` once the runner is
 up, `integrating` while *Landing* settles its verdict), the live
 `ITerminalSession`, and the runner, working directory and start
-time the transcript reader needs at verdict time — plus, in an isolated run,
-whether that directory is its worktree and the landing in flight. The orchestrator keeps one
+time the transcript reader needs at verdict time — plus its *attempt kind* and,
+in an isolated run, whether that directory is its worktree and the landing in
+flight. The orchestrator keeps one
 `Map<taskId, TaskAttempt>`, and every way a run ends — verdict, cancel, release,
 mark complete, retry, a failed spawn, stop, plan load — goes through the one
 `endAttempt`, which also clears the verifier state an interrupted run leaves
@@ -490,9 +531,11 @@ complete. A verdict obeys the same identity rule: the attempt stays live while
 its summary is read, and the verdict lands only if that attempt is still the
 task's current one, so a cancel, retry, mark complete, stop or plan load in that
 window is never overwritten by a stale verdict.
-The working directory is decided in one place (`IsolationRunController.attemptCwd`): the
-workspace root, or in an isolated run the worktree `WorktreeIsolation.prepare`
-made for the attempt. A passed verdict keeps the attempt live through its merge,
+The working directory is decided in one place (`attemptKind.attemptCwd`): the
+workspace root for an attempt that acts from the checkout, else what the
+`IsolationRunController` gives it — the workspace root when the run does not
+isolate, or in an isolated run the worktree `WorktreeIsolation.prepare` made for
+the attempt. A passed verdict keeps the attempt live through its merge,
 so the task completes — and frees its dependents — only once its work is on the
 integration branch. Holds, retry counts and spawn counts are
 deliberately *not* on the record — they describe the task across attempts and
@@ -503,6 +546,23 @@ registry keyed by task let the old attempt's exit unregister the new one.
 *Avoid:* "session" for this concept — the session is the runner's process, one
 field of the attempt. Do not add another per-task map to the orchestrator for
 state that ends with the run; put it on the attempt.
+
+**Attempt kind** (`AttemptKind`, `attemptKind.ts`) — what one attempt of a task
+is: `change`, `ops`, `repair` (a *conflict repair*, ADR-0015) or `continuation`
+(a *Continue*, ADR-0018, which carries whether its task is ops). Everything that
+differs between attempts is read from it, never from loose flags: where the
+attempt runs (`attemptCwd`), the transport (`attemptTransport` — a continue is
+always structured), the prompt (`attemptPrompt`), whether the run decides to
+isolate when it starts (`decidesIsolation` — not for work in the checkout),
+whether the workspace's tracked files are compared across it (`checksTree` —
+ops work in the checkout, which can be caught writing but not stopped), and
+whether it keeps *Merge all* out (`mergeExcludes`, the one rule both the
+attempt's start and the merge's start read). A repair outranks the ops mark, as
+its work already sits in a kept worktree. A task's own `ops` mark has one
+reading, `opsFlag` (only a literal `true`, only on an AI task), and a merge or
+split derives its result's mark with `inheritedOps`.
+*Avoid:* "mode" (permission mode, ADR-0001), "type" (`ai | user` on a task),
+"phase" (an attempt's `starting | running | integrating` progress).
 
 **Isolated execution** — running each *change task* in its own *worktree*
 instead of the shared workspace root, then integrating the results
@@ -677,7 +737,8 @@ that each integration branch goes only where HEAD contains it, and the plan
 forgets it; any other answer deletes nothing. During a run, Merge all is what
 opens a *merge gate*: it merges what has landed so far and the run goes on, its
 branches kept for the tasks still to land (ADR-0020). It never runs while an
-*ops task* does, and takes turns with landings.
+*ops task* does (`mergeExcludes`, read by both sides), and takes turns with
+landings.
 *Avoid:* per-repo merge — there is none, by design (ADR-0014).
 
 **Change task** — a task whose result is a change to repository files: it runs
@@ -689,7 +750,7 @@ is marked `ops` (ADR-0020).
 cloud CLI, a deployment, a pipeline) or on the git refs and history of the
 user's branch (push, tag, reword). It runs at the workspace root, never in a
 worktree, in the session's mode, and in parallel as its dependencies allow;
-never while a Merge all runs. If it leaves a new tracked change in any repo of
+never while a Merge all runs (the flag is read through `opsFlag`). If it leaves a new tracked change in any repo of
 the group, it waits on the user (`awaitingReason: 'files-changed'`) rather than
 completing. A retry is told what the attempt before it did, since its effects
 are never rolled back. The planner sets the mark and splits a mixed request into
@@ -742,8 +803,9 @@ controller*.
 **Isolation run controller** (`IsolationRunController`) — the module between
 TaskOrchestrator and `WorktreeIsolation` that owns an *isolation run*'s
 lifecycle: deciding at a run's start whether it isolates, shares the workspace
-root or is a *blocked run*; continuing a plan's run or minting a new one; each
-attempt's working directory; a task's integration and a repair's evidence
+root or is a *blocked run*; continuing a plan's run or minting a new one; the
+working directory of each attempt that is not already in the checkout (the
+*attempt kind* decides which); a task's integration and a repair's evidence
 check, with the record reported changed before the first merge; releasing a
 worktree once any landing in flight settles; closing the run with its
 *isolation handoff*; and Merge all, clean-up and discard afterwards. It holds the run record, the open run's mode, the
@@ -751,7 +813,10 @@ parked start of a blocked run and the resolver links, and reports through a
 listener (changed, blocked, handoff, notice, worktrees about to go) — it never
 emits orchestrator events or schedules work itself. A blocked start is handed
 back to the caller to replay. The scheduler reads isolation state only through
-it (`openRecord`, `isolating`, `current`). Git stays in `WorktreeIsolation`.
+it (`openRecord`, `isolating`, `current`). Session and the event relay reach its
+Merge all, review, clean-up and discard directly — there is no pass-through on
+the orchestrator — and its `requireRun` is the one guard for "no isolated run
+to act on", throwing `PlanEditError`. Git stays in `WorktreeIsolation`.
 *Avoid:* "isolation run" for the controller — that is the record it holds;
 "WorktreeIsolation" for it — that is the git layer beneath it.
 
@@ -808,6 +873,19 @@ drawn from the set (always present, even for single-runner plans). Size is the
 semantics, not a sentinel: size 1 means a single-runner plan, size >1 means a
 multi-runner plan. Empty is invalid and rejected before planning.
 
+**PlanEditor** — the module behind Session's direct plan edits: `updateTask`,
+`setTaskDependencies`, `setTaskRunner`, `addTask`, `removeTask`, the
+conflict-resolver task, and the requests that ask the planner to merge or split
+tasks. `Session`'s methods of those names are one-line delegations; the rules (the lock on settled tasks, the runner retarget,
+the derived assignment of a hand-added task, the ops mark) live here, reaching
+the plan only through the session's `mutate` ritual, so every edit saves and
+announces once. A refused edit throws `PlanEditError`, which a surface reads as
+"you asked for something invalid" rather than "something broke"; the same error
+type is what `IsolationRunController.requireRun` throws for an isolation action
+on a plan with no run.
+*Avoid:* "plan manager", "task editor" (the *TaskEditValidator* below only
+checks); "Session" for the owner of these rules — Session hosts them.
+
 **Runner retarget (`TaskRetarget` + `Session.setTaskRunner`)** — a task's runner
 is the one assignment that cannot be edited as a single field. Its model,
 thinking effort and mode are all scoped to the runner, so `claude-sonnet-4-5` on
@@ -818,8 +896,8 @@ discovery already sorts models by the manifest's `preferredPatterns`, `modes[0]`
 is the manifest's own first choice, and the effort goes through
 `clampThinkingEffort`. An empty catalog means discovery failed, not that the
 runner offers nothing, so that field is left untouched and the runner validates
-last (as in `coerceAssignments`). `Session.setTaskRunner` is the one owner:
-async because it needs discovery, guarded before that call because listing
+last (as in `coerceAssignments`). `Session.setTaskRunner` is the one entry
+point, and the *PlanEditor* behind it the one owner: async because it needs discovery, guarded before that call because listing
 models spawns the runner's own CLI, and it admits the runner into `plan.runners`
 — without which the next planner turn's `coerceAssignments` would treat it as
 disallowed and silently snap the task back. Both surfaces route through it
@@ -851,7 +929,7 @@ returning null so the surface can say *why* (`PUT` maps it to 400, VS Code to a
 warning, and both then re-show the accepted list — a refused edit must not leave
 an optimistic checkbox on screen).
 
-**Hand-added task (`Session.addTask`)** — async, and for the same reason
+**Hand-added task (`Session.addTask`, done by *PlanEditor*)** — async, and for the same reason
 `setTaskRunner` is: a task with no model or mode is not a lighter task but an
 unspawnable one, so an unset assignment is derived from the runner's catalog
 through the same `runnerAssignment` the runner retarget uses. The runner defaults
@@ -906,8 +984,8 @@ finished task.
 
 **TaskEditValidator** (`validateTaskEdit(actor, tasks, taskId, changes,
 catalog?)`) — the one checker behind both edit paths described above:
-`applyTaskOps` calls it with `actor: 'planner'`, `Session.updateTask` calls it
-with `actor: 'direct'`. Only the lock rule (no touching `in_progress` or
+`applyTaskOps` calls it with `actor: 'planner'`, `PlanEditor.updateTask` (behind
+`Session.updateTask`) calls it with `actor: 'direct'`. Only the lock rule (no touching `in_progress` or
 `completed`) reads the actor; every other rule — a hand-set dependency list
 (`canSetDependencies`), coherence on an AI↔MAN `type` flip, and whether an
 `assignedModel`/`taskMode` is something the target runner actually offers —
@@ -1360,6 +1438,21 @@ saved-session store in `.ordewell/sessions/`, not through a shared transport
 is pure: `reduce(state, action)` returns `{ state, effects }` and `render(state)`
 returns exactly one string per terminal row, so commands and layout are asserted
 without a daemon or a tty. Only `terminal.ts` touches the real terminal.
+
+**Task row view** (`taskRowView`, `core/src/taskRow/`) — what a row shows about
+one task, decided once in core and drawn by both the TUI and VS Code: its
+*status kind* (`TaskStatusKind`, including `quiet` — `in_progress` with a silent
+runner, which VS Code words "Stalled" and the TUI marks "~"), the *row actions*
+it offers (`taskRowActions`, differing by *placement*: a task or a subtask), its
+ops and isolation state, and its merge gate. Task references are shared too
+(`#2.1`, `#2 Deploy`). A **mark request** (`markRequestFor`) is the one reading
+of Mark complete and Skip: skip has no request of its own and marks the task
+complete. A surface chooses words, glyphs and casing and nothing else; a row
+state a surface needs and the view lacks is added to the view, not branched on
+in the surface.
+*Avoid:* "idle" (a silence guess, and the name of a state that is not this
+one — see *Waiting for input*), "task card" (VS Code's component) and "task
+line" (the TUI's) for the view itself — they are drawings of it.
 
 **Command surface** — the set of things a user can ask for by name. It is one set
 with two spellings: a TUI slash command (`SLASH_COMMANDS` in `tui/slash.ts`) and
