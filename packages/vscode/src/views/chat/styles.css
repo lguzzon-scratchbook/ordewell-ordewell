@@ -5255,6 +5255,12 @@ body {
   color: var(--red);
 }
 
+.task-log-queued-state {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
 .task-log-composer {
   display: flex;
   gap: 8px;

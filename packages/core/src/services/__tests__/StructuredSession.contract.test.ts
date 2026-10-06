@@ -662,3 +662,50 @@ describe('the Ordewell task tools (ADR-0022)', () => {
     session.kill();
   });
 });
+
+describe('a message sent mid-turn (ADR-0023)', () => {
+  /** {@link HandAdapter} that can take a message into the running turn, and accepts every one. */
+  class SteeringHandAdapter extends HandAdapter {
+    readonly steered: Array<{ id: string; text: string }> = [];
+    async steer(id: string, text: string): Promise<boolean> {
+      this.steered.push({ id, text });
+      return true;
+    }
+  }
+
+  it('is handed to a runner that can take one, leaving the queue only once the runner says the model has it', async () => {
+    const adapters: SteeringHandAdapter[] = [];
+    const runner = new StructuredRunner({ createAdapter: () => { const a = new SteeringHandAdapter(); adapters.push(a); return a; }, interruptGraceMs: 20 });
+    const turn = observe(await runner.spawn(options()));
+    await until(() => adapters[0]?.sent.length === 1);
+
+    const id = turn.session.sendMessage('and add tests');
+    await until(() => turn.events.some((e) => e.type === 'message_handed_over'));
+    expect(adapters[0].steered).toEqual([{ id, text: 'and add tests' }]);
+    expect(turn.session.queued()).toEqual([{ id, text: 'and add tests', handedOver: true }]);
+
+    adapters[0].emit({ type: 'message_delivered', id });
+    expect(turn.session.queued()).toEqual([]);
+    adapters[0].endTurn();
+    await until(() => turn.turnEnds.length === 1);
+
+    expect(adapters[0].sent).toEqual(['Do the task']);
+    expect(turn.events).toContainEqual({ type: 'message_delivered', messageId: id, text: 'and add tests' });
+    expect(turn.session.turnState()).toBe('idle');
+    turn.session.kill();
+  });
+
+  it('waits for the turn to end on a runner that cannot take one', async () => {
+    const { runner, adapters } = byHand();
+    const turn = observe(await runner.spawn(options()));
+    await until(() => adapters[0].sent.length === 1);
+
+    const id = turn.session.sendMessage('and add tests');
+    expect(turn.session.queued()).toEqual([{ id, text: 'and add tests' }]);
+    adapters[0].endTurn();
+    await until(() => adapters[0].sent.length === 2);
+
+    expect(turn.events.some((e) => e.type === 'message_handed_over' || e.type === 'message_delivered')).toBe(false);
+    turn.session.kill();
+  });
+});

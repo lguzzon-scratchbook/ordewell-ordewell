@@ -188,6 +188,7 @@ export function handleTaskViewKey(state: TuiState, key: Key): Step | null {
   if (key.name === 'ctrl-r') {
     const queued = tv.view.queued[tv.queuedIndex];
     if (!queued) return step(say(state, 'system', 'No queued message to remove.'));
+    if (queued.handedOver) return step(say(state, 'system', 'The runner already has that message; it can no longer be taken back.'));
     return step(state, [{ type: 'removeTaskMessage', sessionId: state.sessionId, taskId: tv.taskId, messageId: queued.id }]);
   }
 

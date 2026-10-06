@@ -528,3 +528,50 @@ it('shows an undelivered message in the task log and removes it from the queue',
   expect(state.taskView?.view.queued).toEqual([]);
   expect(plain(state)).toContain('use Postgres · not delivered');
 });
+
+describe('a message the runner reads mid-turn (ADR-0023)', () => {
+  const handedOver = () => opened({
+    taskView: loaded({
+      view: replayTaskLog([
+        { type: 'turn_start', message: 'Do the task' },
+        { type: 'tool_call', id: 'c1', name: 'Bash', args: '{"command":"sleep 20"}' },
+        { type: 'message_queued', messageId: 'm1', text: 'use Postgres' },
+        { type: 'message_queued', messageId: 'm2', text: 'also tests' },
+        { type: 'message_handed_over', messageId: 'm1' },
+      ]),
+      queuedIndex: 0,
+    }),
+  });
+
+  it('shows a handed-over message as handed over, and ctrl-r leaves it with the runner', () => {
+    const out = plain(handedOver());
+    expect(out).toContain('use Postgres · handed over');
+    expect(out).not.toContain('use Postgres · queued');
+    expect(out).toContain('also tests · queued');
+
+    const { state, effects } = reduce(handedOver(), { type: 'key', key: key('ctrl-r') });
+    expect(effects).toEqual([]);
+    expect(messagesOf(state).at(-1)).toMatchObject({ role: 'system', text: 'The runner already has that message; it can no longer be taken back.' });
+  });
+
+  it('draws the message in the transcript after the step it followed, and takes it off the queue', () => {
+    const state = reduce(handedOver(), {
+      type: 'taskLog', taskId: 't1', attempt: 1, sessionId: 's1',
+      events: [
+        { type: 'tool_result', id: 'c1', output: '', success: true },
+        { type: 'message_delivered', messageId: 'm1', text: 'use Postgres' },
+        { type: 'text', text: 'Switching to Postgres.' },
+      ],
+    }).state;
+
+    expect(state.taskView?.view.queued.map((m) => m.id)).toEqual(['m2']);
+    const out = plain(state);
+    expect(out).not.toContain('handed over');
+    const lines = out.split('\n');
+    const at = (text: string) => lines.findIndex((l) => l.includes(text));
+    expect(at('sleep 20')).toBeGreaterThanOrEqual(0);
+    expect(at('use Postgres')).toBeGreaterThan(at('sleep 20'));
+    expect(at('Switching to Postgres.')).toBeGreaterThan(at('use Postgres'));
+    expect(state.taskView?.view.working).toBe(true);
+  });
+});

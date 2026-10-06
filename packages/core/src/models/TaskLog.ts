@@ -28,9 +28,17 @@ export type TaskLogEvent =
   | { type: 'subagent_started'; subagentId: string; brief: string; model?: string }
   | { type: 'subagent_finished'; subagentId: string; outcome: SubagentOutcome; digest: string }
   | { type: 'usage'; record: UsageRecord }
+  /** Waiting in Ordewell's queue — again, for a message the runner was handed and let go of (ADR-0023, D4). */
   | { type: 'message_queued'; messageId: string; text: string }
   | { type: 'message_removed'; messageId: string }
   | { type: 'message_undelivered'; messageId: string; text: string }
+  /** The runner accepted a queued message into its running turn; it can no longer be taken back. */
+  | { type: 'message_handed_over'; messageId: string }
+  /**
+   * The model read a message inside its running turn (ADR-0023, Q2), logged
+   * where it read it. A message that opened a turn is that turn's `turn_start`.
+   */
+  | { type: 'message_delivered'; messageId: string; text: string }
   /** The agent's own words for a failed turn. */
   | { type: 'error'; message: string }
   /**
@@ -111,6 +119,10 @@ export function toTaskLogEvent(event: StructuredEvent): TaskLogEvent | null {
       return { type: 'message_undelivered', messageId: event.messageId, text: event.text };
     case 'message_removed':
       return { type: 'message_removed', messageId: event.messageId };
+    case 'message_handed_over':
+      return { type: 'message_handed_over', messageId: event.messageId };
+    case 'message_delivered':
+      return { type: 'message_delivered', messageId: event.messageId, text: event.text };
     case 'error':
       return { type: 'error', message: event.message };
     case 'permission_request':

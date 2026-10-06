@@ -862,3 +862,203 @@ describe('CodexAdapter with the Ordewell MCP server (ADR-0022)', () => {
     expect(takesOrdewellTools('codex')).toBe(true);
   });
 });
+
+const userMessage = (clientId: string | null, method = 'item/started') => line({
+  method, params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { id: `item-${clientId}`, type: 'userMessage', clientId, content: [{ type: 'text', text: 'steered' }] } },
+});
+
+describe('CodexAdapter task steer (ADR-0023)', () => {
+  it('steers into the running turn by both its ids, under a client message id its userMessage item later names', async () => {
+    const { adapter, proc } = await startedTask();
+    const events: AgentEvent[] = [];
+    void adapter.send('go', (e) => events.push(e));
+    proc.emitStdout(turnStarted('turn-a'));
+
+    const accepted = adapter.steer('msg-1', 'use Postgres');
+    const [steer] = sentNamed(proc.written, 'turn/steer');
+    expect(steer.params).toEqual({
+      threadId: 'thr-task-1', expectedTurnId: 'turn-a', input: [{ type: 'text', text: 'use Postgres' }],
+      clientUserMessageId: expect.any(String),
+    });
+    proc.emitStdout(line({ id: steer.id, result: { turnId: 'turn-a' } }));
+    expect(await accepted).toBe(true);
+    expect(events).toEqual([]);
+
+    const clientId = String(steer.params?.clientUserMessageId);
+    proc.emitStdout(userMessage(clientId) + userMessage(clientId, 'item/completed') + turnCompleted('turn-a'));
+    await tick();
+    expect(events).toEqual([{ type: 'message_delivered', id: 'msg-1' }, { type: 'turn_end' }]);
+    adapter.dispose();
+  });
+
+  it('holds a steer until Codex names the turn, as it does an interrupt', async () => {
+    const { adapter, proc } = await startedTask();
+    void adapter.send('go', () => {});
+    const accepted = adapter.steer('msg-1', 'use Postgres');
+    await tick();
+    expect(sentNamed(proc.written, 'turn/steer')).toHaveLength(0);
+
+    const [turnStart] = sentNamed(proc.written, 'turn/start');
+    proc.emitStdout(line({ id: turnStart.id, result: { turn: { id: 'turn-a', status: 'inProgress', items: [] } } }));
+    await until(() => sentNamed(proc.written, 'turn/steer').length > 0);
+    const [steer] = sentNamed(proc.written, 'turn/steer');
+    expect(steer.params?.expectedTurnId).toBe('turn-a');
+    proc.emitStdout(line({ id: steer.id, result: { turnId: 'turn-a' } }));
+    expect(await accepted).toBe(true);
+    adapter.dispose();
+  });
+
+  it('answers false when Codex refuses the steer, so the message waits for the turn to end', async () => {
+    const { adapter, proc } = await startedTask();
+    void adapter.send('go', () => {});
+    proc.emitStdout(turnStarted('turn-a'));
+
+    const refused = adapter.steer('msg-1', 'use Postgres');
+    const [steer] = sentNamed(proc.written, 'turn/steer');
+    proc.emitStdout(line({ id: steer.id, error: { code: -32600, message: 'no active turn to steer' } }));
+    expect(await refused).toBe(false);
+    adapter.dispose();
+  });
+
+  it('has nothing to steer into between turns', async () => {
+    const { adapter, proc } = await startedTask();
+    expect(await adapter.steer('msg-1', 'use Postgres')).toBe(false);
+    expect(sentNamed(proc.written, 'turn/steer')).toHaveLength(0);
+    adapter.dispose();
+  });
+
+  it.each([
+    ['completed', [turnCompleted('turn-a')], { type: 'turn_end' }],
+    ['interrupted', [turnCompleted('turn-a', 'interrupted')], { type: 'turn_end', interrupted: true }],
+    ['by the thread going idle', [threadIdle()], { type: 'turn_end' }],
+  ] as const)('drops a steer the turn ended %s without consuming, ahead of the turn\'s end', async (_label, endings, ended) => {
+    const { adapter, proc } = await startedTask();
+    const events: AgentEvent[] = [];
+    void adapter.send('go', (e) => events.push(e));
+    proc.emitStdout(turnStarted('turn-a'));
+    const accepted = adapter.steer('msg-1', 'use Postgres');
+    const [steer] = sentNamed(proc.written, 'turn/steer');
+    proc.emitStdout(line({ id: steer.id, result: { turnId: 'turn-a' } }));
+    expect(await accepted).toBe(true);
+
+    for (const ending of endings) proc.emitStdout(ending);
+    await tick();
+    expect(events).toEqual([{ type: 'message_dropped', id: 'msg-1' }, ended]);
+    adapter.dispose();
+  });
+
+  it('refuses a steer still unanswered when the turn ends, and ignores the answer that lands after', async () => {
+    const { adapter, proc } = await startedTask();
+    const events: AgentEvent[] = [];
+    void adapter.send('go', (e) => events.push(e));
+    proc.emitStdout(turnStarted('turn-a'));
+    const refused = adapter.steer('msg-1', 'use Postgres');
+    const [steer] = sentNamed(proc.written, 'turn/steer');
+
+    proc.emitStdout(turnCompleted('turn-a') + line({ id: steer.id, result: { turnId: 'turn-a' } }));
+    expect(await refused).toBe(false);
+    expect(events).toEqual([{ type: 'turn_end' }]);
+    adapter.dispose();
+  });
+
+  it('refuses a steer held for a turn Codex refused to start', async () => {
+    const { adapter, proc } = await startedTask();
+    void adapter.send('go', () => {});
+    const refused = adapter.steer('msg-1', 'use Postgres');
+    const [turnStart] = sentNamed(proc.written, 'turn/start');
+    proc.emitStdout(line({ id: turnStart.id, error: { message: 'thread busy' } }));
+    expect(await refused).toBe(false);
+    expect(sentNamed(proc.written, 'turn/steer')).toHaveLength(0);
+    adapter.dispose();
+  });
+
+  it('refuses a steer in flight when the process ends', async () => {
+    const { adapter, proc } = await startedTask();
+    void adapter.send('go', () => {});
+    proc.emitStdout(turnStarted('turn-a'));
+    const refused = adapter.steer('msg-1', 'use Postgres');
+    proc.exit(1);
+    expect(await refused).toBe(false);
+  });
+
+  it('delivers a message whose userMessage item lands before its steer is answered, once', async () => {
+    const { adapter, proc } = await startedTask();
+    const events: AgentEvent[] = [];
+    void adapter.send('go', (e) => events.push(e));
+    proc.emitStdout(turnStarted('turn-a'));
+    const accepted = adapter.steer('msg-1', 'use Postgres');
+    const [steer] = sentNamed(proc.written, 'turn/steer');
+
+    proc.emitStdout(userMessage(String(steer.params?.clientUserMessageId)) + line({ id: steer.id, result: { turnId: 'turn-a' } }) + turnCompleted('turn-a'));
+    expect(await accepted).toBe(true);
+    await tick();
+    expect(events).toEqual([{ type: 'message_delivered', id: 'msg-1' }, { type: 'turn_end' }]);
+    adapter.dispose();
+  });
+
+  it('takes the turn\'s own input and another client\'s messages for nothing it sent', async () => {
+    const { adapter, proc } = await startedTask();
+    const events: AgentEvent[] = [];
+    void adapter.send('go', (e) => events.push(e));
+    proc.emitStdout(turnStarted('turn-a') + userMessage(null) + userMessage('someone-else'));
+    await tick();
+    expect(events).toEqual([]);
+    adapter.dispose();
+  });
+});
+
+describe('a Codex task taking a message mid-turn on the structured transport', () => {
+  it('hands the message to the running turn and logs it where Codex delivered it, in one turn', async () => {
+    const { spawned, processDeps } = deps(handshake());
+    const runner = new StructuredRunner({ process: processDeps });
+    const session = await runner.spawn({ taskId: 'task-0012-steer', runner: 'codex', prompt: 'Fix sum', modelId: 'gpt-5.5', mode: 'fullAccess', cwd: '/repo', registry: new RunnerRegistry() });
+    if (!isStructuredSession(session)) throw new Error('not a structured session');
+    const events: StructuredEvent[] = [];
+    session.onEvent((e) => events.push(e));
+    await until(() => sentNamed(spawned.processes[0].written, 'turn/start').length > 0);
+    const proc = spawned.processes[0];
+    proc.emitStdout(turnStarted('turn-a') + line({ method: 'item/started', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { id: 'cmd-1', type: 'commandExecution', command: 'sleep 20', cwd: '/repo' } } }));
+
+    const id = session.sendMessage('use Postgres');
+    await until(() => sentNamed(proc.written, 'turn/steer').length > 0);
+    const [steer] = sentNamed(proc.written, 'turn/steer');
+    proc.emitStdout(line({ id: steer.id, result: { turnId: 'turn-a' } }));
+    await until(() => events.some((e) => e.type === 'message_handed_over'));
+    expect(session.queued()).toEqual([{ id, text: 'use Postgres', handedOver: true }]);
+
+    proc.emitStdout(
+      line({ method: 'item/completed', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { id: 'cmd-1', type: 'commandExecution', command: 'sleep 20', cwd: '/repo', aggregatedOutput: '', exitCode: 0 } } })
+      + userMessage(String(steer.params?.clientUserMessageId))
+      + line({ method: 'item/completed', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { id: 'msg-a', type: 'agentMessage', text: 'Using Postgres.' } } })
+      + turnCompleted('turn-a'),
+    );
+    await new Promise<void>((resolve) => session.onTurnEnd(() => resolve()));
+
+    expect(events.map((e) => e.type)).toEqual([
+      'turn_start', 'tool_call', 'message_queued', 'message_handed_over', 'tool_result', 'message_delivered', 'assistant_text', 'turn_end',
+    ]);
+    expect(session.queued()).toEqual([]);
+    expect(sentNamed(proc.written, 'turn/start')).toHaveLength(1);
+    expect(session.turnState()).toBe('idle');
+    session.kill();
+  });
+
+  it('sends a message Codex dropped unread as the next turn', async () => {
+    const { spawned, processDeps } = deps(handshake());
+    const runner = new StructuredRunner({ process: processDeps });
+    const session = await runner.spawn({ taskId: 'task-0012-steer', runner: 'codex', prompt: 'Fix sum', modelId: 'gpt-5.5', mode: 'fullAccess', cwd: '/repo', registry: new RunnerRegistry() });
+    if (!isStructuredSession(session)) throw new Error('not a structured session');
+    await until(() => sentNamed(spawned.processes[0].written, 'turn/start').length > 0);
+    const proc = spawned.processes[0];
+    proc.emitStdout(turnStarted('turn-a'));
+
+    session.sendMessage('use Postgres');
+    await until(() => sentNamed(proc.written, 'turn/steer').length > 0);
+    proc.emitStdout(line({ id: sentNamed(proc.written, 'turn/steer')[0].id, result: { turnId: 'turn-a' } }) + turnCompleted('turn-a'));
+
+    await until(() => sentNamed(proc.written, 'turn/start').length > 1);
+    expect(sentNamed(proc.written, 'turn/start')[1].params?.input).toEqual([{ type: 'text', text: 'use Postgres' }]);
+    expect(session.turnState()).toBe('working');
+    session.kill();
+  });
+});

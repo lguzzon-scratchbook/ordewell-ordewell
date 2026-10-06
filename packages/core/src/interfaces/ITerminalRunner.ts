@@ -46,13 +46,18 @@ export type StructuredTurnEnd = 'completed' | 'interrupted' | 'failed';
  * full-fidelity task log, never for verdicts.
  */
 export type StructuredEvent =
-  | Exclude<AgentEvent, { type: 'turn_end' } | { type: 'permission_cancelled' }>
+  | Exclude<AgentEvent, { type: 'turn_end' | 'permission_cancelled' | 'message_delivered' | 'message_dropped' }>
   /** `text` is the user message the turn answers; `messageId` is set when it had waited in the queue. */
   | { type: 'turn_start'; text: string; messageId?: string }
   | { type: 'turn_end'; reason: StructuredTurnEnd }
+  /** Waiting in Ordewell's queue — again, for a message the runner was handed and let go of (ADR-0023, D4). */
   | { type: 'message_queued'; messageId: string; text: string }
   | { type: 'message_removed'; messageId: string }
   | { type: 'message_undelivered'; messageId: string; text: string }
+  /** The runner accepted the message into its running turn; it can no longer be taken back (ADR-0023, D3). */
+  | { type: 'message_handed_over'; messageId: string }
+  /** The model read the message inside the running turn, at this point of it (ADR-0023, Q2). */
+  | { type: 'message_delivered'; messageId: string; text: string }
   /** An open `permission_request` was answered, by whoever answered it (ADR-0018, A1). */
   | { type: 'permission_decided'; id: string; decision: ApprovalDecision }
   /** An open `permission_request` can no longer be answered: the runner withdrew it, or its process is gone. */
@@ -61,6 +66,8 @@ export type StructuredEvent =
 export interface QueuedTaskMessage {
   id: string;
   text: string;
+  /** The runner has it and owes a delivery, so it cannot be taken back (ADR-0023, Q1). */
+  handedOver?: boolean;
 }
 
 /**
@@ -75,13 +82,14 @@ export interface StructuredSessionCapability {
   onTurnEnd(listener: (reason: StructuredTurnEnd) => void): void;
   onEvent(listener: (event: StructuredEvent) => void): void;
   /**
-   * Queue a user message, delivered when the current turn ends — or at once
-   * when idle. Returns its id, for {@link removeQueued}.
+   * Send a user message: at once when idle; while a turn runs, handed to the
+   * runner for its next step where it can take one, otherwise queued until
+   * the turn ends (ADR-0023). Returns its id, for {@link removeQueued}.
    */
   sendMessage(text: string): string;
-  /** Take a message back before it is delivered. False when it already was. */
+  /** Take a message back before the runner has it. False once it was handed over or delivered. */
   removeQueued(id: string): boolean;
-  /** Messages waiting for the current turn to end, oldest first. */
+  /** Messages not yet delivered, oldest first: queued ones, and ones handed over that the runner owes. */
   queued(): QueuedTaskMessage[];
   /**
    * Stop the running turn, keeping the session: a soft interrupt first, then —

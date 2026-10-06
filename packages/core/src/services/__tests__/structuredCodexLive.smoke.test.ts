@@ -97,23 +97,31 @@ describe.runIf(live)('structured transport, Codex — live smoke', () => {
     } finally { own.stopAll(); }
   }, TIMEOUT_MS);
 
-  it('queues a message sent mid-turn and delivers it when the turn ends', async () => {
+  it('hands a message sent during a command to the running turn, which acts on it before the turn ends (ADR-0023)', async () => {
     const dir = dirFor();
     const own = new StructuredRunner();
     try {
-      const session = await spawnTask(own, dir, 'live-codex-queue', 'Run the shell command `sleep 5`, then reply with only the word done.', 'fullAccess');
+      const session = await spawnTask(own, dir, 'live-codex-steer', 'Run the shell command `sleep 20 && echo step1done`. Then run the shell command `echo step2done`. Then reply with one short sentence saying what you ran.', 'fullAccess');
       const turns = turnEnds(session);
       await new Promise<void>((resolve) => turns.session.onEvent((e) => { if (e.type === 'tool_call') resolve(); }));
+      await new Promise<void>((resolve) => setTimeout(resolve, 4000));
 
-      turns.session.sendMessage('reply with the word PONG');
-      expect(turns.events).toContainEqual(expect.objectContaining({ type: 'message_queued', text: 'reply with the word PONG' }));
-      expect(turns.session.queued()).toHaveLength(1);
-
+      const id = turns.session.sendMessage('Before your next command, run the shell command `touch steered.txt`. Then carry on, and include the word PINEAPPLE in your final reply.');
       await turns.next();
-      if (turns.ends.length < 2) await turns.next();
-      expect(turns.ends).toEqual(['completed', 'completed']);
+
+      const at = (match: (e: StructuredEvent) => boolean) => turns.events.findIndex(match);
+      const delivered = at((e) => e.type === 'message_delivered' && e.messageId === id);
+      const touched = turns.events.findIndex((e, i) => i > delivered && e.type === 'tool_call' && JSON.stringify(e.args).includes('steered.txt'));
+      console.error(`[live] steer: handed over at ${at((e) => e.type === 'message_handed_over')}, delivered at ${delivered}, acted on at ${touched}, turn ended at ${at((e) => e.type === 'turn_end')}`);
+      expect(turns.ends, session.getOutput()).toEqual(['completed']);
+      expect(turns.events.filter((e) => e.type === 'turn_start')).toHaveLength(1);
+      expect(at((e) => e.type === 'message_handed_over' && e.messageId === id)).toBeGreaterThan(-1);
+      expect(delivered, session.getOutput()).toBeGreaterThan(at((e) => e.type === 'message_handed_over'));
+      expect(touched, session.getOutput()).toBeGreaterThan(delivered);
+      expect(touched).toBeLessThan(at((e) => e.type === 'turn_end'));
+      expect(existsSync(join(dir, 'steered.txt'))).toBe(true);
+      expect(session.getOutput()).toContain('PINEAPPLE');
       expect(turns.session.queued()).toEqual([]);
-      expect(session.getOutput()).toContain('PONG');
     } finally { own.stopAll(); }
   }, TIMEOUT_MS);
 

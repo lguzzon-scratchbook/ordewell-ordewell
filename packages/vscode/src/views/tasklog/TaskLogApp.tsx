@@ -159,8 +159,10 @@ export default function TaskLogApp() {
           {status.queued.map((message) => (
             <div key={message.id} className="task-log-queued-item">
               <span className="task-log-queued-text">{message.text}</span>
-              <button type="button" className="task-log-queued-remove" title="Remove this message"
-                onClick={() => vscode.postMessage({ type: 'removeQueuedTaskMessage', id: message.id })}>&#10005;</button>
+              {message.handedOver
+                ? <span className="task-log-queued-state" title="The runner has this message and reads it after its current step">handed over</span>
+                : <button type="button" className="task-log-queued-remove" title="Remove this message"
+                    onClick={() => vscode.postMessage({ type: 'removeQueuedTaskMessage', id: message.id })}>&#10005;</button>}
             </div>
           ))}
         </div>

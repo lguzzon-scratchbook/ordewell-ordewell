@@ -8,10 +8,12 @@ import type { ApprovalDecision, AwaitingReason, DisplayBlock, StructuredTurnEnd,
  * the chat's, which is shaped around the planner conversation.
  */
 
-/** One message waiting behind a structured task's running turn. */
+/** One message a structured task's runner has not read yet. */
 export interface TaskLogQueuedMessage {
   id: string;
   text: string;
+  /** The runner already has it, for its next step, so it cannot be taken back (ADR-0023). */
+  handedOver?: boolean;
 }
 
 /**
@@ -33,7 +35,7 @@ export interface TaskLogStatus {
   working: boolean;
   /** How the last turn ended; absent before the first one does. */
   lastTurnEnd?: StructuredTurnEnd;
-  /** Messages waiting for the running turn to end, oldest first. */
+  /** Messages the runner has not read yet, oldest first. */
   queued: readonly TaskLogQueuedMessage[];
   /** Attempts that have a saved log, oldest first. */
   attempts: readonly number[];

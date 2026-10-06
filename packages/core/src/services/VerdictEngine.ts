@@ -216,11 +216,11 @@ export class VerdictEngine {
       session.onEvent((event) => {
         if (this.generations.get(task.id) !== gen) return;
         if (event.type === 'turn_start') {
-          this.pendingVerdicts.delete(task.id);
-          this.markerTails.set(task.id, '');
-          this.checkpointCarry.set(task.id, '');
+          this.supersede(task.id);
           this.resumeIdle(task.id);
         }
+        // Read mid-turn, a message voids what the runner reported before it just as a new turn does (ADR-0023).
+        else if (event.type === 'message_delivered') this.supersede(task.id);
         else if (event.type === 'permission_request' && !event.decided) this.approvalOpened(task.id, event.id);
         else if (event.type === 'permission_decided' || event.type === 'permission_withdrawn') this.approvalClosed(task.id, event.id, gen);
       });
@@ -247,6 +247,14 @@ export class VerdictEngine {
   signalComplete(taskId: string, generation: number, report: TaskCompleteArgs): void {
     if (this.generations.get(taskId) !== generation) return;
     this.acceptVerdict(taskId, reportedVerdict(report));
+  }
+
+  /** The runner was told something after its evidence so far, so only what it reports from here counts. */
+  private supersede(taskId: string): void {
+    this.pendingVerdicts.delete(taskId);
+    this.markerSeen.delete(taskId);
+    this.markerTails.set(taskId, '');
+    this.checkpointCarry.set(taskId, '');
   }
 
   private acceptVerdict(taskId: string, verdict: Verdict): void {

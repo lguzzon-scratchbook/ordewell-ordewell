@@ -56,7 +56,8 @@ export class BufferedTaskOutputSource implements TaskOutputSource {
     });
     if (isStructuredSession(session)) {
       session.onEvent((event) => {
-        if (capture.attached && event.type === 'turn_start') {
+        // A message read mid-turn starts the account of the work afresh, as a new turn does (ADR-0023).
+        if (capture.attached && (event.type === 'turn_start' || event.type === 'message_delivered')) {
           capture.reported = undefined;
           capture.turnStart = capture.dropped + capture.raw.length;
         }
