@@ -16,7 +16,7 @@ async function setup(opts: { isolation?: FakeWorktreeIsolation; conflictRepairAt
   const isolation = opts.isolation ?? new FakeWorktreeIsolation();
   const listener: IsolationRunListener = { opened: vi.fn(), changed: vi.fn(), blocked: vi.fn(), handoff: vi.fn(), notice: vi.fn(), releasing: vi.fn() };
   const config = fakeConfig({ conflictRepairAttempts: opts.conflictRepairAttempts ?? 2 });
-  const runs = new IsolationRunController({ isolation, config, notifications: fakeNotification(), workspaceRoot: () => '/repo', listener });
+  const runs = new IsolationRunController({ isolation, config, notifications: fakeNotification(), workspaceRoot: () => '/repo', listener, liveTasks: () => new Set() });
   const store = new PlanStore();
   store.load(opts.tasks ?? [], ['claude-code']);
   await runs.decide(async () => undefined);

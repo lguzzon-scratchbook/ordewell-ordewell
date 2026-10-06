@@ -3,6 +3,7 @@ import { IsolationRunController, type IsolationRunListener } from '../IsolationR
 import { createTask, type Task } from '../../models/Task';
 import type { IsolationOutcome } from '../../interfaces/IWorktreeIsolation';
 import { fakeConfig, FakeWorktreeIsolation } from '../../testing';
+import { PlanEditError } from '../PlanEditError';
 import { fakeNotification } from './sessionTestKit';
 
 function setup(isolation = new FakeWorktreeIsolation()) {
@@ -15,8 +16,10 @@ function setup(isolation = new FakeWorktreeIsolation()) {
     releasing: vi.fn(),
   };
   const notifications = fakeNotification();
-  const runs = new IsolationRunController({ isolation, config: fakeConfig(), notifications, workspaceRoot: () => '/repo', listener });
-  return { runs, isolation, listener, notifications };
+  /** Tasks the plan has live: an attempt running, or in progress or waiting on the user. */
+  const live = new Set<string>();
+  const runs = new IsolationRunController({ isolation, config: fakeConfig(), notifications, workspaceRoot: () => '/repo', listener, liveTasks: () => live });
+  return { runs, isolation, listener, notifications, live };
 }
 
 const task = (id: string, order: number): Task =>
@@ -217,6 +220,7 @@ describe('IsolationRunController', () => {
       const { runs, listener } = setup();
       await runs.decide(async () => undefined);
       await runs.attemptCwd(task('t1', 1), { repair: false });
+      await runs.integrate(task('t1', 1));
       await runs.close();
 
       expect(await runs.merge()).toEqual({ outcome: 'merged' });
@@ -224,6 +228,83 @@ describe('IsolationRunController', () => {
       expect(listener.releasing).toHaveBeenCalledWith(['t1']);
       expect(runs.current).toBeNull();
       expect(runs.planIsolation).toBeNull();
+    });
+  });
+
+  describe('clearing a run up never takes live or unlanded work', () => {
+    /** A closed run: t1 landed, t2 started and was left as its attempt ended. */
+    async function closedRun(t2: 'kept' | 'active') {
+      const env = setup();
+      await env.runs.decide(async () => undefined);
+      await env.runs.attemptCwd(task('t1', 1), { repair: false });
+      await env.runs.integrate(task('t1', 1));
+      await env.runs.attemptCwd(task('t2', 2), { repair: false });
+      if (t2 === 'kept') await env.runs.release('t2', { keep: true });
+      env.runs.interrupt();
+      return env;
+    }
+
+    it('keeps the run after Merge all while a task still holds work that has not landed', async () => {
+      const { runs, isolation, listener, notifications } = await closedRun('kept');
+
+      expect(await runs.merge()).toEqual({ outcome: 'merged' });
+
+      expect(ops(isolation)).not.toContain('discard');
+      expect(listener.releasing).not.toHaveBeenCalled();
+      expect(runs.taskIsolation('t2')).toMatchObject({ state: 'kept' });
+      expect(notifications.info).toHaveBeenCalledWith('The run is not cleared up: Task "Task t2" holds work that has not landed, so its worktree stays, and so do the run\'s branches.');
+    });
+
+    it('keeps the run after Merge all while a task is live, even one the run looks closed under', async () => {
+      const { runs, isolation, live, notifications } = await closedRun('active');
+      live.add('t2');
+
+      expect(await runs.merge()).toEqual({ outcome: 'merged' });
+
+      expect(ops(isolation)).not.toContain('discard');
+      expect(runs.taskIsolation('t2')).toMatchObject({ state: 'active' });
+      expect(notifications.info).toHaveBeenCalledWith(expect.stringContaining('Task "Task t2" is still running or waiting on you'));
+    });
+
+    it.each(['cleanup', 'discard'] as const)('refuses %s while a task of the run is live, removing nothing', async (action) => {
+      const { runs, isolation, live, listener } = await closedRun('active');
+      live.add('t2');
+
+      await expect(runs[action]()).rejects.toThrow(PlanEditError);
+      await expect(runs[action]()).rejects.toThrow('Task "Task t2" is still running or waiting on you, so its worktree stays.');
+
+      expect(ops(isolation)).not.toContain('discard');
+      expect(listener.releasing).not.toHaveBeenCalled();
+      expect(runs.current).not.toBeNull();
+    });
+
+    it('says where a removal kept work that had not landed, and which worktree it left in place', async () => {
+      const { runs, isolation, notifications } = await closedRun('kept');
+      const t2 = { taskId: 't2', order: 2, title: 'Task t2' };
+      isolation.removal = {
+        preserved: [{ task: t2, repo: '.', branch: 'ordewell-preserved/run1/2-t2', commit: 'abcdef1234567890' }],
+        refused: [{ task: t2, worktree: '/fake-worktrees/run1/2-t2', reason: 'it is not a git worktree any more' }],
+      };
+
+      await runs.discard();
+
+      const warned = vi.mocked(notifications.warn).mock.calls.map((c) => String(c[0]));
+      expect(warned).toContain('Task "Task t2" had work that never landed, so before its worktree was removed it was kept on branch ordewell-preserved/run1/2-t2 (abcdef1). `git log ordewell-preserved/run1/2-t2` shows it; merge or cherry-pick it to bring it back, and delete the branch once you no longer need it.');
+      expect(warned).toContain('Left the worktree of task "Task t2" in place at /fake-worktrees/run1/2-t2: it holds work Ordewell could not keep (it is not a git worktree any more). Save what you need from it, then remove it with `git worktree remove --force /fake-worktrees/run1/2-t2`.');
+    });
+
+    it('leaves the last run\'s worktrees in place when a new run is minted while a task is live in it', async () => {
+      const { runs, isolation, live, notifications } = setup();
+      await runs.decide(async () => undefined);
+      await runs.attemptCwd(task('t1', 1), { repair: false });
+      live.add('t1');
+      runs.interrupt();
+
+      await runs.decide(async () => undefined);
+
+      expect(runs.current?.id).toBe('run2');
+      expect(ops(isolation)).not.toContain('discard');
+      expect(notifications.warn).toHaveBeenCalledWith('The last run\'s worktrees are left in place: Task "Task t1" is still running or waiting on you there.');
     });
   });
 

@@ -79,7 +79,7 @@ export async function handleIsolationAction(
         const confirm = await vscode.window.showWarningMessage(
           deps.session.isExecuting
             ? 'Merge what the run has landed so far into your checked-out branch? This cannot be undone from Ordewell. The run goes on: tasks waiting for Merge all start once it has merged, and later tasks land on the same branch.'
-            : 'Merge the isolated run into your checked-out branch? This cannot be undone from Ordewell. Once it has merged, the run\'s worktrees and branches are removed.',
+            : 'Merge the isolated run into your checked-out branch? This cannot be undone from Ordewell. Once it has merged, the run\'s worktrees and branches are removed — unless a task still has work in its worktree that has not landed: then the run stays, and so does that work.',
           { modal: true },
           'Merge',
         );

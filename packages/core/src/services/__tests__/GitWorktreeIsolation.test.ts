@@ -766,7 +766,7 @@ describe.skipIf(!hasGit)('WorktreeIsolation.release', () => {
     const root = repo();
     const iso = create({ config: fakeConfig({ worktreeIsolation: true }) });
     const run = await iso.startRun(root);
-    await expect(iso.release(run, 'nope', { keep: false })).resolves.toBeUndefined();
+    await expect(iso.release(run, 'nope', { keep: false })).resolves.toEqual({ preserved: [], refused: [] });
   });
 
   it('a retry starts fresh from the current integration tip', async () => {
@@ -787,6 +787,179 @@ describe.skipIf(!hasGit)('WorktreeIsolation.release', () => {
     expect(existsSync(join(retry.cwd, 'stale.txt'))).toBe(false);
     expect(readFileSync(join(retry.cwd, 'pred.txt'), 'utf8')).toBe('landed\n');
     expect(run.tasks['task-2'].status).toBe('active');
+  });
+});
+
+describe.skipIf(!hasGit)('WorktreeIsolation never deletes work that has not landed', () => {
+  const preserved = (root: string) => branches(root, 'ordewell-preserved/*');
+
+  /** Real git, except that a rescue commit fails, as it does for a repository with no identity set. */
+  const rescueFails: GitExecFn = async (file, args, opts) => {
+    if (args.includes('--no-verify')) throw Object.assign(new Error('fatal: unable to auto-detect email address'), { stderr: 'fatal: unable to auto-detect email address', code: 128 });
+    const { stdout, stderr } = await execFileAsync(file, args, { cwd: opts.cwd, env: opts.env });
+    return { stdout: String(stdout), stderr: String(stderr) };
+  };
+
+  it('keeps a kept task\'s uncommitted edits on a branch of their own when Merge all clears the run up', async () => {
+    const root = repo();
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }) });
+    const run = await iso.startRun(root);
+    const landed = await iso.prepare(task(1, 'Landed'), run);
+    writeFileSync(join(landed.cwd, 'landed.txt'), 'landed\n');
+    expect(await iso.integrate(task(1, 'Landed'), run)).toBe('merged');
+    const stopped = await iso.prepare(task(2, 'Stopped mid-work'), run);
+    writeFileSync(join(stopped.cwd, 'half-done.txt'), 'not committed yet\n');
+    writeFileSync(join(stopped.cwd, 'README.md'), 'edited\n');
+    await iso.release(run, 'task-2', { keep: true });
+    await iso.handoff(run);
+    expect(await iso.mergeIntoCheckedOut(run)).toEqual({ outcome: 'merged' });
+
+    const removal = await iso.discard(run, { integration: 'delete-merged' });
+
+    const branch = `ordewell-preserved/${run.id}/2-stopped-mid-work`;
+    expect(removal).toEqual({
+      preserved: [{ task: { taskId: 'task-2', order: 2, title: 'Stopped mid-work' }, repo: '.', branch, commit: git(root, 'rev-parse', branch) }],
+      refused: [],
+    });
+    expect(existsSync(stopped.cwd)).toBe(false);
+    expect(git(root, 'show', `${branch}:half-done.txt`)).toBe('not committed yet');
+    expect(git(root, 'show', `${branch}:README.md`)).toBe('edited');
+    expect(git(root, 'log', '-1', '--format=%s', branch)).toBe('WIP: Stopped mid-work (kept by Ordewell before removing its worktree)');
+    expect(branches(root)).toEqual([]);
+    expect(git(root, 'status', '--porcelain')).toBe('');
+  });
+
+  it('keeps the commits only a task branch carries, even once its worktree is gone', async () => {
+    const root = repo();
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }) });
+    const run = await iso.startRun(root);
+    const { cwd, branch } = await iso.prepare(task(1, 'Committed its work'), run);
+    writeFileSync(join(cwd, 'work.txt'), 'committed\n');
+    git(cwd, 'add', '-A');
+    git(cwd, 'commit', '-q', '-m', 'the agent committed');
+    const tip = git(root, 'rev-parse', branch);
+    git(root, 'worktree', 'remove', '--force', cwd);
+
+    const removal = await iso.discard(run, { integration: 'delete' });
+
+    expect(removal.preserved).toEqual([expect.objectContaining({ branch: `ordewell-preserved/${run.id}/1-committed-its-work`, commit: tip })]);
+    expect(branches(root)).toEqual([]);
+  });
+
+  it('a rescue commit gets past a hook that refuses commits', async () => {
+    const root = repo();
+    writeFileSync(join(root, '.git', 'hooks', 'pre-commit'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }) });
+    const run = await iso.startRun(root);
+    const { cwd } = await iso.prepare(task(1, 'Hooked'), run);
+    writeFileSync(join(cwd, 'edit.txt'), 'edit\n');
+
+    const removal = await iso.release(run, 'task-1', { keep: false });
+
+    expect(removal.preserved).toHaveLength(1);
+    expect(git(root, 'show', `${removal.preserved[0].branch}:edit.txt`)).toBe('edit');
+    expect(existsSync(cwd)).toBe(false);
+  });
+
+  it('keeps nothing for a worktree with no work of its own, linked artifacts and all', async () => {
+    const root = repo();
+    mkdirSync(join(root, '.claude'));
+    writeFileSync(join(root, '.claude', 'settings.local.json'), '{}\n');
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }) });
+    const run = await iso.startRun(root);
+    const { cwd } = await iso.prepare(task(1, 'Untouched'), run);
+    expect(lexists(join(cwd, '.claude'))).toBe(true);
+
+    expect(await iso.release(run, 'task-1', { keep: false })).toEqual({ preserved: [], refused: [] });
+    expect(preserved(root)).toEqual([]);
+    expect(existsSync(cwd)).toBe(false);
+  });
+
+  it('refuses to remove a worktree whose edits it cannot keep, and keeps its record', async () => {
+    const root = repo();
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }), execFileImpl: rescueFails });
+    const run = await iso.startRun(root);
+    const { cwd, branch } = await iso.prepare(task(1, 'Unsaveable'), run);
+    writeFileSync(join(cwd, 'precious.txt'), 'only copy\n');
+
+    const removal = await iso.discard(run, { integration: 'delete' });
+
+    expect(removal.preserved).toEqual([]);
+    expect(removal.refused).toEqual([{ task: { taskId: 'task-1', order: 1, title: 'Unsaveable' }, worktree: cwd, reason: expect.stringContaining('auto-detect email') }]);
+    expect(readFileSync(join(cwd, 'precious.txt'), 'utf8')).toBe('only copy\n');
+    expect(worktreePaths(root)).toContain(cwd);
+    expect(branches(root)).toContain(branch);
+    expect(Object.keys(run.tasks)).toEqual(['task-1']);
+  });
+
+  it('a release that cannot keep the work leaves the attempt kept, not active', async () => {
+    const root = repo();
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }), execFileImpl: rescueFails });
+    const run = await iso.startRun(root);
+    const { cwd } = await iso.prepare(task(1, 'Unsaveable'), run);
+    writeFileSync(join(cwd, 'precious.txt'), 'only copy\n');
+
+    const removal = await iso.release(run, 'task-1', { keep: false });
+
+    expect(removal.refused).toHaveLength(1);
+    expect(existsSync(join(cwd, 'precious.txt'))).toBe(true);
+    expect(run.tasks['task-1'].status).toBe('kept');
+  });
+
+  it('a retry keeps what the attempt before it left uncommitted, and starts clean', async () => {
+    const root = repo();
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }) });
+    const run = await iso.startRun(root);
+    const first = await iso.prepare(task(1, 'Retried'), run);
+    writeFileSync(join(first.cwd, 'first-try.txt'), 'first try\n');
+    await iso.release(run, 'task-1', { keep: true });
+
+    const retry = await iso.prepare(task(1, 'Retried'), run);
+
+    expect(retry.preserved).toEqual([expect.objectContaining({ branch: `ordewell-preserved/${run.id}/1-retried` })]);
+    expect(existsSync(join(retry.cwd, 'first-try.txt'))).toBe(false);
+    expect(git(root, 'show', `ordewell-preserved/${run.id}/1-retried:first-try.txt`)).toBe('first try');
+  });
+
+  it('a retry whose last attempt it cannot keep does not start over it', async () => {
+    const root = repo();
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }), execFileImpl: rescueFails });
+    const run = await iso.startRun(root);
+    const first = await iso.prepare(task(1, 'Retried'), run);
+    writeFileSync(join(first.cwd, 'first-try.txt'), 'first try\n');
+
+    await expect(iso.prepare(task(1, 'Retried'), run)).rejects.toThrow(/could not keep/);
+    expect(readFileSync(join(first.cwd, 'first-try.txt'), 'utf8')).toBe('first try\n');
+  });
+
+  it('never overwrites a branch kept earlier: a second keep for the same task gets its own', async () => {
+    const root = repo();
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }) });
+    const run = await iso.startRun(root);
+    for (const attempt of ['one', 'two']) {
+      const { cwd } = await iso.prepare(task(1, 'Twice'), run);
+      writeFileSync(join(cwd, 'attempt.txt'), `${attempt}\n`);
+      await iso.release(run, 'task-1', { keep: false });
+    }
+
+    expect(preserved(root)).toEqual([`ordewell-preserved/${run.id}/1-twice`, `ordewell-preserved/${run.id}/1-twice-2`]);
+    expect(git(root, 'show', `ordewell-preserved/${run.id}/1-twice:attempt.txt`)).toBe('one');
+    expect(git(root, 'show', `ordewell-preserved/${run.id}/1-twice-2:attempt.txt`)).toBe('two');
+  });
+
+  it('crash recovery keeps the edits of a task workspace no record owns before sweeping it', async () => {
+    const root = repo();
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }) });
+    const run = await iso.startRun(root);
+    const { cwd } = await iso.prepare(task(1, 'Record lost'), run);
+    writeFileSync(join(cwd, 'unsaved.txt'), 'the runner wrote this\n');
+    delete run.tasks['task-1'];
+
+    const result = await iso.pruneOrphans(run);
+
+    expect(result.preserved).toEqual([{ repo: '.', branch: `ordewell-preserved/${run.id}/1-record-lost`, commit: expect.any(String) }]);
+    expect(existsSync(cwd)).toBe(false);
+    expect(git(root, 'show', `ordewell-preserved/${run.id}/1-record-lost:unsaved.txt`)).toBe('the runner wrote this');
   });
 });
 

@@ -9,6 +9,7 @@ import type {
   IsolationMergeResult,
   IsolationOutcome,
   IsolationPruneResult,
+  IsolationRemoval,
   IsolationRun,
   IntegrationDisposal,
   PreparedTask,
@@ -17,7 +18,7 @@ import type {
   TreeSnapshot,
 } from './interfaces/IWorktreeIsolation';
 import type { Task } from './models/Task';
-import { handoffOf, integrationBranchFor, SELF_REPO } from './services/isolationRecord';
+import { handoffOf, integrationBranchFor, noRemoval, SELF_REPO } from './services/isolationRecord';
 
 /**
  * Let an already-queued promise chain run to its next await before asserting,
@@ -234,7 +235,7 @@ export type FakeIsolationCall =
  * test can observe that its dependents wait. `repos` makes the run a group of
  * several; `changes` and `stopsIn` say which of them a task changes and where
  * its landing stops. `repairEvidence` scripts what a conflict repair's
- * evidence check finds.
+ * evidence check finds, and `removal` what a removal kept back.
  */
 export class FakeWorktreeIsolation implements IWorktreeIsolation {
   availability: IsolationAvailability = { active: true };
@@ -265,6 +266,11 @@ export class FakeWorktreeIsolation implements IWorktreeIsolation {
   sweepError: Error | null = null;
   /** What `pruneOrphans` reports as kept back from the sweep. */
   keptOnPrune: IsolationPruneResult['kept'] = [];
+  /**
+   * What every removal — a `release` that removes, `discard`, `pruneOrphans` —
+   * reports it kept back. A refused task keeps its record, as git's does.
+   */
+  removal: IsolationRemoval = noRemoval();
   /** Per task id; a task not listed integrates as `merged`. */
   outcomes = new Map<string, IsolationOutcome>();
   /** Per task id, what `verifyRepair` finds; a task not listed passes. */
@@ -373,15 +379,22 @@ export class FakeWorktreeIsolation implements IWorktreeIsolation {
     return outcome;
   }
 
-  async release(run: IsolationRun, taskId: string, opts: { keep: boolean }): Promise<void> {
+  async release(run: IsolationRun, taskId: string, opts: { keep: boolean }): Promise<IsolationRemoval> {
     this.log({ op: 'release', taskId, keep: opts.keep });
     const record = run.tasks[taskId];
-    if (!opts.keep) delete run.tasks[taskId];
+    const removal = opts.keep || !record ? noRemoval() : this.removed();
+    const refused = removal.refused.some((r) => r.task?.taskId === taskId);
+    if (!opts.keep && !refused) delete run.tasks[taskId];
     else if (record?.status === 'active') record.status = 'kept';
     else if (record?.status === 'repairing') {
       record.status = 'conflict';
       delete record.repairBase;
     }
+    return removal;
+  }
+
+  private removed(): IsolationRemoval {
+    return { preserved: [...this.removal.preserved], refused: [...this.removal.refused] };
   }
 
   async handoff(run: IsolationRun): Promise<IsolationHandoff> {
@@ -391,7 +404,7 @@ export class FakeWorktreeIsolation implements IWorktreeIsolation {
 
   async pruneOrphans(): Promise<IsolationPruneResult> {
     this.log({ op: 'pruneOrphans' });
-    return { kept: [...this.keptOnPrune] };
+    return { kept: [...this.keptOnPrune], ...this.removed() };
   }
   async reviewDiff(): Promise<string> { this.log({ op: 'reviewDiff' }); return ''; }
   async mergeIntoCheckedOut(run: IsolationRun): Promise<IsolationMergeResult> {
@@ -413,9 +426,10 @@ export class FakeWorktreeIsolation implements IWorktreeIsolation {
   }
   async snapshotTree(): Promise<TreeSnapshot | null> { this.log({ op: 'snapshotTree' }); return this.treeSnapshot; }
   async changedSince(): Promise<string[]> { this.log({ op: 'changedSince' }); return [...this.changedFiles]; }
-  async discard(_run: IsolationRun, opts: { integration: IntegrationDisposal }): Promise<void> {
+  async discard(_run: IsolationRun, opts: { integration: IntegrationDisposal }): Promise<IsolationRemoval> {
     this.log({ op: 'discard', integration: opts.integration });
     if (this.discardError) throw this.discardError;
+    return this.removed();
   }
   async sweep(): Promise<void> {
     this.log({ op: 'sweep' });
