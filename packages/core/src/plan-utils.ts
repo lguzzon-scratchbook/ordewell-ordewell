@@ -12,3 +12,7 @@ export { capConflictFiles } from './services/conflictFiles';
 // The shared conversation view (#51) is pure too, so every surface — a webview
 // included — draws from the same reducer.
 export * from './conversation';
+// The task row view is pure for the same reason: the webview draws a task card
+// from the facts the TUI paints its plan row from.
+export * from './taskRow';
+export { taskOrderLabel, taskRef, titledTaskRef } from './order-labels';

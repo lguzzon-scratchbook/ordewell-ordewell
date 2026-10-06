@@ -21,7 +21,6 @@ import {
 import { clamp, clampSelection, stale, step, type Action, type Effect, type Step } from './reducers/shared';
 
 export { initialState } from './state';
-export { markAction } from './reducers/planPane';
 export { resolveTaskId } from './reducers/taskEdits';
 export type { Action, Effect, Step, TaskAction } from './reducers/shared';
 

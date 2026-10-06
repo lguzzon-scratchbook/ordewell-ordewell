@@ -1,12 +1,10 @@
 import React, { useState } from 'react';
 import ModelSelector, { getModelClass, providerLabel } from './ModelSelector';
-import { taskOrderLabel } from '@ordewell/core/order-labels';
-import type { Task, DiscoveredModel, TaskModelAssignment } from '@ordewell/core';
-import { TaskCheck } from './TaskCard';
-import { runnerOptionsFor } from './TaskCard';
+import { taskRowView } from '@ordewell/core/plan-utils';
+import type { Task, DiscoveredModel, TaskModelAssignment, TaskRowAction } from '@ordewell/core';
+import { TaskActions, TaskCheck, runnerOptionsFor, statusBadge } from './TaskCard';
 import type { RunnerMode, RunnerOption } from './TaskCard';
 import { checkLabel } from '../checkLabel';
-import { awaitingLabel } from '../awaitingLabel';
 
 interface SubTaskCardProps {
   task: Task;
@@ -36,14 +34,8 @@ interface SubTaskCardProps {
   onOpenLog?: (taskId: string) => void;
 }
 
-const STATUS_CONFIG: Record<string, { label: string; cls: string }> = {
-  completed: { label: 'Done', cls: 'status-completed' },
-  failed: { label: 'Failed', cls: 'status-failed' },
-  in_progress: { label: 'Running', cls: 'status-running' },
-  blocked: { label: 'Blocked', cls: 'status-blocked' },
-  pending: { label: 'To do', cls: 'status-pending' },
-  approved: { label: 'To do', cls: 'status-pending' },
-  awaiting_user: { label: 'Awaiting User', cls: 'status-blocked' },
+const ACTION_LABELS: Record<TaskRowAction, string> = {
+  cancel: 'Cancel', skip: 'Skip', 'force-start': 'Force Start', complete: 'Mark Complete', uncomplete: 'Mark Not Done',
 };
 
 const DEFAULT_MODES: RunnerMode[] = [
@@ -64,8 +56,8 @@ export default function SubTaskCard({ task, parentTask, models, modes, runners, 
   const activeModes = modes && modes.length > 0 ? modes : DEFAULT_MODES;
   const runnerOptions = runnerOptionsFor(runners, task.assignedRunner);
   const runnerAbbrev = effectiveRunner ? (RUNNER_ABBREV[effectiveRunner] ?? effectiveRunner.slice(0, 2).toUpperCase()) : null;
-  const baseStatus = STATUS_CONFIG[task.status] ?? STATUS_CONFIG.pending;
-  const status = { ...baseStatus, label: awaitingLabel(task) ?? baseStatus.label };
+  const row = taskRowView(task, { parent: parentTask, placement: 'subtask' });
+  const status = statusBadge(row);
   const isStructured = task.transport?.kind === 'structured';
 
   const handlePromptSave = () => {
@@ -83,8 +75,8 @@ export default function SubTaskCard({ task, parentTask, models, modes, runners, 
   return (
     <div className={`subtask-card ${expanded ? 'expanded' : ''}`}>
       <div className="subtask-card-header" onClick={() => setExpanded(!expanded)}>
-        <TaskCheck status={task.status} taskId={task.id} onMarkComplete={onMarkComplete} onMarkIncomplete={onMarkIncomplete} />
-        <span className="subtask-order">{taskOrderLabel(task, parentTask)}.</span>
+        <TaskCheck row={row} taskId={task.id} onMarkComplete={onMarkComplete} onMarkIncomplete={onMarkIncomplete} />
+        <span className="subtask-order">{row.orderLabel}.</span>
         <span className={`task-type-badge small ${task.type}`}>
           {task.type === 'ai' ? 'AI' : 'Manual'}
         </span>
@@ -98,7 +90,7 @@ export default function SubTaskCard({ task, parentTask, models, modes, runners, 
           </button>
         )}
 
-        {(isExecuting || task.status === 'failed' || task.status === 'awaiting_user') && (
+        {(isExecuting || row.status === 'failed' || row.status === 'awaiting') && (
           <span className={`task-status-badge ${status.cls}`}>{status.label}</span>
         )}
 
@@ -216,26 +208,9 @@ export default function SubTaskCard({ task, parentTask, models, modes, runners, 
           )}
 
           {isExecuting && (
-            <div className="task-actions">
-              {task.status === 'in_progress' && onCancel && (
-                <button className="task-action-btn cancel" onClick={(e) => { e.stopPropagation(); onCancel(task.id); }}>Cancel</button>
-              )}
-              {task.status === 'in_progress' && task.type === 'ai' && onMarkComplete && (
-                <button className="task-action-btn start" onClick={(e) => { e.stopPropagation(); onMarkComplete(task.id); }}>Mark Complete</button>
-              )}
-              {(task.status === 'pending' || task.status === 'approved') && task.type === 'ai' && onForceStart && (
-                <button className="task-action-btn start" onClick={(e) => { e.stopPropagation(); onForceStart(task.id); }}>Force Start</button>
-              )}
-              {(task.status === 'pending' || task.status === 'approved') && onSkip && (
-                <button className="task-action-btn skip" onClick={(e) => { e.stopPropagation(); onSkip(task.id); }}>Skip</button>
-              )}
-              {task.status === 'awaiting_user' && onMarkComplete && (
-                <button className="task-action-btn start" onClick={(e) => { e.stopPropagation(); onMarkComplete(task.id); }}>Verify / Mark Complete</button>
-              )}
-              {task.status === 'completed' && onMarkIncomplete && (
-                <button className="task-action-btn skip" onClick={(e) => { e.stopPropagation(); onMarkIncomplete(task.id); }}>Mark Not Done</button>
-              )}
-            </div>
+            <TaskActions taskId={task.id} actions={row.actions}
+              labels={row.status === 'awaiting' ? { ...ACTION_LABELS, complete: 'Verify / Mark Complete' } : ACTION_LABELS}
+              handlers={{ cancel: onCancel, skip: onSkip, 'force-start': onForceStart, complete: onMarkComplete, uncomplete: onMarkIncomplete }} />
           )}
         </div>
       )}

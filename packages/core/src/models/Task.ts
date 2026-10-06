@@ -530,7 +530,7 @@ export function migrateLegacyPlan(legacy: LegacyPlanState): PlanState {
   };
 }
 
-export { taskOrderLabel, resolveOrderLabel } from '../order-labels';
+export { taskOrderLabel, taskRef, titledTaskRef, resolveOrderLabel } from '../order-labels';
 
 export function createTask(overrides: Partial<Task> = {}): Task {
   return {

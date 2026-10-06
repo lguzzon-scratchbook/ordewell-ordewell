@@ -2,11 +2,10 @@ import { pad, style, truncate, width, wrap, wrapLines, type WrapLine } from './a
 import { cursorInLines, type CursorPosition } from './editor';
 import { conversationLines, tokenLine } from './blocks';
 import { chatEditorRoomFor, chatPaneWidth, planPaneWidth } from './geometry';
-import { taskRepoNames } from '../isolation';
 import { SLASH_COMMANDS, type SlashCategory } from './slash';
-import { findTask, isTaskRunning, planRows, plannerInFlight, selectedPlanRow, waitingApproval, type PlanRow, type TaskView, type TuiState } from './state';
+import { findTask, planRows, plannerInFlight, selectedPlanRow, waitingApproval, type PlanRow, type TaskView, type TuiState } from './state';
 import { modesForTask } from './taskAssignment';
-import { ALL_PROVIDERS, capConflictFiles, hasHiddenDetail, runnerForProvider, taskOrderLabel, type AiProvider, type AwaitingReason, type DisplayBlock } from '@ordewell/core';
+import { ALL_PROVIDERS, approvalLabel, awaitingLabel, hasHiddenDetail, markAction, runnerForProvider, taskRowView, type AiProvider, type DisplayBlock, type TaskStatusKind } from '@ordewell/core';
 
 /**
  * What each pane's content actually is, and therefore how far it can scroll.
@@ -48,7 +47,7 @@ export function footerHints(state: TuiState): string[] {
   // `m` toggles, so the hint has to name the direction it will actually go for
   // the selected task — a fixed 'm done' on a finished task reads as a no-op.
   const selected = selectedPlanRow(state)?.task;
-  const markHint = selected?.status === 'completed' ? 'm undone' : 'm done';
+  const markHint = selected && markAction(selected) === 'uncomplete' ? 'm undone' : 'm done';
   // Only on a task that has a conflict to resolve: isolation stays quiet otherwise.
   const resolveHint = selected?.isolation?.state === 'conflict' ? ['x resolve conflict'] : [];
   // A planning turn in flight owns ESC ahead of whatever the pane would
@@ -137,11 +136,10 @@ function queuedTaskBubble(text: string, selected: boolean, cols: number): string
  * plain input), then the task's own status.
  */
 function taskActivity(task: TaskView | undefined, working: boolean): string {
-  if (task?.awaitingApproval) return approvalLabel(task.awaitingApproval);
+  const approvals = approvalLabel(task?.awaitingApproval);
+  if (approvals) return inRow(approvals);
   if (working) return 'working';
-  if (task?.status === 'awaiting_user') {
-    return task.awaitingReason ? AWAITING_LABEL[task.awaitingReason] : 'waiting for your input';
-  }
+  if (task?.status === 'awaiting_user') return inRow(awaitingLabel(task) ?? 'Waiting for your input');
   return task?.status ?? '';
 }
 
@@ -421,42 +419,28 @@ function welcomeLines(state: TuiState, cols: number): string[] {
 
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-const STATUS_MARK: Record<string, (text: string) => string> = {
-  completed: style.green,
+const STATUS_PAINT: Record<TaskStatusKind, (text: string) => string> = {
+  done: style.green,
   running: style.yellow,
-  in_progress: style.yellow,
+  quiet: style.cyan,
   failed: style.red,
   blocked: style.red,
-  awaiting_user: style.yellow,
-  cancelled: style.grey,
-  skipped: style.grey,
+  awaiting: style.yellow,
+  todo: (text) => text,
 };
 
-const STATUS_ICON: Record<string, string> = {
-  completed: '✓',
+/** `quiet` is static — distinct from both the busy spinner and the awaiting '?'. */
+const STATUS_ICON: Record<Exclude<TaskStatusKind, 'running'>, string> = {
+  done: '✓',
   failed: '✗',
   blocked: '!',
-  awaiting_user: '?',
-  cancelled: '−',
-  skipped: '−',
-  approved: '·',
-  pending: '·',
+  awaiting: '?',
+  quiet: '~',
+  todo: '·',
 };
 
-/** What an awaiting_user task waits on, in the words its row uses. */
-const AWAITING_LABEL: Record<AwaitingReason, string> = {
-  input: 'waiting for your input',
-  checkpoint: 'checkpoint',
-  conflict: 'merge conflict',
-  'files-changed': 'changed tracked files',
-};
-
-function approvalLabel(count: number): string {
-  return count > 1 ? `waiting for approval (${count})` : 'waiting for approval';
-}
-
-/** Static marker for a running task whose runner has gone quiet — distinct from both the busy spinner and the awaiting_user '?'. */
-const IDLE_ICON = '~';
+/** A row's annotations run on inside a sentence, so core's sentence-case labels lose their capital. */
+const inRow = (label: string): string => label.charAt(0).toLowerCase() + label.slice(1);
 
 /** Inclusive indices into `PlanLayout.lines`. */
 export interface LineSpan {
@@ -488,13 +472,14 @@ export function planLayout(state: TuiState, rows: number, cols: number): PlanLay
   const lines = [style.bold(`Plan ${done}/${state.tasks.length}`), ''];
 
   const rowSpans: LineSpan[] = [];
+  const orderOf = new Map(state.tasks.map((task) => [task.id, task.order]));
   // An expanded task starts its editor at the end of its prompt. For a long
   // prompt, keeping only the task heading visible makes edits appear to do
   // nothing because the caret is below the viewport.
   let editorLine: number | undefined;
   planRows(state).forEach((row, i) => {
     const taskStart = lines.length;
-    const renderedTask = taskLines(state, row, i, cols);
+    const renderedTask = taskLines(state, row, i, cols, orderOf);
     if (row.task.id === state.expandedTaskId && renderedTask.editorLine !== undefined) {
       editorLine = taskStart + renderedTask.editorLine;
     }
@@ -590,27 +575,25 @@ interface TaskLines {
   editorLine?: number;
 }
 
-function taskLines(state: TuiState, row: PlanRow, index: number, cols: number): TaskLines {
-  const { task, parent } = row;
+function taskLines(state: TuiState, planRow: PlanRow, index: number, cols: number, orderOf: ReadonlyMap<string, number>): TaskLines {
+  const { task, parent } = planRow;
+  const row = taskRowView(task, { parent, orderOf, modes: modesForTask(state.modesByRunner, task) });
   const selected = state.focus === 'plan' && index === state.selectedTask;
   const expanded = state.expandedTaskId === task.id;
-  const running = isTaskRunning(task);
-  const idle = running && task.status === 'in_progress' && task.idleSince != null;
-  const paint = idle ? style.cyan : (STATUS_MARK[task.status] ?? ((t: string) => t));
-  const rawIcon = idle ? IDLE_ICON : running ? SPINNER[state.spinnerFrame % SPINNER.length] : (STATUS_ICON[task.status] ?? '·');
-  const icon = paint(rawIcon);
-  const kind = running
+  const rawIcon = row.status === 'running' ? SPINNER[state.spinnerFrame % SPINNER.length] : STATUS_ICON[row.status];
+  const icon = STATUS_PAINT[row.status](rawIcon);
+  const kind = row.running
     ? style.yellow('RUN')
-    : task.type === 'user'
+    : row.kind === 'user'
       ? style.yellow('MAN')
-      : task.ops
+      : row.kind === 'ops'
         ? style.magenta('OPS')
         : style.grey(' AI');
   const caret = selected ? style.cyan('❯') : ' ';
 
   // A subtask row names itself by its dotted order ("2.1") and steps in under
   // its parent; the top-level order number keeps its two-wide pad.
-  const orderLabel = parent ? taskOrderLabel(task, parent) : String(task.order).padStart(2);
+  const orderLabel = parent ? row.orderLabel : row.orderLabel.padStart(2);
   const indent = parent ? '  ' : '';
   const head = `${indent}${caret} ${icon} ${orderLabel} ${kind} `;
   const titleRoom = Math.max(1, cols - width(head));
@@ -630,24 +613,19 @@ function taskLines(state: TuiState, row: PlanRow, index: number, cols: number): 
   const effort = task.type === 'ai'
     ? `effort: ${task.assignedModel?.thinkingEffort ?? 'default'}`
     : '';
-  // Autonomy is a manifest tag on the task's own mode, not a mode name — so this
-  // looks the tag up rather than string-matching a mode id (ADR-0001: no
-  // hardcoded mode names).
-  const modeInfo = task.type === 'ai'
-    ? modesForTask(state.modesByRunner, task).find((m) => m.id === task.taskMode)
-    : undefined;
   const mode = task.type === 'ai'
-    ? `mode: ${task.taskMode ?? 'default'}${modeInfo?.autonomous ? style.yellow(' ⚡') : ''}`
+    ? `mode: ${task.taskMode ?? 'default'}${row.autonomous ? style.yellow(' ⚡') : ''}`
     : '';
   const runner = task.assignedRunner ?? '';
   const bodyPad = parent ? '      ' : '    ';
   // "working" over an agent that has printed nothing for a minute hid the one
   // case that needs the user: an agent stopped at a question in its terminal.
   const structured = task.transport?.kind === 'structured';
-  const waiting = task.status === 'awaiting_user' && task.awaitingReason ? AWAITING_LABEL[task.awaitingReason] : '';
-  const activity = task.awaitingApproval
-    ? `${approvalLabel(task.awaitingApproval)} — t opens it`
-    : idle ? (structured ? 'quiet' : 'quiet — t opens its terminal') : running ? 'working' : waiting;
+  const activity = row.approvals
+    ? `${inRow(row.approvals)} — t opens it`
+    : row.status === 'quiet'
+      ? (structured ? 'quiet' : 'quiet — t opens its terminal')
+      : row.running ? 'working' : row.awaiting ? inRow(row.awaiting) : '';
   const meta = [activity, runner, structured ? 'structured' : '', model].filter(Boolean).join(' · ');
   if (meta) lines.push(style.grey(truncate(`${bodyPad}${meta}`, cols)));
   // Asked for structured and did not get it: said on the row, never silently.
@@ -655,32 +633,27 @@ function taskLines(state: TuiState, row: PlanRow, index: number, cols: number): 
   if (effort || mode) lines.push(style.grey(truncate(`${bodyPad}${[effort, mode].filter(Boolean).join(' · ')}`, cols)));
   // The one isolation state that needs the user; every other stays out of the
   // row and shows only in the expanded detail below.
-  if (task.isolation?.state === 'conflict') {
-    const where = task.isolation.conflictRepo && task.isolation.conflictRepo !== '.' ? ` in ${task.isolation.conflictRepo}` : '';
-    const files = task.isolation.conflictFiles?.length ? ` (${capConflictFiles(task.isolation.conflictFiles)})` : '';
+  if (row.conflict) {
+    const where = row.conflict.repo ? ` in ${row.conflict.repo}` : '';
+    const files = row.conflict.files ? ` (${row.conflict.files})` : '';
     lines.push(style.red(truncate(`${bodyPad}⚠ merge conflict${where}${files} — its work is kept on its own branch`, cols)));
   }
-  // A repair in flight (ADR-0015): still running, so it reads as progress, not
-  // a blocker like `conflict` above. `repair` is absent only for a task shown
-  // straight from a reloaded plan, before the live stream has caught up.
-  if (task.isolation?.state === 'repairing') {
-    const files = task.isolation.conflictFiles?.length ? ` in ${capConflictFiles(task.isolation.conflictFiles)}` : '';
-    const attempt = task.isolation.repair ? ` (attempt ${task.isolation.repair.attempt}/${task.isolation.repair.limit})` : '';
+  // `attempt` is absent only for a task shown straight from a reloaded plan,
+  // before the live stream has caught up.
+  if (row.repairing) {
+    const files = row.repairing.files ? ` in ${row.repairing.files}` : '';
+    const attempt = row.repairing.attempt ? ` (attempt ${row.repairing.attempt.attempt}/${row.repairing.attempt.limit})` : '';
     lines.push(style.yellow(truncate(`${bodyPad}↻ repairing conflict${files}${attempt}`, cols)));
   }
   // A merge gate holds the task as plainly as a task that waits on the user (ADR-0020).
-  if (task.mergeGate?.length) {
-    const deps = task.mergeGate.map((id) => {
-      const dep = state.tasks.find((t) => t.id === id);
-      return dep ? `#${dep.order}` : id;
-    });
-    lines.push(style.yellow(truncate(`${bodyPad}⏸ waits for Merge all — ${deps.join(', ')} not merged into your branch yet`, cols)));
+  if (row.mergeGate) {
+    lines.push(style.yellow(truncate(`${bodyPad}⏸ waits for Merge all — ${row.mergeGate.join(', ')} not merged into your branch yet`, cols)));
   }
-  if (task.status === 'awaiting_user' && task.awaitingReason === 'files-changed') {
+  if (row.opsChangedFiles) {
     lines.push(style.yellow(truncate(`${bodyPad}⚠ an ops task changed tracked files — check them, then m done or /retry`, cols)));
   }
-  if (task.isolation?.state === 'integrated' && task.isolation.repairedFiles?.length) {
-    lines.push(style.grey(truncate(`${bodyPad}↻ landed after repairing conflict in ${capConflictFiles(task.isolation.repairedFiles)}`, cols)));
+  if (row.repaired?.landed) {
+    lines.push(style.grey(truncate(`${bodyPad}↻ landed after repairing conflict in ${row.repaired.files}`, cols)));
   }
 
   let editorLine: number | undefined;
@@ -688,20 +661,19 @@ function taskLines(state: TuiState, row: PlanRow, index: number, cols: number): 
     lines.push(style.grey(`${bodyPad}${task.status.replace(/_/g, ' ')}`));
     if (task.isolation && task.isolation.state !== 'none' && task.isolation.branch) {
       lines.push(...taskText('Branch', task.isolation.branch, cols, bodyPad));
-      const repos = taskRepoNames(task.isolation);
-      if (repos.length > 0) lines.push(...taskText('Repos', repos.join(', '), cols, bodyPad));
+      if (row.repos.length > 0) lines.push(...taskText('Repos', row.repos.join(', '), cols, bodyPad));
       // An integrated task's worktree is gone; naming it would point at nothing.
       if (task.isolation.state !== 'integrated' && task.isolation.worktree) {
         lines.push(...taskText('Worktree', task.isolation.worktree, cols, bodyPad));
       }
     }
-    if (task.ops) {
+    if (row.kind === 'ops') {
       lines.push(...taskText('Ops', 'Runs in your checkout, not a worktree, once the work it depends on is merged. O makes it a change task.', cols, bodyPad));
     }
-    if (task.forcedPastGate?.length) {
-      lines.push(...taskText('Forced', `Started before the work of ${task.forcedPastGate.join(', ')} was merged into your branch.`, cols, bodyPad));
+    if (row.forcedPastGate) {
+      lines.push(...taskText('Forced', `Started before the work of ${row.forcedPastGate.join(', ')} was merged into your branch.`, cols, bodyPad));
     }
-    if (modeInfo?.autonomous) {
+    if (row.autonomous) {
       lines.push(...taskText('Autonomy', 'Runs without permission prompts (Full). Change the level with /auto.', cols, bodyPad));
     }
     // The prompt editor is seeded from prompt ?? description ?? title, so only
@@ -720,12 +692,8 @@ function taskLines(state: TuiState, row: PlanRow, index: number, cols: number): 
       editorLine = lines.length + 1 + cp.line;
       lines.push(...taskPromptLines(wrapped, cp, bodyPad));
     }
-    if (task.dependencies.length > 0) {
-      const orderById = new Map(state.tasks.map((candidate) => [candidate.id, candidate.order]));
-      const dependencies = task.dependencies
-        .map((id) => orderById.has(id) ? `#${orderById.get(id)}` : id)
-        .join(', ');
-      lines.push(...taskText('Depends on', dependencies, cols, bodyPad));
+    if (row.dependencies.length > 0) {
+      lines.push(...taskText('Depends on', row.dependencies.join(', '), cols, bodyPad));
     }
     // Two lines: the assignment keys plus the edit verbs no longer fit the plan
     // pane on one, and a truncated hint hides the keys it exists to teach. They

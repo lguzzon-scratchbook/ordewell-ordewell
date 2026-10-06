@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import {
   Session, LegacyPlanState, Task, flattenTasks, RunnerId, DiscoveredModel, enabledRunners,
   saveState, clearState, ModelResolver, RunnerRegistry, isCliProvider, taskStartedNotice,
-  createEmptyPlan, type INotification, type ITerminalRunner,
+  createEmptyPlan, markRequestFor, pastGateConfirmation, titledRefs, type INotification, type ITerminalRunner, type TaskRowAction,
 } from '@ordewell/core';
 import type { TaskDraft, TaskEdit } from '../shared/protocol';
 import type { ChatViewProvider } from '../providers/ChatViewProvider';
@@ -427,17 +427,16 @@ export function handleNewSession(deps: Pick<PlanManagerDeps,
 export async function confirmPastGate(taskId: string, session: Pick<Session, 'mergeGate' | 'planState'>): Promise<boolean> {
   const unmerged = session.mergeGate(taskId);
   if (unmerged.length === 0) return true;
-  const named = unmerged.map((id) => {
-    const dep = session.planState?.tasks && flattenTasks(session.planState.tasks).find((t) => t.id === id);
-    return dep ? `#${dep.order} ${dep.title}` : id;
-  });
   const choice = await vscode.window.showWarningMessage(
-    `This task waits for Merge all: the work of ${named.join(', ')} is not merged into your branch yet, so it would act without it. Starting it now is kept on the task.`,
+    pastGateConfirmation(titledRefs(unmerged, session.planState?.tasks ?? [])),
     { modal: true },
     'Start anyway',
   );
   return choice === 'Start anyway';
 }
+
+/** The webview's names for the task row actions that end in a mark. */
+const ROW_ACTION: Record<string, TaskRowAction> = { skip: 'skip', markComplete: 'complete', markIncomplete: 'uncomplete' };
 
 export async function handleSystemCommand(
   command: string,
@@ -453,10 +452,10 @@ export async function handleSystemCommand(
       break;
     case 'skip':
     case 'markComplete':
-      await deps.session.markTaskComplete(taskId);
-      break;
     case 'markIncomplete':
-      await deps.session.markTaskIncomplete(taskId);
+      await (markRequestFor(ROW_ACTION[command]) === 'uncomplete'
+        ? deps.session.markTaskIncomplete(taskId)
+        : deps.session.markTaskComplete(taskId));
       break;
     case 'forceStart':
       if (!(await confirmPastGate(taskId, deps.session))) return;

@@ -1,4 +1,4 @@
-import { canSetDependencies, dependencyCandidates } from '@ordewell/core/plan-utils';
+import { canSetDependencies, dependencyCandidates, taskRef, titledTaskRef } from '@ordewell/core/plan-utils';
 import { assignedModelFor, effortsForTask, modelsForTask, modesForTask, runnerAccepts } from '../tui/taskAssignment';
 import type { TaskView } from '../tui/state';
 import type { ApiClient } from '../daemonClient';
@@ -40,7 +40,7 @@ export async function handleTaskRunner(subArgs: string[], injectedApi?: ApiClien
 
     const state = await api.getRunners();
     if (!runner) {
-      console.log(`\nRunner · #${task.order} ${task.title}\n`);
+      console.log(`\nRunner · ${titledTaskRef(task)}\n`);
       for (const r of state.runners) {
         console.log(`  ${r.id === task.assignedRunner ? '*' : ' '} ${r.id.padEnd(14)} ${r.name}${r.enabled ? '' : '  (not enabled for planning)'}`);
       }
@@ -57,7 +57,7 @@ export async function handleTaskRunner(subArgs: string[], injectedApi?: ApiClien
     // new runner's catalog. Naming a model here would race that derive and
     // could persist one the runner cannot spawn.
     await api.updateTask(sessionId, task.id, { assignedRunner: runner });
-    console.log(`Task #${task.order} runner set to ${runner} — its model, effort and mode were re-picked for it.`);
+    console.log(`Task ${taskRef(task)} runner set to ${runner} — its model, effort and mode were re-picked for it.`);
   });
 }
 
@@ -69,7 +69,7 @@ export async function handleTaskModel(subArgs: string[], injectedApi?: ApiClient
     const options = modelsForTask(catalog.models, task);
 
     if (!modelId) {
-      console.log(`\nModel · #${task.order} ${task.title}${task.assignedRunner ? ` (${task.assignedRunner})` : ''}\n`);
+      console.log(`\nModel · ${titledTaskRef(task)}${task.assignedRunner ? ` (${task.assignedRunner})` : ''}\n`);
       if (options.length === 0) console.log('  No models discovered for this runner — try `ordewell refresh`.');
       for (const m of options) {
         const detail = [m.provider, m.variants?.length ? `${m.variants.length} effort levels` : 'runner default effort']
@@ -96,7 +96,7 @@ export async function handleTaskModel(subArgs: string[], injectedApi?: ApiClient
       assignedModel,
       thinkingEffort: assignedModel.thinkingEffort ?? null,
     });
-    console.log(`Task #${task.order} model set to ${model.label}.`);
+    console.log(`Task ${taskRef(task)} model set to ${model.label}.`);
     if (task.assignedModel?.thinkingEffort && !assignedModel.thinkingEffort) {
       console.log(`  ${model.label} does not expose "${task.assignedModel.thinkingEffort}", so the effort went back to the runner default.`);
     }
@@ -112,7 +112,7 @@ export async function handleTaskEffort(subArgs: string[], injectedApi?: ApiClien
     const current = task.assignedModel?.thinkingEffort;
 
     if (!level) {
-      console.log(`\nThinking effort · #${task.order} ${task.title}\n`);
+      console.log(`\nThinking effort · ${titledTaskRef(task)}\n`);
       console.log(`  ${current ? ' ' : '*'} default        Let the executor choose`);
       for (const v of variants) {
         console.log(`  ${v.id === current ? '*' : ' '} ${v.id.padEnd(14)} ${v.label}`);
@@ -138,7 +138,7 @@ export async function handleTaskEffort(subArgs: string[], injectedApi?: ApiClien
       assignedModel: task.assignedModel ? { ...task.assignedModel, thinkingEffort } : undefined,
       thinkingEffort: thinkingEffort ?? null,
     });
-    console.log(`Task #${task.order} thinking effort set to ${thinkingEffort ?? 'runner default'}.`);
+    console.log(`Task ${taskRef(task)} thinking effort set to ${thinkingEffort ?? 'runner default'}.`);
   });
 }
 
@@ -150,7 +150,7 @@ export async function handleTaskMode(subArgs: string[], injectedApi?: ApiClient)
     const modes = modesForTask(catalog.modesByRunner, task);
 
     if (!mode) {
-      console.log(`\nMode · #${task.order} ${task.title}${task.assignedRunner ? ` (${task.assignedRunner})` : ''}\n`);
+      console.log(`\nMode · ${titledTaskRef(task)}${task.assignedRunner ? ` (${task.assignedRunner})` : ''}\n`);
       if (modes.length === 0) {
         console.log('  This task has no runner, or its runner declares no modes.');
       }
@@ -173,7 +173,7 @@ export async function handleTaskMode(subArgs: string[], injectedApi?: ApiClient)
     }
 
     await api.updateTask(sessionId, task.id, { taskMode: chosen.id });
-    console.log(`Task #${task.order} mode set to ${chosen.label}.`);
+    console.log(`Task ${taskRef(task)} mode set to ${chosen.label}.`);
   });
 }
 
@@ -184,13 +184,13 @@ export async function handleTaskDeps(subArgs: string[], injectedApi?: ApiClient)
     const candidates = dependencyCandidates(tasks, task.id);
 
     if (!value) {
-      console.log(`\nDependencies · #${task.order} ${task.title}\n`);
+      console.log(`\nDependencies · ${titledTaskRef(task)}\n`);
       if (candidates.length === 0) {
-        console.log(`  Nothing runs before #${task.order}, so it has no possible dependencies.`);
+        console.log(`  Nothing runs before ${taskRef(task)}, so it has no possible dependencies.`);
       }
       for (const c of candidates) {
         const chosen = task.dependencies.includes(c.id);
-        console.log(`  ${chosen ? '*' : ' '} ${c.id}  #${c.order} ${c.title}${c.status === 'completed' ? '  (already completed)' : ''}`);
+        console.log(`  ${chosen ? '*' : ' '} ${c.id}  ${titledTaskRef(c)}${c.status === 'completed' ? '  (already completed)' : ''}`);
       }
       console.log(`\n  * = current. ${DEPS_USAGE}`);
       return;
@@ -210,8 +210,8 @@ export async function handleTaskDeps(subArgs: string[], injectedApi?: ApiClient)
 
     await api.updateTask(sessionId, task.id, { dependencies });
     console.log(dependencies.length > 0
-      ? `Task #${task.order} now depends on ${dependencies.length} task${dependencies.length === 1 ? '' : 's'}.`
-      : `Task #${task.order} no longer depends on anything.`);
+      ? `Task ${taskRef(task)} now depends on ${dependencies.length} task${dependencies.length === 1 ? '' : 's'}.`
+      : `Task ${taskRef(task)} no longer depends on anything.`);
   });
 }
 
@@ -224,7 +224,7 @@ const OPS_USAGE = 'Usage: ordewell task-ops <task-id-or-order> [on|off] [--sessi
 export async function handleTaskOps(subArgs: string[], injectedApi?: ApiClient): Promise<void> {
   await withTask(subArgs, OPS_USAGE, injectedApi, async (api, sessionId, task, tasks, value) => {
     if (!value) {
-      console.log(`\n#${task.order} ${task.title} is ${task.ops ? 'an ops task: it runs in your checkout once the work it depends on is merged' : 'a change task: it runs in its own worktree'}.`);
+      console.log(`\n${titledTaskRef(task)} is ${task.ops ? 'an ops task: it runs in your checkout once the work it depends on is merged' : 'a change task: it runs in its own worktree'}.`);
       console.log(`\n  ${OPS_USAGE}`);
       return;
     }
@@ -235,7 +235,7 @@ export async function handleTaskOps(subArgs: string[], injectedApi?: ApiClient):
 
     await api.updateTask(sessionId, task.id, { ops: to === 'on' });
     console.log(to === 'on'
-      ? `Task #${task.order} is an ops task: it runs in your checkout once the work it depends on is merged.`
-      : `Task #${task.order} is a change task: it runs in its own worktree.`);
+      ? `Task ${taskRef(task)} is an ops task: it runs in your checkout once the work it depends on is merged.`
+      : `Task ${taskRef(task)} is a change task: it runs in its own worktree.`);
   });
 }

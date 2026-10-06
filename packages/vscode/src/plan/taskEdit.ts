@@ -1,4 +1,4 @@
-import { dependentsOf, flattenTasks } from '@ordewell/core';
+import { dependentsNotice, dependentsOf, flattenTasks, newTaskFields } from '@ordewell/core';
 import type { Task } from '@ordewell/core';
 import type { TaskDraft } from '../shared/protocol';
 
@@ -13,12 +13,8 @@ export function removalPrompt(tasks: readonly Task[], taskId: string): string {
   const all = flattenTasks(tasks);
   const title = all.find((t) => t.id === taskId)?.title;
   const question = title ? `Remove "${title}"?` : 'Remove this task?';
-  const dependents = dependentsOf(all, taskId);
-  if (dependents.length === 0) return question;
-
-  const named = dependents.map((t) => `#${t.order} ${t.title}`).join(', ');
-  const subject = dependents.length === 1 ? '1 task depends' : `${dependents.length} tasks depend`;
-  return `${question}\n\n${subject} on it and will lose that dependency: ${named}.`;
+  const notice = dependentsNotice(dependentsOf(all, taskId));
+  return notice ? `${question}\n\n${notice}` : question;
 }
 
 /**
@@ -27,13 +23,10 @@ export function removalPrompt(tasks: readonly Task[], taskId: string): string {
  * marker, and any assignment the form left blank) is the session's to derive.
  */
 export function taskFromDraft(draft: TaskDraft): Partial<Task> | null {
-  const title = draft.title.trim();
-  if (!title) return null;
+  const fields = newTaskFields(draft.title, draft.prompt);
+  if (!fields) return null;
   return {
-    title,
-    description: title,
-    prompt: draft.prompt?.trim() ? draft.prompt : title,
-    type: 'ai',
+    ...fields,
     dependencies: draft.dependencies.map(String),
     assignedRunner: draft.assignedRunner,
     assignedModel: draft.assignedModel,

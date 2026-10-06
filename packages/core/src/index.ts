@@ -108,6 +108,7 @@ export type {
 export { serializeTask, serializeTaskStatus, serializePlan, executionSummary, truncateCheckpointSummary, CHECKPOINT_TRUNCATE_LENGTH } from './services/SessionMessage';
 export { summarizeToolCall, classifyOutcome } from './services/researchStepSummary';
 export * from './conversation';
+export * from './taskRow';
 export { VerdictEngine } from './services/VerdictEngine';
 export type { VerdictListener, CheckpointListener } from './services/VerdictEngine';
 export * from './interfaces/TaskOutputSource';
