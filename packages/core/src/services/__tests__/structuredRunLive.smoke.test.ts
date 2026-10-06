@@ -80,11 +80,14 @@ describe.runIf(live)('structured run — live', () => {
       expect(first.verdict?.outcome).toBe('pass');
       expect(first.verdict?.checks.find((c) => c.name === 'completion_marker')?.passed).toBe(true);
       expect(first.transport).toMatchObject({ kind: 'structured', nativeSessionId: expect.any(String) });
-      expect(first.outputSummary?.logTail).toContain('PELICAN');
+      // The summary is whatever the runner's task_complete call reported
+      // (ADR-0022), worded by the model, so the run is checked by carrying it.
+      const summary = first.outputSummary?.logTail?.trim().split('\n')[0] ?? '';
+      expect(summary.length).toBeGreaterThan(0);
       await vi.waitFor(() => expect(exited(children[0])).toBe(true), { timeout: 10_000 });
 
       await vi.waitFor(() => expect(taskOf(session, 'live-2')?.status).toBe('completed'), { timeout: TIMEOUT_MS, interval: 500 });
-      expect(prompts.get('live-2')).toContain('PELICAN');
+      expect(prompts.get('live-2')).toContain(summary);
       await vi.waitFor(() => expect(children.every(exited)).toBe(true), { timeout: 10_000 });
     } finally {
       session.destroy();

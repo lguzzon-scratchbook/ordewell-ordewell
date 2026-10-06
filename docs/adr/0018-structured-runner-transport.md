@@ -2,8 +2,6 @@
 
 **Status:** accepted
 
-*Pending (2026-10-06):* [ADR-0023](0023-messages-reach-a-running-task.md) changes M1: a message reaches a running task at the runner's next step boundary instead of when the turn ends, with the turn-end queue as the fallback, and adds force send.
-
 A task's runner is a TUI in tmux (ADR-0007) or a headless one-shot process, and
 Ordewell talks to it through the screen and the keyboard. "Done" and
 checkpoints are found by scanning rendered PTY bytes (`VerdictEngine`,
@@ -81,12 +79,23 @@ protocol instead of a screen and a keyboard.
   and is paused while the task waits, on input, a checkpoint or an open
   approval (2026-10-03: approvals added, so a long one doesn't also read as
   idle). If a queued message is delivered as the
-  turn ends, the task stays `in_progress` with no flicker.
-- **Talking to a task (M1).** Ordewell owns the message queue. Messages are
-  shown as queued, can be removed, and are delivered when the turn ends.
+  turn ends, or the runner still owes one it was handed (M1), the task stays
+  `in_progress` with no flicker.
+- **Talking to a task (M1).** Ordewell owns the message queue. A message sent
+  while a turn runs is handed to the runner at once and reaches the model at
+  the runner's next step boundary — after the tool call in flight, inside the
+  same turn — where the runner supports it (Claude Code, Codex, OpenCode 1.x;
+  [ADR-0023](0023-messages-reach-a-running-task.md)). Otherwise, or when the
+  runner refuses or lets go of it, the message waits in the queue and opens
+  the next turn when this one ends. The queue shows each message as queued
+  (removable) or handed over (the runner has it; no longer removable) until
+  the runner reports it delivered; one that can no longer reach the runner is
+  reported undelivered, never dropped silently. *Force send* interrupts the
+  running tool call and delivers its message as the turn that replaces it.
   Interrupt is the runner's soft interrupt (Claude's `control_request`,
-  Codex's `turn/interrupt`), with kill-and-resume as the fallback; an
-  interrupted turn becomes "waiting for input".
+  Codex's `turn/interrupt`, OpenCode's abort), with kill-and-resume as the
+  fallback; an interrupted turn becomes "waiting for input" unless a forced
+  message follows.
   `session.write(text)` means "send as a user message", so checkpoint replies
   work unchanged. Clarifying questions are plain text for now: a task starts
   with `AskUserQuestion` disallowed, so the agent asks in prose and ends its
@@ -213,3 +222,4 @@ protocol instead of a screen and a keyboard.
 - 2026-10-01 — the Codex connector (#54).
 - 2026-10-02 — the OpenCode connector (#55); structured the default, terminal the fallback, tmux optional (#61).
 - 2026-10-04 — the OpenCode connector speaks the 2.x API as well as 1.x.
+- 2026-10-06 — M1 per ADR-0023: messages reach a running turn between tool calls, the turn-end queue as the fallback, force send.

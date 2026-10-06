@@ -1,9 +1,9 @@
 # 0023 — Messages reach a running task between tool calls
 
-**Status:** proposed — changes [ADR-0018](0018-structured-runner-transport.md) M1
+**Status:** accepted, implemented — changes [ADR-0018](0018-structured-runner-transport.md) M1
 
-A message sent to a structured task waits in Ordewell's queue until the
-runner's turn ends (ADR-0018, M1). That rule was written for a conversation of
+ADR-0018's M1 first had a message sent to a structured task wait in
+Ordewell's queue until the runner's turn ended. That rule was written for a conversation of
 short turns. A task is not one: it is usually a single long turn, from the
 prompt to `task_complete`. So "delivered when the turn ends" means "delivered
 when the task is over" — a correction sent five minutes into a ten-minute task
@@ -38,7 +38,11 @@ straight away.**
   to the model after the tool call in flight completes. Ordewell does not wait
   for the boundary itself — no runner exposes "between tool calls" as a moment
   a client can act in, and each one already queues and injects on its own
-  (see *Per runner*).
+  (see *Per runner*). Messages are offered one at a time, in the order they
+  were sent: the next goes once the runner has answered the last. A refusal
+  ends offering for that turn — the refused message and every one behind it
+  wait for the turn's end, so none overtakes another. Nothing is offered while
+  an interrupt is in flight.
 - **The runner's acknowledgement is the delivery (D3).** A message is
   *delivered* when the runner reports that the model has it — not when the
   write, POST or request succeeded. Each runner has its own evidence (below).
@@ -46,14 +50,30 @@ straight away.**
   removable (no runner can recall it), and owed a delivery.
 - **Fallback to the turn-end queue (D4).** A message goes to the turn-end
   queue when the adapter lacks the capability, when the runner refuses it
-  (Codex: no active turn, or a different one), or when the turn ends with the
-  message handed over but never acknowledged — it is then sent as the next
-  turn's message, so nothing handed over is lost. Turn-end delivery keeps
-  ADR-0018's W1 rule: the task stays `in_progress` with no flicker.
+  (Codex: no active turn, or a different one), when the runner reports that
+  the turn ended with the message handed over but never read (Codex and
+  OpenCode), or when kill-and-resume replaces the process that held it — it
+  is then sent as the next turn's message, so nothing handed over is lost.
+  Such a message is removable again. Turn-end delivery keeps ADR-0018's W1
+  rule: the task stays `in_progress` with no flicker.
 - **A turn that ends with a message owed does not wait for input (D5).** If a
   turn ends without the marker while a handed-over message is unacknowledged,
   the runner is about to work on it (or Ordewell is about to send it), so the
-  task does not become `awaiting_user` (W1) for that turn end.
+  task does not become `awaiting_user` (W1) for that turn end. A turn the
+  runner opens by itself for such a message is that message's turn, not
+  background work (ADR-0018, B1).
+- **Completion evidence waits for the messages (D6).** A completion signal —
+  the `task_complete` call or the marker — that arrives while a message is
+  still undelivered is held, not settled. If the turn then ends with nothing
+  left to deliver, the held verdict is published. If the message is read
+  mid-turn, or opens the next turn, the runner has been told something after
+  that evidence, so it is discarded and only what the runner reports from
+  then on counts; the summary handed to dependents restarts there too.
+- **Nothing is dropped silently (D7).** A message that can no longer reach
+  the runner — its process exited, the turn failed, or it was sent to a
+  session that has already ended — is reported *undelivered*
+  (`message_undelivered`), with its text, instead of disappearing from the
+  queue.
 
 ### The queue view and the task log
 
@@ -61,11 +81,14 @@ straight away.**
   messages not yet delivered: *queued* ones (removable, waiting for a turn to
   end on a runner without the capability) and *handed over* ones (not
   removable). Delivery removes the entry.
-- **Delivery is a task-log event (Q2).** A `message_delivered` event carries
-  the message id and where it landed: `mid_turn` (into the running turn) or
-  `turn_end` (as the message that opened a turn). The log shows the message
-  at the point the model read it, not where it was typed, and replays the
-  same way on reload (ADR-0018, P1). A forced message is marked as such.
+- **Delivery is a task-log event (Q2).** A message read inside the running
+  turn is a `message_delivered` event, logged where the model read it, not
+  where it was typed. A message delivered at a turn end is the `turn_start`
+  of the turn it opened, carrying its `messageId`. Handing over is
+  `message_handed_over`, a message back in the queue is `message_queued`
+  again, and one that never reaches the runner is `message_undelivered`
+  (D7). A forced message carries `forced` on its `message_queued` and
+  `turn_start`. All of it replays the same way on reload (ADR-0018, P1).
 
 ### Force send
 
@@ -74,6 +97,13 @@ straight away.**
   forced message as the turn that replaces it. The runners' interrupts are the
   ones ADR-0018 M1 already uses: Claude's `control_request` interrupt, Codex's
   `turn/interrupt`, OpenCode's abort, with kill-and-resume as the fallback.
+  With no turn running, force send is a plain send. A message still waiting in
+  Ordewell's queue can be force sent too; one already handed over cannot,
+  since the runner has it. The terminal transport refuses force send with the
+  reason. The surfaces: `ctrl-s` in the TUI task view (the composer text, or
+  the selected queued message when the composer is empty), *Send now* and
+  `Ctrl+Enter` in the VS Code task log, and `POST …/tasks/:task/messages/now`
+  and `…/messages/:id/now` on the daemon.
 - **The forced message goes first; the rest keep their order (F2).** Messages
   still in Ordewell's queue follow the forced one in the order they were sent.
   Messages already handed over to the runner are where the runners differ:
@@ -109,8 +139,13 @@ straight away.**
   `result` — delivery `turn_end`, and the adapter attributes that turn to the
   message instead of treating it as background work (ADR-0018, B1). The task
   spawn adds `--replay-user-messages`; the echo of a message is the only
-  signal that tells the two cases apart. Its first prompt is echoed too, and
-  is not a delivery.
+  signal that tells the two cases apart. Each steer is written under a fresh
+  `uuid`, and the echo carrying it is the delivery; the first prompt is echoed
+  too, carries no steer's `uuid`, and is not a delivery. The CLI never lets go
+  of a message it was handed — after an interrupt too, the message runs in
+  the next turn — so a Claude Code steer is never dropped. A steer is refused
+  while an interrupt is in flight, and before the CLI's `init` shows a
+  `--resume` was taken up (a refused resume closes stdin).
 - **Codex.** `turn/steer` answers `{turnId}` at once; that is acceptance, not
   delivery. The `userMessage` item appears after the item in flight completes.
   A steer before the turn id is known is refused (the request needs a string
@@ -119,12 +154,22 @@ straight away.**
   after the turn ended is refused with `no active turn to steer`, and a wrong
   id with `expected active turn id …` — both fall back to the turn-end queue.
   The existing deny-note steer (ADR-0018, Codex approvals) is the same call.
+  An accepted steer still unread when the turn ends is reported dropped and
+  re-sent from the queue (D4).
 - **OpenCode 1.x.** A `prompt_async` while busy returns 204 and stores the user
   message at once (`message.updated`, role `user`) — storage, not delivery.
   The session's loop reads it at its next step, including when the step in
   flight was the model's final text: the loop runs one more step instead of
   going idle. So the busy period simply continues, and the turn ends at the
-  next idle as today.
+  next idle as today. A steer posts `prompt_async` under a `messageID`
+  Ordewell generates, to the task's root session only; an assistant message
+  in that session parented on it, or on a message handed over after it, is
+  the delivery. With no turn running the adapter refuses the steer. One whose
+  turn went idle unread is deleted from the session
+  (`DELETE /session/:id/message/:messageID`) and reported dropped, so the
+  turn-end re-send does not show the model the message twice.
+- **OpenCode 2.x.** Its adapter refuses every steer, so messages keep the
+  turn-end queue until a mid-turn path is verified on a 2.x server.
 
 ### The supervisor
 
@@ -220,17 +265,27 @@ interrupt (D4 covers it either way).
 
 ## Consequences
 
-- The structured capability's `sendMessage` changes meaning: "handed over now,
+- The structured capability's `sendMessage` means "handed over now,
   delivered at the next step" on a capable adapter, "queued until the turn
-  ends" otherwise. `queued()` reports both states; `removeQueued` refuses a
-  handed-over message.
-- The Claude task spawn adds `--replay-user-messages`, and the adapter learns
-  to read echoes as deliveries and to attribute a turn the CLI starts for a
-  queued message to that message.
-- The Codex adapter steers task messages with a `clientUserMessageId` and
-  re-sends any it never saw acknowledged.
-- ADR-0018 carries a *Pending* line naming this ADR until M1 is rewritten.
+  ends" otherwise. `queued()` reports both states and marks forced messages;
+  `removeQueued` and `forceSendQueued` refuse a handed-over message.
+  `forceSend` and `forceSendQueued` join the capability.
+- A task-mode adapter's `steer(id, text)` is optional and answers whether the
+  runner accepted the message; delivery and a drop come back as adapter
+  events (`message_delivered`, `message_dropped`).
+- The Claude task spawn adds `--replay-user-messages`; the adapter reads
+  echoes as deliveries and attributes a turn the CLI starts for a queued
+  message to that message. Tests that play transcripts recorded without the
+  flag keep the turn-end queue.
+- The Codex adapter steers task messages with a `clientUserMessageId`
+  through the same helper as the deny note, re-sends any it never saw
+  delivered, and drops the late report of a command an interrupt left
+  running (F4).
+- `VerdictEngine` holds completion evidence while a message is undelivered,
+  and voids it when a message is read (D6).
+- ADR-0018's M1 states this decision.
 
 ## History
 
 - 2026-10-06 — proposed, with the per-runner probe above (Claude Code 2.1.291, Codex 0.160.0, OpenCode 1.18.34).
+- 2026-10-06 — accepted and implemented on Claude Code, Codex and OpenCode 1.x, force send on every surface; OpenCode 2.x keeps the turn-end queue. ADR-0018 M1 rewritten.
