@@ -357,13 +357,13 @@ describe('TaskOrchestrator', () => {
     it('no-ops on a task that is not completed', async () => {
       const orchestrator = makeOrchestrator();
       orchestrator.loadPlan([
-        createTask({ id: 't1', order: 1, title: 'AI Task', prompt: 'do', status: 'in_progress' }),
+        createTask({ id: 't1', order: 1, title: 'AI Task', prompt: 'do', status: 'awaiting_user' }),
       ]);
 
       await orchestrator.markTaskIncomplete('t1');
       await orchestrator.markTaskIncomplete('nope');
 
-      expect(orchestrator.storeInstance.get('t1')!.status).toBe('in_progress');
+      expect(orchestrator.storeInstance.get('t1')!.status).toBe('awaiting_user');
     });
 
     it('holds the un-marked task so a running plan does not immediately respawn it', async () => {

@@ -2,6 +2,7 @@ import * as path from 'path';
 import type {
   IsolationHandoff,
   IsolationLandedTask,
+  IsolationRemoval,
   IsolationRepo,
   IsolationRun,
   IsolationTaskRecord,
@@ -20,6 +21,18 @@ export function integrationBranchFor(runId: string): string {
 
 export function repoRootOf(workspaceRoot: string, repoPath: string): string {
   return path.join(workspaceRoot, repoPath);
+}
+
+/** A removal that kept nothing back. */
+export function noRemoval(): IsolationRemoval {
+  return { preserved: [], refused: [] };
+}
+
+/** Add what `from` kept back to `into`. */
+export function absorbRemoval(into: IsolationRemoval, from: IsolationRemoval): IsolationRemoval {
+  into.preserved.push(...from.preserved);
+  into.refused.push(...from.refused);
+  return into;
 }
 
 /** The group a run isolates, as the planner is told it. */

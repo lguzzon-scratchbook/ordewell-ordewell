@@ -360,6 +360,11 @@ describe.skipIf(!hasGit)('isolated execution over a folder of three repositories
       expect(git(roots[r], 'status', '--porcelain'), r).toBe('');
     }
     expect(existsSync(join(dir, '.ordewell', 'worktrees', runId))).toBe(false);
+    // What the conflicted task did never landed anywhere, so it is kept on a branch of its own.
+    const kept = `ordewell-preserved/${runId}/3-rename-across-api-and-web`;
+    expect(git(roots.api, 'show', `${kept}:api.txt`)).toBe('api by t3');
+    expect(git(roots.web, 'show', `${kept}:web.txt`)).toBe('web by t3');
+    expect(git(roots.infra, 'branch', '--list', 'ordewell-preserved/*')).toBe('');
     // The loose file was never isolated, so discarding the run cannot take the edit back.
     expect(readFileSync(join(dir, 'NOTES.md'), 'utf8')).toBe('notes\nt1 was here\n');
     expect(readFileSync(join(roots.api, '.env'), 'utf8')).toBe('API_KEY=local\n');

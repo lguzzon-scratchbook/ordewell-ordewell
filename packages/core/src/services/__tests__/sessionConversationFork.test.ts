@@ -89,9 +89,11 @@ describe('Session.forkConversation', () => {
     expect(reset).not.toHaveBeenCalled();
   });
 
-  it('carries no run: in-flight and checkpointed tasks become pending, finished ones keep their outcome, queued edits stay behind', () => {
+  it('carries no run: in-flight and checkpointed tasks become pending, finished ones keep their outcome, queued edits stay behind', async () => {
     const session = makeSession();
     session.loadPlan(runningPlan(), GOAL, workspace, { sessionId: 'session-original', persist: false });
+    // Loaded, it has nothing running it; started, it is in flight.
+    await session.forceStartTask('running');
     saves(session).mockImplementation(sessionStore.saveSession);
 
     const fork = session.forkConversation();

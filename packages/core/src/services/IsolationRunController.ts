@@ -6,11 +6,14 @@ import type {
   IsolationInactiveReason,
   IsolationMergeResult,
   IsolationOutcome,
+  IsolationRemoval,
   IsolationRun,
   IsolationTaskRecord,
+  IsolationTaskRef,
   IsolationView,
   IWorktreeIsolation,
   PlanIsolation,
+  PreservedWork,
   RepairEvidence,
   RepoGroupLayout,
   TaskIsolation,
@@ -55,6 +58,12 @@ export interface IsolationRunControllerDeps {
   notifications: INotification;
   workspaceRoot: () => string;
   listener: IsolationRunListener;
+  /**
+   * The tasks no clean-up of the whole run may take a worktree from: an
+   * attempt is running them, or the plan has them in progress or waiting on
+   * the user mid-attempt.
+   */
+  liveTasks: () => ReadonlySet<string>;
 }
 
 type SharedRootReason = Exclude<IsolationInactiveReason, 'dirty'>;
@@ -77,6 +86,29 @@ function sharedRootNotice(reason: SharedRootReason, repos: string[]): string {
         : `The repository has no commits yet — ${SHARED_ROOT_TAIL}`;
     case 'not-git': return `Not a git repository — ${SHARED_ROOT_TAIL}`;
   }
+}
+
+const quoted = (tasks: readonly IsolationTaskRef[]): string => {
+  const titles = tasks.map((t) => `"${t.title}"`);
+  return titles.length > 1 ? `${titles.slice(0, -1).join(', ')} and ${titles.at(-1)}` : titles.join('');
+};
+
+/** Tasks as the subject of a sentence: `Task "A"`, `Tasks "A" and "B"`. */
+const tasksNamed = (tasks: readonly IsolationTaskRef[]): string => `${tasks.length === 1 ? 'Task' : 'Tasks'} ${quoted(tasks)}`;
+
+/** What one removal kept on a branch, and how to get it back. */
+function preservedNotice(kept: PreservedWork[]): string {
+  const [first] = kept;
+  const where = kept.some((k) => k.repo !== SELF_REPO) ? ` in ${kept.map((k) => `${k.repo} (${k.commit.slice(0, 7)})`).join(', ')}` : ` (${first.commit.slice(0, 7)})`;
+  const owner = first.task ? `Task "${first.task.title}"` : 'A leftover task workspace no record accounted for';
+  return `${owner} had work that never landed, so before its worktree was removed it was kept on branch ${first.branch}${where}. `
+    + `\`git log ${first.branch}\` shows it; merge or cherry-pick it to bring it back, and delete the branch once you no longer need it.`;
+}
+
+/** A worktree a removal left alone, and what the user can do with it. */
+function refusedNotice(worktree: string, reason: string, task?: IsolationTaskRef): string {
+  return `Left ${task ? `the worktree of task "${task.title}"` : 'a leftover worktree'} in place at ${worktree}: it holds work Ordewell could not keep (${reason}). `
+    + `Save what you need from it, then remove it with \`git worktree remove --force ${worktree}\`.`;
 }
 
 /** What a new run shares live instead of isolating, as one line; null when it shares nothing. */
@@ -115,6 +147,7 @@ export class IsolationRunController {
   private readonly notifications: INotification;
   private readonly workspaceRoot: () => string;
   private readonly listener: IsolationRunListener;
+  private readonly liveTasks: () => ReadonlySet<string>;
 
   private run: IsolationRun | null = null;
   /** Copied paths already reported for the current run: every task gets the same copies. */
@@ -139,6 +172,7 @@ export class IsolationRunController {
     this.notifications = deps.notifications;
     this.workspaceRoot = deps.workspaceRoot;
     this.listener = deps.listener;
+    this.liveTasks = deps.liveTasks;
   }
 
   /** The plan's run record, open or not; null when the plan has not isolated. */
@@ -201,12 +235,13 @@ export class IsolationRunController {
     this.resolvers = { ...(state?.resolvers ?? {}) };
     if (!this.run) return;
     try {
-      const { kept } = await this.isolation.pruneOrphans(this.run);
+      const pruned = await this.isolation.pruneOrphans(this.run);
       // Never silently: work kept back from the sweep has to be named, or the
       // user has a worktree they do not know about and a task that looks done.
-      for (const task of kept) {
+      for (const task of pruned.kept) {
         this.tell('warn', `Task "${task.title}" was still holding unlanded work when this plan was re-opened, so its worktree and branch were kept. Retry it to land the work, or review it by hand.`);
       }
+      this.report(pruned);
     } catch (err) {
       this.tell('warn', `Could not prune leftover worktrees: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -298,8 +333,9 @@ export class IsolationRunController {
   }
 
   private async prepareCwd(task: Task, run: IsolationRun): Promise<{ cwd: string; worktree: boolean }> {
-    const { cwd, copied } = await this.isolation.prepare(task, run);
+    const { cwd, copied, preserved } = await this.isolation.prepare(task, run);
     this.reportCopies(copied);
+    if (preserved) this.report({ preserved, refused: [] });
     return { cwd, worktree: true };
   }
 
@@ -336,7 +372,7 @@ export class IsolationRunController {
     if (!run?.tasks[taskId]) return;
     if (!opts.keep) this.listener.releasing([taskId]);
     try {
-      await this.isolation.release(run, taskId, opts);
+      this.report(await this.isolation.release(run, taskId, opts));
     } catch (err) {
       this.notifications.warn(`Could not clean up the worktree of task ${taskId}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -470,31 +506,80 @@ export class IsolationRunController {
     return result;
   }
 
-  /** Worktrees and task branches go; the integration branch and the record stay for review and merge. */
+  /**
+   * Worktrees and task branches go; the integration branch and the record stay
+   * for review and merge. Refused while a task of the run is still live.
+   */
   async cleanup(): Promise<void> {
     const run = this.requireRun();
+    this.refuseWhileLive(run);
     this.listener.releasing(Object.keys(run.tasks));
-    await this.isolation.discard(run, { integration: 'keep' });
+    this.report(await this.isolation.discard(run, { integration: 'keep' }));
     this.listener.changed();
   }
 
-  /** The run and everything it made go, and the plan forgets it; the next run starts afresh. */
+  /**
+   * The run and everything it made go, and the plan forgets it; the next run
+   * starts afresh. Refused while a task of the run is still live.
+   */
   async discard(): Promise<void> {
     const run = this.requireRun();
+    this.refuseWhileLive(run);
     this.listener.releasing(Object.keys(run.tasks));
-    await this.isolation.discard(run, { integration: 'delete' });
+    this.report(await this.isolation.discard(run, { integration: 'delete' }));
     this.forget();
   }
 
+  /** The records of tasks still live, whose worktrees no clean-up of the whole run may take. */
+  private liveRecords(run: IsolationRun): IsolationTaskRecord[] {
+    const live = this.liveTasks();
+    return Object.values(run.tasks).filter((r) => live.has(r.taskId));
+  }
+
+  private refuseWhileLive(run: IsolationRun): void {
+    const live = this.liveRecords(run);
+    if (live.length === 0) return;
+    const one = live.length === 1;
+    throw new PlanEditError(`${tasksNamed(live)} ${one ? 'is' : 'are'} still running or waiting on you, so ${one ? 'its worktree stays' : 'their worktrees stay'}. Let ${one ? 'it' : 'them'} finish, or retry or mark ${one ? 'it' : 'them'} complete, first.`);
+  }
+
+  /**
+   * Clear a settled run up once everything it landed is merged — and only
+   * when nothing else is left in it: a live task, or a worktree holding work
+   * that never landed, keeps the whole run, worktrees and branches, rather
+   * than leaving that work to a deletion.
+   */
   private async clearMerged(run: IsolationRun): Promise<void> {
+    const live = this.liveRecords(run);
+    const unlanded = Object.values(run.tasks).filter((r) => r.status !== 'merged' && !live.includes(r));
+    if (live.length > 0 || unlanded.length > 0) {
+      const why = [
+        ...(live.length > 0 ? [`${tasksNamed(live)} ${live.length === 1 ? 'is' : 'are'} still running or waiting on you`] : []),
+        ...(unlanded.length > 0 ? [`${tasksNamed(unlanded)} ${unlanded.length === 1 ? 'holds' : 'hold'} work that has not landed`] : []),
+      ];
+      const one = live.length + unlanded.length === 1;
+      this.tell('info', `The run is not cleared up: ${why.join(', and ')}, so ${one ? 'its worktree stays' : 'their worktrees stay'}, and so do the run's branches.`);
+      return;
+    }
     this.listener.releasing(Object.keys(run.tasks));
     try {
-      await this.isolation.discard(run, { integration: 'delete-merged' });
+      this.report(await this.isolation.discard(run, { integration: 'delete-merged' }));
     } catch (err) {
       this.tell('warn', `Merged, but could not clean up the run's worktrees and branches: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
     this.forget();
+  }
+
+  /** Say what a removal kept back instead of deleting: where the work went, or which worktree stayed. */
+  private report(removal: IsolationRemoval): void {
+    const byOwner = new Map<string, PreservedWork[]>();
+    for (const kept of removal.preserved) {
+      const key = kept.task?.taskId ?? `${kept.repo}:${kept.branch}`;
+      byOwner.set(key, [...(byOwner.get(key) ?? []), kept]);
+    }
+    for (const kept of byOwner.values()) this.tell('warn', preservedNotice(kept));
+    for (const { worktree, reason, task } of removal.refused) this.tell('warn', refusedNotice(worktree, reason, task));
   }
 
   private forget(): void {
@@ -585,11 +670,15 @@ export class IsolationRunController {
    */
   private async mint(root: string): Promise<void> {
     const previous = this.run;
-    if (previous) {
+    const live = previous ? this.liveRecords(previous) : [];
+    if (previous && live.length > 0) {
+      this.tell('warn', `The last run's worktrees are left in place: ${tasksNamed(live)} ${live.length === 1 ? 'is' : 'are'} still running or waiting on you there.`);
+    } else if (previous) {
       const landed = Object.values(previous.tasks).some((r) => r.status === 'merged');
-      await this.isolation.discard(previous, { integration: landed ? 'delete-merged' : 'delete' }).catch(() => undefined);
-      this.run = null;
+      const removal = await this.isolation.discard(previous, { integration: landed ? 'delete-merged' : 'delete' }).catch(() => null);
+      if (removal) this.report(removal);
     }
+    this.run = null;
     this.run = await this.isolation.startRun(root);
     this.resolvers = {};
     this.reportedCopies.clear();

@@ -105,13 +105,13 @@ export function runHandoffAction(state: TuiState, id: HandoffActionId): Step {
             ? {
               kind: 'confirm',
               title: 'Merge all into your branches?',
-              message: `Merge ${handoffBranch(handoff)} into whatever each of ${reposWithWork(handoff).join(', ')} has checked out. Ordewell never does this on its own. It checks every repository first and merges none unless every repository can take it; on git older than 2.38 it goes repository by repository and stops at the first that fails. A merge that conflicts is aborted, and your trees stay as they were. Once every repository has merged, the run's worktrees and branches are removed.${repairedNotice(handoff)}`,
+              message: `Merge ${handoffBranch(handoff)} into whatever each of ${reposWithWork(handoff).join(', ')} has checked out. Ordewell never does this on its own. It checks every repository first and merges none unless every repository can take it; on git older than 2.38 it goes repository by repository and stops at the first that fails. A merge that conflicts is aborted, and your trees stay as they were. Once every repository has merged, the run's worktrees and branches are removed — unless a task still has work in its worktree that has not landed: then the run stays, and so does that work.${repairedNotice(handoff)}`,
               action: { kind: 'merge-run' },
             }
             : {
               kind: 'confirm',
               title: 'Merge into your branch?',
-              message: `Merge ${handoffBranch(handoff)} into whatever you have checked out. Ordewell never does this on its own. If it conflicts the merge is aborted and your tree stays as it was. Once it has merged, the run's worktrees and branches are removed.${repairedNotice(handoff)}`,
+              message: `Merge ${handoffBranch(handoff)} into whatever you have checked out. Ordewell never does this on its own. If it conflicts the merge is aborted and your tree stays as it was. Once it has merged, the run's worktrees and branches are removed — unless a task still has work in its worktree that has not landed: then the run stays, and so does that work.${repairedNotice(handoff)}`,
               action: { kind: 'merge-run' },
             },
         },

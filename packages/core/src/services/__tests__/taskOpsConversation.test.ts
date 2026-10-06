@@ -873,9 +873,8 @@ describe('rearm — task_ops conversation turn', () => {
         reset: vi.fn(),
       },
     });
-    const plan = failedRunPlan();
-    plan.tasks[0].status = 'in_progress';
-    session.loadPlan(plan, 'build it', testWorkspace, { persist: false });
+    session.loadPlan(failedRunPlan(), 'build it', testWorkspace, { persist: false });
+    await session.forceStartTask('a');
 
     const result = await session.continueConversation('fix task a and try again');
 

@@ -233,6 +233,11 @@ export class TaskOrchestrator {
    * task whose spawn always throws.
    */
   private onHold = new Set<string>();
+  /**
+   * Tasks Mark complete is landing after it ended their attempt: in progress
+   * with no attempt for as long as that takes, and not orphans for it.
+   */
+  private completing = new Set<string>();
 
   /**
    * The plan's isolation run and the open run's lifecycle (ADR-0013); see
@@ -319,6 +324,7 @@ export class TaskOrchestrator {
         notice: (level, message) => orchestrator.emit('onIsolationNotice', { level, message }),
         releasing: (taskIds) => { for (const taskId of taskIds) orchestrator.lingering.close(taskId); },
       },
+      liveTasks: (): ReadonlySet<string> => orchestrator.liveTaskIds(),
     });
     const landing = new Landing({ runs, config: options.config, tasks: store });
     const orchestrator = new TaskOrchestrator({
@@ -649,6 +655,7 @@ export class TaskOrchestrator {
     this.retryCounts.clear();
     this.spawnCounts.clear();
     this.onHold.clear();
+    this.recoverOrphans();
   }
 
   /**
@@ -714,14 +721,77 @@ export class TaskOrchestrator {
     this.terminalRunner.stopAll();
     // Interrupted work is kept like a failed attempt's: inspectable, and off
     // `active` so a crash-recovery prune does not sweep it away. A stopped
-    // repair did not land, so its task waits on the user as its conflict did.
+    // repair did not land, so its task waits on the user as its conflict did;
+    // every other stopped task is back to not started, as a cancel leaves it.
+    // Left in progress, it would read as running with nothing behind it — and
+    // its kept worktree as work a finished run could clear up.
+    const stopped: TaskAttempt[] = [];
     for (const a of this.endAllAttempts('stop')) {
       if (a.kind.kind === 'repair') this.store.markAwaitingUser(a.taskId, 'conflict');
+      else if (this.store.get(a.taskId)) {
+        this.store.markPending(a.taskId);
+        stopped.push(a);
+      }
       if (a.worktree) void this.runs.release(a.taskId, { keep: true }, a.integration);
     }
     this.runs.interrupt();
     this.onHold.clear();
+    this.sayStopped(stopped);
+    this.recoverOrphans();
     this.emit('onTaskChanged');
+  }
+
+  /** Name the tasks a stop took down, so none is mistaken for one still at work. */
+  private sayStopped(stopped: readonly TaskAttempt[]): void {
+    if (stopped.length === 0) return;
+    const one = stopped.length === 1;
+    const named = quotedTitles(stopped.map((a) => this.store.get(a.taskId)?.title ?? a.taskId));
+    const kept = stopped.some((a) => a.worktree)
+      ? ` What ${one ? 'it' : 'they'} did is kept in ${one ? 'its worktree' : 'their worktrees'}: Mark complete lands it; Retry starts over and keeps it on a branch.`
+      : '';
+    this.tell('info', `Stopped ${named} — back to not started.${kept}`);
+  }
+
+  /**
+   * A task in progress with no attempt has nothing running it: a stop, a plan
+   * load or anything else that ended its attempt left its status behind. It
+   * is put back to not started, and said, so it can be retried rather than
+   * read as running — or, in an isolated run, count as live work forever.
+   */
+  private recoverOrphans(): void {
+    const orphans = this.store.allTasks.filter((t) => t.type === 'ai' && t.status === 'in_progress' && !this.attempts.has(t.id) && !this.completing.has(t.id));
+    if (orphans.length === 0) return;
+    for (const t of orphans) this.store.markPending(t.id);
+    const one = orphans.length === 1;
+    const titles = quotedTitles(orphans.map((t) => t.title));
+    this.tell('warn', `${one ? 'Task' : 'Tasks'} ${titles} ${one ? 'was' : 'were'} shown as running, but nothing was running ${one ? 'it' : 'them'} — back to not started. Retry or force-start ${one ? 'it' : 'them'}; a worktree ${one ? 'it' : 'they'} had is kept.`);
+    this.emit('onTaskChanged');
+  }
+
+  /**
+   * Task ids still live, whose worktrees no clean-up of the whole run may
+   * take: an attempt is running them, or the plan has them in progress or
+   * waiting on the user mid-attempt — at a checkpoint, or for input. One
+   * waiting on the user's decision instead (a conflict, a usage limit, files
+   * an ops task changed) is not: no runner is at work on it, and a clean-up
+   * keeps what it holds on a branch before its worktree goes.
+   */
+  private liveTaskIds(): Set<string> {
+    const live = new Set(this.attempts.keys());
+    for (const t of this.store.allTasks) {
+      const midAttempt = t.status === 'awaiting_user' && (t.awaitingReason === 'checkpoint' || t.awaitingReason === 'input');
+      if (t.status === 'in_progress' || midAttempt) live.add(t.id);
+    }
+    return live;
+  }
+
+  /**
+   * Whether the run may close with its handoff: no task is live. A handoff
+   * tells the user the run has finished, and a Merge all after it clears the
+   * run up, so neither may happen under a task the plan still shows at work.
+   */
+  private get settled(): boolean {
+    return this.liveTaskIds().size === 0;
   }
 
   async onUserTaskComplete(taskId: string): Promise<void> {
@@ -795,7 +865,7 @@ export class TaskOrchestrator {
       if (this.attempts.size === 0) {
         if (this.store.isAllComplete()) this.planStatus = 'completed';
         this.emit('onTick');
-        await this.runs.close();
+        if (this.settled) await this.runs.close();
         this.emit('onExecutionComplete');
       }
       return;
@@ -948,6 +1018,8 @@ export class TaskOrchestrator {
     if (phase === 'running' || phase === 'integrating') await this.cancelAttempt(taskId, { keep: false });
     else {
       this.endAttempt(taskId, 'release');
+      // Not left in progress while its worktree goes: it is leaving the plan, not running.
+      if (this.store.get(taskId)?.status === 'in_progress') this.store.markPending(taskId);
       await this.runs.release(taskId, { keep: false });
     }
     this.onHold.delete(taskId);
@@ -963,7 +1035,13 @@ export class TaskOrchestrator {
     const verdict = this.verifier.markComplete(task);
     // The user vouches for the work, so it lands the way a passed verdict's
     // would — including a landing a passed verdict already has in flight.
-    const landing = await (ended?.integration ?? this.landing.landVouched(task));
+    this.completing.add(taskId);
+    let landing: LandingOutcome;
+    try {
+      landing = await (ended?.integration ?? this.landing.landVouched(task));
+    } finally {
+      this.completing.delete(taskId);
+    }
 
     if (completesTask(landing)) this.store.markCompleted(taskId);
     else this.settleUnlanded(task, landing);
@@ -1147,12 +1225,13 @@ export class TaskOrchestrator {
   getPlanVisualization() { return this.store.getPlanVisualization(); }
 
   async tick(): Promise<void> {
+    this.recoverOrphans();
     if (!this.running) {
       // A run the scheduler is not driving — a manual task run, or a halted
       // plan's remaining attempts — is closed by a verdict only. Ended by
       // cancel, Mark complete or a failed spawn instead, it would stay open, and
       // the next run would inherit its mode rather than decide its own.
-      if (this.attempts.size === 0 && this.runs.isOpen) await this.runs.close();
+      if (this.attempts.size === 0 && this.runs.isOpen && this.settled) await this.runs.close();
       return;
     }
 
@@ -1352,11 +1431,13 @@ export class TaskOrchestrator {
         return false;
       }
       this.endAttempt(task.id, 'spawn-failed');
+      // Each way out settles the task's status before it awaits anything, so
+      // no tick in between finds it in progress with no attempt.
       if (attempt.kind.kind === 'continuation') {
-        await this.runs.release(task.id, { keep: false });
         const reason = unresumedMessage(task, `could not start: ${err instanceof Error ? err.message : String(err)}`);
         this.store.markFailed(task.id);
         this.store.setTaskOutputSummary(task.id, summarizeOutput(reason, ''));
+        await this.runs.release(task.id, { keep: false });
         this.notifications.error(reason);
         this.emit('onTaskSettled', { taskId: task.id });
         this.emit('onTaskChanged');
@@ -1364,17 +1445,18 @@ export class TaskOrchestrator {
         return false;
       }
       if (attempt.kind.kind === 'repair') {
+        this.store.markAwaitingUser(task.id, 'conflict');
         this.settleUnlanded(task, await this.landing.unrepaired(task, `could not start: ${err instanceof Error ? err.message : String(err)}`));
         this.emit('onTaskSettled', { taskId: task.id });
         this.emit('onTaskChanged');
         await this.tick();
         return false;
       }
-      await this.runs.release(task.id, { keep: false });
       // Couldn't spawn — the task was never executed, so it stays "to do".
       // Held out of auto-scheduling to avoid a spawn-throw retry loop.
       this.store.markPending(task.id);
       this.onHold.add(task.id);
+      await this.runs.release(task.id, { keep: false });
       this.tell('error', `Failed to start task "${task.title}": ${err}`);
       this.emit('onTaskChanged');
       await this.tick();
@@ -1493,6 +1575,12 @@ export class TaskOrchestrator {
 
 /** How much of an ops task's last attempt the next one is shown. */
 const OPS_RETRY_TAIL_LINES = 60;
+
+/** `"A"`, `"A" and "B"`, `"A", "B" and "C"`. */
+function quotedTitles(titles: readonly string[]): string {
+  const quoted = titles.map((t) => `"${t}"`);
+  return quoted.length > 1 ? `${quoted.slice(0, -1).join(', ')} and ${quoted.at(-1)}` : quoted.join('');
+}
 
 function unresumedMessage(task: Task, why: string): string {
   return `Could not continue task "${task.title}": ${why}. Retry starts it afresh.`;

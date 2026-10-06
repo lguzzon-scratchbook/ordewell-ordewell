@@ -300,6 +300,45 @@ export interface PreparedTask {
    * stay in the task, so the user is told.
    */
   copied: string[];
+  /** What the attempt this one replaces left unlanded, kept on a branch before its worktree went; absent when nothing was. */
+  preserved?: PreservedWork[];
+}
+
+/** A task as a removal names it. */
+export type IsolationTaskRef = Pick<IsolationTaskRecord, 'taskId' | 'order' | 'title'>;
+
+/**
+ * Work a removal found that had not landed — edits never committed, or
+ * commits only the task's branch carried — committed and kept on `branch`,
+ * a branch of its own under `ordewell-preserved/`, before the worktree went.
+ */
+export interface PreservedWork {
+  /** Absent for a leftover directory no task record owned. */
+  task?: IsolationTaskRef;
+  repo: string;
+  branch: string;
+  /** The commit `branch` points at. */
+  commit: string;
+}
+
+/** A worktree a removal left in place, because the work in it could not be kept any other way. */
+export interface RefusedRemoval {
+  /** Absent for a leftover directory no task record owned. */
+  task?: IsolationTaskRef;
+  worktree: string;
+  /** What stopped git keeping it, in words a surface can repeat. */
+  reason: string;
+}
+
+/**
+ * What removing task worktrees did in place of deleting work. A removal never
+ * deletes work that has not landed: it keeps it on a branch first
+ * (`preserved`), and where it cannot, it leaves that worktree alone
+ * (`refused`) — so the record of a refused task stays too.
+ */
+export interface IsolationRemoval {
+  preserved: PreservedWork[];
+  refused: RefusedRemoval[];
 }
 
 /**
@@ -307,8 +346,8 @@ export interface PreparedTask {
  * `active` yet still held unlanded work, so the prune kept them as `kept`
  * rather than deleting work no one else has.
  */
-export interface IsolationPruneResult {
-  kept: Array<{ taskId: string; order: number; title: string }>;
+export interface IsolationPruneResult extends IsolationRemoval {
+  kept: IsolationTaskRef[];
 }
 
 /**
@@ -384,14 +423,16 @@ export interface IWorktreeIsolation {
 
   /**
    * `keep: false` removes the task's worktree, branch and record (retry, task
-   * removal). `keep: true` leaves the worktree and branch exactly as they are
+   * removal), keeping whatever had not landed on a branch first; a record
+   * whose work cannot be kept stays, off `active`. `keep: true` leaves the
+   * worktree and branch exactly as they are
    * for inspection — a failed verdict, a stop, a cancel — and only moves the task off `active`,
    * so a crash-recovery prune does not sweep it away; a repair it ends leaves
    * the task `conflict`, as it was before the repair. Takes the run rather than
    * a bare task id: ids are only unique within one plan, and one daemon serves
    * many (ADR-0007).
    */
-  release(run: IsolationRun, taskId: string, opts: { keep: boolean }): Promise<void>;
+  release(run: IsolationRun, taskId: string, opts: { keep: boolean }): Promise<IsolationRemoval>;
 
   /** End of run: park the integration branch for review and report what landed. */
   handoff(run: IsolationRun): Promise<IsolationHandoff>;
@@ -403,7 +444,8 @@ export interface IWorktreeIsolation {
    * that still holds unlanded work — commits its branch alone carries, or
    * edits in its worktree — is not a crash orphan: it may belong to a runner
    * another host is still driving, so it is kept as `kept` and named in the
-   * result.
+   * result. A leftover directory holding work is kept on a branch before it
+   * goes, as {@link release} does.
    */
   pruneOrphans(run: IsolationRun): Promise<IsolationPruneResult>;
 
@@ -447,9 +489,10 @@ export interface IWorktreeIsolation {
   /**
    * Remove every worktree and task branch of the run, and settle each repo's
    * integration branch as `integration` says. Anything but `keep` also clears
-   * the run's task records.
+   * the run's task records, except those of worktrees it refused to remove.
+   * Work that had not landed is kept on a branch first, as {@link release} does.
    */
-  discard(run: IsolationRun, opts: { integration: IntegrationDisposal }): Promise<void>;
+  discard(run: IsolationRun, opts: { integration: IntegrationDisposal }): Promise<IsolationRemoval>;
 
   /**
    * Clear what other runs left in each repo of `run`'s group: every
