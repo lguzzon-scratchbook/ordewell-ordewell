@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { StructuredRunner } from '../StructuredRunner';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { isStructuredSession, type ITerminalSession, type StructuredEvent, type StructuredTurnEnd } from '../../interfaces/ITerminalRunner';
@@ -22,7 +22,9 @@ import { createTask, type Verdict } from '../../models/Task';
  * interrupt ends the turn without ending the task, a turn is not closed
  * while background work is still running, and a task completes through the
  * `task_complete` tool without an approval, and a `checkpoint` call stays
- * open until the checkpoint is answered (ADR-0022).
+ * open until the checkpoint is answered (ADR-0022), and a message sent during
+ * a command reaches the model inside the same turn, and a forced message cuts
+ * that command short (ADR-0023).
  *
  * The `auto` case needs a model and an account the CLI offers auto mode on. If
  * it refuses, the case is skipped with the CLI's own words — the mode is never
@@ -181,6 +183,53 @@ describe.runIf(live)('structured transport — live smoke', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, TIMEOUT_MS);
+
+  it('hands a message sent during a command to the running turn, which acts on it before the turn ends (ADR-0023)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-'));
+    const runner = new StructuredRunner();
+    try {
+      // Bypass, in a throwaway directory: a command waiting on an approval would hold the turn, not the steer.
+      const session = await runner.spawn({
+        taskId: 'live-steer',
+        runner: 'claude-code',
+        prompt: 'Use the Bash tool to run `sleep 20 && echo step1done`. Then use the Bash tool to run `echo step2done`. Then reply with one short sentence saying what you ran.',
+        modelId: model,
+        mode: 'bypassPermissions',
+        cwd: dir,
+        registry: new RunnerRegistry(),
+      });
+      const turns = turnEnds(session);
+      const events: StructuredEvent[] = [];
+      turns.session.onEvent((e) => events.push(e));
+      await vi.waitFor(() => expect(events.some((e) => e.type === 'tool_call')).toBe(true), { timeout: 60_000, interval: 250 });
+      await new Promise<void>((resolve) => setTimeout(resolve, 4000));
+
+      const id = turns.session.sendMessage('Before your next command, use the Bash tool to run `touch steered.txt`. Then carry on, and include the word PINEAPPLE in your final reply.');
+      await turns.next();
+
+      const at = (match: (e: StructuredEvent) => boolean) => events.findIndex(match);
+      const handed = at((e) => e.type === 'message_handed_over' && e.messageId === id);
+      const delivered = at((e) => e.type === 'message_delivered' && e.messageId === id);
+      const touched = events.findIndex((e, i) => i > delivered && e.type === 'tool_call' && JSON.stringify(e.args).includes('steered.txt'));
+      const ended = at((e) => e.type === 'turn_end');
+      console.error(`[live] claude steer: handed over at ${handed}, delivered at ${delivered}, acted on at ${touched}, turn ended at ${ended}`);
+      expect(turns.ends, session.getOutput()).toEqual(['completed']);
+      expect(events.filter((e) => e.type === 'turn_start')).toHaveLength(1);
+      expect(handed).toBeGreaterThan(-1);
+      expect(delivered, session.getOutput()).toBeGreaterThan(handed);
+      // Read after the sleep's result, inside the same turn.
+      expect(delivered).toBeGreaterThan(at((e) => e.type === 'tool_result'));
+      expect(touched, session.getOutput()).toBeGreaterThan(delivered);
+      expect(touched).toBeLessThan(ended);
+      expect(existsSync(join(dir, 'steered.txt'))).toBe(true);
+      expect(session.getOutput()).toContain('PINEAPPLE');
+      expect(turns.session.queued()).toEqual([]);
+    } finally {
+      runner.stopAll();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, TIMEOUT_MS);
+
   it('force sends during a 60s sleep: the sleep is cut short, the forced message acted on, no wait for input between (ADR-0023, F1–F3)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-'));
     const runner = new StructuredRunner();
