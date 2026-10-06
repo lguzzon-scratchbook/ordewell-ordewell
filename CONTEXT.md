@@ -458,6 +458,68 @@ carded.
 *Avoid:* "permission prompt" for Ordewell's side (that is Claude's protocol),
 and "awaiting approval" as a task status.
 
+**Task message** (`sendMessage`, `QueuedTaskMessage`) — a message sent to a
+structured task while its attempt lives (ADR-0018 M1, ADR-0023). Ordewell owns
+the queue, and a message is in exactly one state: *queued* — waiting in
+Ordewell's queue for the running turn to end, removable; *handed over* — the
+runner accepted it into the running turn and owes a delivery, no longer
+removable, since no runner can recall one; *delivered* — the runner reported
+that the model has it, mid-turn (`message_delivered`) or as the message that
+opened a turn (`turn_start`); or *undelivered*. Sent with no turn running, it
+opens a turn at once. The queue lists queued and handed-over messages until
+delivery; a message handed over and then let go of by the runner is queued
+again. Completion evidence that arrives while one is undelivered is held, and
+a message the runner reads voids it.
+*Avoid:* "queued prompt" (the planner conversation's hold) and "pending plan
+edit" (a run's plan-edit queue); "sent" or "delivered" for a handed-over
+message — the write or POST succeeding is not delivery.
+
+**Mid-turn delivery** — a task message reaching the model at the runner's next
+step boundary, after the tool call in flight and inside the same turn
+(ADR-0023): Claude Code by a `user` line on stdin, read when echoed; Codex by
+`turn/steer`; OpenCode 1.x by `prompt_async` while busy. It is a per-adapter
+optional capability (`steer`); without it — OpenCode 2.x, the terminal
+transport — messages wait for the turn to end, the *turn-end queue*. Offered
+one message at a time, in the order sent; a refusal leaves the rest for the
+turn's end.
+*Avoid:* "interrupt" (nothing in flight is stopped — that is *force send*),
+"injection" (the rejected hook route), and "steer" outside the adapter seam
+and Codex's protocol (it names the call, not the delivery).
+
+**Force send** (`forceSend`, `forceSendQueued`; "Send now" on the surfaces) — interrupt
+the running turn, stopping the tool call in flight, and deliver a message as
+the turn that replaces it, ahead of everything still queued (ADR-0023,
+F1–F4). The task stays `in_progress` through the switch. With no turn running
+it is a plain send; a handed-over message cannot be force sent; the terminal
+transport refuses it. On Codex the interrupt stops the agent waiting, not the
+command, which runs to its end. TUI `ctrl-s`, VS Code *Send now* /
+`Ctrl+Enter`.
+*Avoid:* "force-start" (starting a task past its dependencies), "priority" or
+"urgent" message, and "interrupt" for the whole action — a plain interrupt
+ends in waiting for input, a force send does not.
+
+**Undelivered message** (`message_undelivered`) — a task message that can no
+longer reach the runner: its process exited, its turn failed, or it was sent
+to a session already ended. Every surface reports it with its text; a message
+is never removed from the queue without being delivered, taken back, or
+reported undelivered.
+*Avoid:* "dropped" — that is an adapter reporting that a handed-over message
+went unread at the turn's end (`message_dropped`), which puts it back in the
+queue, not out of it; and "lost".
+
+**Checkpoint** (task) — a task asking a person to approve its work before it
+goes on: the `checkpoint` tool call on the structured transport, the
+checkpoint marker as the fallback. The task is `awaiting_user` with reason
+`checkpoint`, and its status carries the whole question (`checkpoint`).
+Answered with approve — which carries no note — or reject with a reason: the
+TUI task view's *checkpoint card* (`ctrl-y` / `ctrl-g`, composer text as the
+reason), `/checkpoint <id> approve|reject [reason]`, `ordewell checkpoint`,
+or the VS Code card. A runner approval waiting in the same task is answered
+first. The turn that asked it ending — an interrupt, a force send — withdraws
+it, and the task goes back to in progress.
+*Avoid:* "runner approval" (a tool request mid-turn, not a question about the
+work), "pause", and "merge gate" (a scheduling wait).
+
 **Ordewell MCP server** — the one MCP server Ordewell runs (ADR-0022,
 proposed): Streamable HTTP on `127.0.0.1` at a random port, started on first
 use by the process that owns the session (the daemon or the VS Code extension

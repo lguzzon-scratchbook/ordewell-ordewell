@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- **A message reaches a running task between tool calls.** A message typed in
+  a task log while a Claude Code, Codex or OpenCode 1.x task works is read by
+  the model after the command or edit in flight, inside the same turn,
+  instead of when the turn ends. A message the runner already has is marked
+  handed over and can no longer be removed. OpenCode 2.x keeps the old
+  behaviour.
+- **Send now.** A button beside Send, and on each queued message, interrupts
+  the running step and delivers the message straight away (`Ctrl+Enter` in
+  the message box). On Codex it stops the agent waiting on a command, not the
+  command itself.
+
+### Fixed
+
+- **A message sent to a task is never lost.** One still queued when the task
+  reported done used to vanish; the verdict now waits for it. A message that
+  can no longer reach the runner is shown as undelivered.
+- **Merge all never deletes a live task's worktree.** A run with a task still
+  live is left alone, and work that never landed is kept on an
+  `ordewell-preserved/…` branch before a worktree is removed.
+
 ## [0.7.0] — 2026-10-05
 
 ## [0.6.4] — 2026-10-04

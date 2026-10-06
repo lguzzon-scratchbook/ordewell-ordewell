@@ -8,6 +8,30 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- **A message reaches a running task between tool calls.** On the structured
+  transport, a message you send to a working Claude Code, Codex or OpenCode 1.x
+  task is handed to the runner at once, and the model reads it after the
+  command or edit in flight, inside the same turn. It used to wait until the
+  turn ended, which for a task is usually when the work is done. The queue
+  marks a message the runner already has as handed over (it can no longer be
+  removed), and the task log shows it where the model read it. OpenCode 2.x,
+  and a runner that refuses a message, keep the old behaviour: the message
+  opens the next turn (ADR-0023).
+- **Force send.** `ctrl-s` in the TUI task view, or *Send now*
+  (`Ctrl+Enter`) in the VS Code task log, interrupts the running step and
+  delivers the message straight away, ahead of anything queued. With the
+  composer empty, `ctrl-s` force sends the selected queued message. The task
+  stays in progress throughout. On Codex the interrupt stops the agent
+  waiting on a command, not the command itself.
+- **Answer a task's checkpoint from the TUI and the CLI.** The TUI task view
+  shows the whole question as a card, answered with `ctrl-y` (approve) or
+  `ctrl-g` (reject, with the composer text as the reason).
+  `/checkpoint <id> approve|reject [reason]` and
+  `ordewell checkpoint <id> approve|reject [reason]` work from anywhere, and
+  the chat notice reads "Task N asks: … — t on it to answer".
+
 ### Changed
 
 - **Internals reorganized behind narrower modules.** OpenCode 1.x and 2.x share
@@ -15,12 +39,25 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   and VS Code, each runner's Ordewell tools are declared in one place, plan
   editing has its own module, and what differs between change, ops, repair and
   continued attempts is read from one attempt kind. No behaviour change is
-  intended beyond the fix below.
+  intended beyond the fixes below.
 
 ### Fixed
 
 - **OpenCode 2.x task logs show file edits as diffs**, as they do on 1.x. An edit
   row used to say only that the edit succeeded.
+- **A message sent to a task is never lost.** A message still queued when the
+  task reported done used to vanish with the task; the verdict now waits for
+  it, and a report made before the agent read a message no longer counts. A
+  message that can no longer reach the runner — its process ended, or its
+  turn failed — is shown as undelivered, with its text.
+- **A merge or clean-up never deletes a live task's worktree.** Stop puts the
+  tasks it ends back to not started and keeps their worktrees; Merge all, Clean
+  up and Discard leave a run alone while any task in it is live; and work that
+  never landed is kept on an `ordewell-preserved/<run-id>/<task>` branch
+  before a worktree is removed.
+- **A task interrupted at a checkpoint can ask again.** An interrupt or a
+  force send left the open checkpoint call pending, so the agent's next
+  checkpoint was refused and the task stayed stuck at the old one.
 - **The TUI shows how to answer a runner's tool request right under it**
   (`ctrl-y` allow, `ctrl-t` allow for the task, `ctrl-g` deny), and the notice in
   other panes names the keys too.
