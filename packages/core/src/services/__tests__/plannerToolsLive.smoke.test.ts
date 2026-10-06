@@ -25,16 +25,25 @@ import { FakeTerminalSession, fakeConfig, makeSession } from './sessionTestKit';
  * not touch — can still be checked there; the planner then cannot read the
  * workspace, which this case never asks of it.
  *
+ * The planner runs on the cheapest model — Haiku for Claude Code,
+ * `gpt-5.6-luna` for Codex — unless ORDEWELL_LIVE_MODEL says otherwise, which
+ * applies to both, so set it only with one runner. The catalog offers the same
+ * models, so a committed plan never names a dearer one.
+ *
  * Not part of the suite: it costs real tokens and a minute or two.
  */
 
 const liveAgents = (process.env.ORDEWELL_LIVE_AGENTS ?? '').split(',').map((s) => s.trim());
 const live = liveAgents.includes('claude-code');
 const liveCodex = liveAgents.includes('codex');
+// The `haiku` alias runs Sonnet under `--permission-mode plan`, which the
+// planner spawns with; the full id is honoured.
+const claudeModel = process.env.ORDEWELL_LIVE_MODEL ?? 'claude-haiku-4-5-20251001';
+const codexModel = process.env.ORDEWELL_LIVE_MODEL ?? 'gpt-5.6-luna';
 
 const CATALOG: Record<string, DiscoveredModel[]> = {
-  'claude-code': [{ modelId: 'sonnet', modelLabel: 'Sonnet', variants: [] }],
-  codex: [{ modelId: 'gpt-5', modelLabel: 'GPT-5', variants: [{ id: 'low', label: 'Low' }, { id: 'high', label: 'High' }] }],
+  'claude-code': [{ modelId: claudeModel, modelLabel: 'Live model', variants: [] }],
+  codex: [{ modelId: codexModel, modelLabel: 'Live model', variants: [{ id: 'low', label: 'Low' }] }],
 };
 
 const cleanup: (() => Promise<void> | void)[] = [];
@@ -51,7 +60,7 @@ async function submitsThroughTools(provider: 'claude-code' | 'codex', model: str
   cleanup.push(() => rmSync(workspace, { recursive: true, force: true }));
   const server = new OrdewellMcpServer();
   cleanup.push(() => server.dispose());
-  const config = fakeConfig({ aiProvider: provider, orchestratorModel: model });
+  const config = fakeConfig({ aiProvider: provider, orchestratorModel: model, plannerThinkingEffort: provider === 'codex' && !process.env.ORDEWELL_LIVE_MODEL ? 'low' : undefined });
   const ai = new CliAgentAiService(config, { spawn: spawnFn, workspaceRoot: () => workspace, mcpServer: server });
   cleanup.push(() => ai.reset());
 
@@ -94,7 +103,7 @@ async function submitsThroughTools(provider: 'claude-code' | 'codex', model: str
 
 describe.runIf(live)('Claude Code planner tools — live', () => {
   it('reads a runner enabled mid-conversation and commits a plan on it through submit_plan (#69)', async () => {
-    await submitsThroughTools('claude-code', 'sonnet', spawn);
+    await submitsThroughTools('claude-code', claudeModel, spawn);
   }, 600_000);
 
   /** A real planner, a real Session and a plan of two tasks, `a` running behind `sessions[0]`. */
@@ -103,7 +112,7 @@ describe.runIf(live)('Claude Code planner tools — live', () => {
     cleanup.push(() => rmSync(workspace, { recursive: true, force: true }));
     const server = new OrdewellMcpServer();
     cleanup.push(() => server.dispose());
-    const config = fakeConfig({ aiProvider: 'claude-code', orchestratorModel: 'sonnet' });
+    const config = fakeConfig({ aiProvider: 'claude-code', orchestratorModel: claudeModel });
     const ai = new CliAgentAiService(config, { spawn, workspaceRoot: () => workspace, mcpServer: server });
     cleanup.push(() => ai.reset());
 
@@ -132,7 +141,7 @@ describe.runIf(live)('Claude Code planner tools — live', () => {
       },
     });
     const task = (id: string, order: number, title: string, dependencies: string[] = []) => createTask({
-      id, order, title, prompt: `do ${title}`, dependencies, assignedRunner: 'claude-code', assignedModel: { modelId: 'sonnet', modelLabel: 'Sonnet' },
+      id, order, title, prompt: `do ${title}`, dependencies, assignedRunner: 'claude-code', assignedModel: { modelId: claudeModel, modelLabel: 'Live model' },
     });
     session.loadPlan({
       tasks: [task('a', 1, 'Write the greeting script'), task('b', 2, 'Test the greeting script', ['a'])],
@@ -180,6 +189,6 @@ describe.runIf(live)('Claude Code planner tools — live', () => {
 
 describe.runIf(liveCodex)('Codex planner tools — live', () => {
   it('reads a runner enabled mid-conversation and commits a plan on it through submit_plan (#69)', async () => {
-    await submitsThroughTools('codex', process.env.ORDEWELL_LIVE_MODEL ?? 'gpt-5.6-luna', process.env.ORDEWELL_LIVE_CODEX_NO_SANDBOX ? spawnWithoutSandboxProbe : spawn);
+    await submitsThroughTools('codex', codexModel, process.env.ORDEWELL_LIVE_CODEX_NO_SANDBOX ? spawnWithoutSandboxProbe : spawn);
   }, 600_000);
 });

@@ -10,6 +10,7 @@ import { StructuredRunner } from '../StructuredRunner';
 import { TransportRouter } from '../TransportRouter';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import type { RunnerSpawnOptions } from '../AbstractRunner';
+import type { ITerminalSession } from '../../interfaces/ITerminalRunner';
 import { makeSession, taskOf } from './sessionTestKit';
 
 /**
@@ -39,9 +40,10 @@ function liveSession(dir: string) {
   };
   const router = new TransportRouter({ terminal: new HeadlessRunner(), structured: new StructuredRunner({ process: { spawn } }) });
   const requests: RunnerSpawnOptions[] = [];
+  const attempts: ITerminalSession[] = [];
   const runner = {
     get activeCount() { return router.activeCount; },
-    spawn: (opts: RunnerSpawnOptions) => { requests.push(opts); return router.spawn(opts); },
+    spawn: async (opts: RunnerSpawnOptions) => { requests.push(opts); const attempt = await router.spawn(opts); attempts.push(attempt); return attempt; },
     stop: vi.fn((id: string) => router.stop(id)),
     stopAll: () => router.stopAll(),
   };
@@ -51,7 +53,7 @@ function liveSession(dir: string) {
     settings: () => ({ tddEnabled: false, runnerTransport: 'structured' }),
     taskOutput: new BufferedTaskOutputSource(),
   });
-  return { session, children, requests };
+  return { session, children, requests, attempts };
 }
 
 function planOf(task: Task): LegacyPlanState {
@@ -64,11 +66,11 @@ describe.runIf(live)('continue — live', () => {
   it('resumes a finished task\'s session in its recreated directory, and verifies the continued attempt on its own', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ordewell-continue-'));
     writeFileSync(join(dir, 'package.json'), '{ "name": "continue" }\n');
-    const { session, children, requests } = liveSession(dir);
+    const { session, children, requests, attempts } = liveSession(dir);
     try {
       session.loadPlan(planOf(createTask({
         id: 'live-1', order: 1, title: 'Name the word', taskMode: 'acceptEdits', assignedModel,
-        prompt: 'Do not use any tools. Reply with exactly this sentence: The secret word is PELICAN.',
+        prompt: 'Do not read, edit or run anything. Reply with exactly this sentence: The secret word is PELICAN.',
       })), 'Continue', dir);
       await session.executePlan();
       await vi.waitFor(() => expect(taskOf(session, 'live-1')?.status).toBe('completed'), { timeout: TIMEOUT_MS, interval: 500 });
@@ -80,15 +82,17 @@ describe.runIf(live)('continue — live', () => {
       rmSync(dir, { recursive: true, force: true });
       mkdirSync(dir);
 
-      await session.continueTask('live-1', 'Do not use any tools. Which secret word did you name earlier? Answer with: The word was <WORD>.');
+      await session.continueTask('live-1', 'Do not read, edit or run anything. Which secret word did you name earlier? Answer with: The word was <WORD>.');
       await vi.waitFor(() => expect(taskOf(session, 'live-1')?.status).toBe('completed'), { timeout: TIMEOUT_MS, interval: 500 });
 
       const continued = taskOf(session, 'live-1')!;
       expect(requests.at(-1)).toMatchObject({ resumeSessionId: saved, transport: 'structured' });
       expect(requests.at(-1)!.prompt).not.toContain('Reply with exactly this sentence');
       expect(continued.verdict?.outcome).toBe('pass');
-      expect(continued.outputSummary?.logTail).toMatch(/The word was PELICAN/i);
-      expect(continued.outputSummary?.logTail).not.toContain('The secret word is PELICAN');
+      // The log tail is the runner's task_complete summary, in its own words;
+      // the reply itself is in the continued attempt's output.
+      expect(attempts.at(-1)!.getOutput()).toMatch(/The word was PELICAN/i);
+      expect(attempts.at(-1)!.getOutput()).not.toContain('The secret word is PELICAN');
       expect(continued.transport?.nativeSessionId).toBeTruthy();
       await vi.waitFor(() => expect(children.every(exited)).toBe(true), { timeout: 10_000 });
     } finally {
