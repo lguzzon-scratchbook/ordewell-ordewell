@@ -287,6 +287,12 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   private endedTurnId: string | null = null;
   /** An interrupt was asked for during this turn, so however it ends, it was cut short. */
   private interruptRequested = false;
+  /**
+   * Turns an interrupt cut short. Codex leaves their command running and
+   * reports it when it ends, inside whatever turn is live by then — a report
+   * that belongs to no turn of the agent's any more (ADR-0023, F4).
+   */
+  private readonly interruptedTurnIds = new Set<string>();
   /** An interrupt asked for before Codex named the turn, sent once it does. */
   private interruptOnStart: (() => void) | null = null;
   /** A task's approval requests still waiting for an answer, by the request id as a string. */
@@ -633,9 +639,11 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
 
     switch (msg.method) {
       case 'item/started':
+        if (this.fromInterruptedTurn(msg.params)) return;
         this.emitItemStart(msg.params?.item as ThreadItem | undefined, emit, this.subagentOf(msg.params?.threadId));
         return;
       case 'item/completed':
+        if (this.fromInterruptedTurn(msg.params)) return;
         this.emitItemDone(msg.params?.item as ThreadItem | undefined, emit, this.subagentOf(msg.params?.threadId));
         return;
       // Reply text streams before its completed item. The completed item is
@@ -775,6 +783,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   private closeTurn(emit: (event: AgentEvent) => void): void {
     const turn = this.turn;
     this.endedTurnId = turn?.id ?? null;
+    if (turn?.id && this.interruptRequested) this.interruptedTurnIds.add(turn.id);
     this.turn = null;
     this.interruptOnStart = null;
     if (!turn) return;
@@ -783,6 +792,11 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
       else steer.settle(false);
     }
     turn.steers.clear();
+  }
+
+  private fromInterruptedTurn(params: Record<string, unknown> | undefined): boolean {
+    const turnId = params?.turnId;
+    return typeof turnId === 'string' && this.interruptedTurnIds.has(turnId) && !this.subagentOf(params?.threadId);
   }
 
   /** The `userMessage` item a steer turns into once the item before it completes: the model has it. */

@@ -161,6 +161,27 @@ export class FakeStructuredSession extends FakeTerminalSession implements Struct
     else this.messages.push({ id, text });
     return id;
   }
+  /** Interrupts, and the turn that replaces the interrupted one opens with the forced message. */
+  forceSend(text: string): string {
+    if (this.state === 'idle') return this.sendMessage(text);
+    this.messageCount += 1;
+    const id = `msg-${this.messageCount}`;
+    this.putForced({ id, text, forced: true });
+    void this.interrupt();
+    return id;
+  }
+  forceSendQueued(id: string): boolean {
+    const message = this.messages.find((m) => m.id === id);
+    if (!message || message.handedOver) return false;
+    this.messages = this.messages.filter((m) => m !== message);
+    this.putForced({ ...message, forced: true });
+    if (this.state === 'working') void this.interrupt();
+    return true;
+  }
+  private putForced(message: QueuedTaskMessage): void {
+    const at = this.messages.findIndex((m) => !m.forced);
+    this.messages.splice(at < 0 ? this.messages.length : at, 0, message);
+  }
   removeQueued(id: string): boolean {
     const before = this.messages.length;
     this.messages = this.messages.filter((m) => m.id !== id);

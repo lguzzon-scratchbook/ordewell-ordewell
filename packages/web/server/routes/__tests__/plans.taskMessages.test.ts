@@ -59,6 +59,48 @@ describe('talking to a structured task over the daemon (ADR-0018, M1)', () => {
     expect(interruptTask).toHaveBeenCalledWith('t1');
   });
 
+  it('force sends a new message and answers with its id (ADR-0023, F1)', async () => {
+    const forceSendTaskMessage = vi.fn(() => 'msg-3');
+    const res = await request(appFor({ forceSendTaskMessage }), 'POST', '/messages/now', { text: 'stop, use Postgres' });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: 'msg-3' });
+    expect(forceSendTaskMessage).toHaveBeenCalledWith('t1', 'stop, use Postgres');
+  });
+
+  it('asks for the text rather than force sending an empty message', async () => {
+    const forceSendTaskMessage = vi.fn();
+    const res = await request(appFor({ forceSendTaskMessage }), 'POST', '/messages/now', {});
+
+    expect(res.status).toBe(400);
+    expect(forceSendTaskMessage).not.toHaveBeenCalled();
+  });
+
+  it('force sends a queued message, saying whether it was still queued', async () => {
+    const forceSendQueuedTaskMessage = vi.fn(() => true);
+    const res = await request(appFor({ forceSendQueuedTaskMessage }), 'POST', '/messages/msg-2/now');
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ sent: true });
+    expect(forceSendQueuedTaskMessage).toHaveBeenCalledWith('t1', 'msg-2');
+  });
+
+  it('answers a force send to a terminal task with 400 and the reason', async () => {
+    const refusal = new TaskControlError('Task "Only" runs in a terminal, which cannot take a message sent now from Ordewell: use its terminal instead.');
+    const app = appFor({
+      forceSendTaskMessage: () => { throw refusal; },
+      forceSendQueuedTaskMessage: () => { throw refusal; },
+    });
+
+    for (const res of [
+      await request(app, 'POST', '/messages/now', { text: 'hi' }),
+      await request(app, 'POST', '/messages/msg-1/now'),
+    ]) {
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: refusal.message });
+    }
+  });
+
   it('answers a refusal — a terminal task, say — with 400 and the reason', async () => {
     const refusal = new TaskControlError('Task "Only" runs in a terminal, which cannot take a message from Ordewell: use its terminal instead.');
     const app = appFor({

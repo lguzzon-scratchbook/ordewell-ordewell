@@ -24,6 +24,8 @@ function harness(attempts: Record<number, TaskLogEvent[]> = { 1: attemptOne }) {
     taskLog: vi.fn((_taskId: string, attempt: number) => attempts[attempt] ?? []),
     sendTaskMessage: vi.fn(() => 'm1'),
     removeQueuedTaskMessage: vi.fn(() => true),
+    forceSendTaskMessage: vi.fn(() => 'm2'),
+    forceSendQueuedTaskMessage: vi.fn(() => true),
     interruptTask: vi.fn(async () => {}),
     continueTask: vi.fn(async () => {}),
     pending: [] as PendingApproval[],
@@ -74,6 +76,7 @@ describe('the task-log registry (ADR-0018, V1)', () => {
       extensionUri: vscode.Uri.file('/ext'),
       session: () => ({
         taskLogAttempts: () => [], taskLog: () => [], sendTaskMessage: () => 'm', removeQueuedTaskMessage: () => false, interruptTask: async () => {},
+        forceSendTaskMessage: () => 'm', forceSendQueuedTaskMessage: () => false,
         continueTask: async () => {}, outstandingApprovals: () => [], resolveApproval: () => false,
       }),
       getTask: () => undefined,
@@ -134,6 +137,34 @@ describe('the task-log registry (ADR-0018, V1)', () => {
     expect(h.session.sendTaskMessage).toHaveBeenCalledWith('t1', 'use Postgres');
     expect(h.session.removeQueuedTaskMessage).toHaveBeenCalledWith('t1', 'q1');
     await vi.waitFor(() => expect(h.session.interruptTask).toHaveBeenCalledWith('t1'));
+  });
+
+  it('routes a force send, new or queued, to the Session (ADR-0023, F1)', () => {
+    const h = harness();
+    h.registry.open('t1');
+
+    __panels[0].__receive({ type: 'sendTaskMessageNow', text: 'stop, use Postgres' });
+    __panels[0].__receive({ type: 'sendQueuedTaskMessageNow', id: 'q1' });
+
+    expect(h.session.forceSendTaskMessage).toHaveBeenCalledWith('t1', 'stop, use Postgres');
+    expect(h.session.forceSendQueuedTaskMessage).toHaveBeenCalledWith('t1', 'q1');
+  });
+
+  it('says so when the runner already had the message it was asked to send now, and shows a refusal', () => {
+    const h = harness();
+    h.session.forceSendQueuedTaskMessage.mockReturnValue(false);
+    h.session.forceSendTaskMessage.mockImplementation(() => { throw new Error('Task runs in a terminal, which cannot take a message sent now from Ordewell.'); });
+    h.registry.open('t1');
+    __panels[0].__receive({ type: 'ready' });
+    __panels[0].webview.postMessage.mockClear();
+
+    __panels[0].__receive({ type: 'sendQueuedTaskMessageNow', id: 'q1' });
+    __panels[0].__receive({ type: 'sendTaskMessageNow', text: 'now' });
+
+    expect(posted(__panels[0])).toEqual([
+      { type: 'showError', error: expect.stringMatching(/runner already has that message/) },
+      { type: 'showError', error: expect.stringMatching(/cannot take a message sent now/) },
+    ]);
   });
 
   it('shows the Session\u2019s refusal of a task that cannot take a message', () => {

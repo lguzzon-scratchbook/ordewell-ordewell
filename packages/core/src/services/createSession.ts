@@ -1293,6 +1293,22 @@ export class Session {
     return id;
   }
 
+  /**
+   * Force send (ADR-0023, F1): interrupt the task's running turn and deliver
+   * this message next. Throws `TaskControlError` where a plain message would,
+   * and for a task on the terminal transport.
+   */
+  forceSendTaskMessage(taskId: string, text: string): string {
+    const id = this.events.holdStatus(() => this.orchestrator.forceSendTaskMessage(taskId, text));
+    this.persist({ background: true });
+    this.events.releaseStatus(this.plan);
+    return id;
+  }
+
+  forceSendQueuedTaskMessage(taskId: string, id: string): boolean {
+    return this.orchestrator.forceSendQueuedTaskMessage(taskId, id);
+  }
+
   removeQueuedTaskMessage(taskId: string, id: string): boolean {
     return this.orchestrator.removeQueuedTaskMessage(taskId, id);
   }

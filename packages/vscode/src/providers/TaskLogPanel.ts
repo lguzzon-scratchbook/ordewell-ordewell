@@ -15,11 +15,16 @@ export interface TaskLogSession {
   taskLog(taskId: string, attempt: number): TaskLogEvent[];
   sendTaskMessage(taskId: string, text: string): string;
   removeQueuedTaskMessage(taskId: string, id: string): boolean;
+  forceSendTaskMessage(taskId: string, text: string): string;
+  forceSendQueuedTaskMessage(taskId: string, id: string): boolean;
   interruptTask(taskId: string): Promise<void>;
   continueTask(taskId: string, message: string): Promise<void>;
   outstandingApprovals(): PendingApproval[];
   resolveApproval(id: string, answer: ApprovalAnswer): boolean;
 }
+
+/** Why a queued message could not be force sent: the runner took it in the meantime (ADR-0023, D3). */
+export const ALREADY_HANDED_OVER = 'The runner already has that message; it reads it after its current step.';
 
 export interface TaskLogPanelDeps {
   session: TaskLogSession;
@@ -115,6 +120,14 @@ export class TaskLogPanel {
         return;
       case 'removeQueuedTaskMessage':
         this.control(() => { this.deps.session.removeQueuedTaskMessage(this.taskId, msg.id); });
+        return;
+      case 'sendTaskMessageNow':
+        this.control(() => { this.deps.session.forceSendTaskMessage(this.taskId, msg.text); });
+        return;
+      case 'sendQueuedTaskMessageNow':
+        this.control(() => {
+          if (!this.deps.session.forceSendQueuedTaskMessage(this.taskId, msg.id)) throw new Error(ALREADY_HANDED_OVER);
+        });
         return;
       case 'interruptTask':
         this.controlAsync(() => this.deps.session.interruptTask(this.taskId));

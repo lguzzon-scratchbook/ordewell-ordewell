@@ -69,6 +69,12 @@ TUI options:
   --workspace /path   Workspace directory (default: cwd)
   --port N            Target a daemon on port N
 
+TUI task view keys (t on a structured task; /help in the TUI lists them all):
+  ctrl-s              Send now: interrupt the running step and deliver the composer text next
+                      (with the composer empty, the selected queued message)
+  ctrl-n / ctrl-p     Select a queued message; ctrl-r removes it
+  ctrl-x              Interrupt the running turn
+
 Plan options:
   --goal "text"       Task description (required)
   --runner <id>       Runner to use (repeatable; default: all enabled runners)

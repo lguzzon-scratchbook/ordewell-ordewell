@@ -1,6 +1,7 @@
 import { EMPTY_TASK_LOG, reduceTaskLog, replayTaskLog, runnerToolSubject, type ApprovalDecision, type TaskLogEvent } from '@ordewell/core';
+import { commit } from '../editor';
 import type { Key } from '../keys';
-import { findTask, waitingApproval, type TaskLogState, type TuiState } from '../state';
+import { continuesTask, findTask, waitingApproval, type TaskLogState, type TuiState } from '../state';
 import { say } from '../transcript';
 import { step, type Step, type Action } from './shared';
 
@@ -163,6 +164,24 @@ function answerApproval(state: TuiState, tv: TaskLogState, sessionId: string, de
 }
 
 /**
+ * Force send (ADR-0023, F1): the composer's text or, with the composer empty,
+ * the selected queued message — interrupting the running turn to go next.
+ * One key for both, so sending now is always the same reach whichever
+ * message it is.
+ */
+function sendNow(state: TuiState, tv: TaskLogState, sessionId: string): Step {
+  const text = state.editor.text.trim();
+  if (text) {
+    if (continuesTask(findTask(state.tasks, tv.taskId))) return step(say(state, 'system', 'The task has finished, so there is no turn to interrupt — enter continues it.'));
+    return step({ ...state, editor: commit(state.editor) }, [{ type: 'forceSendTaskMessage', sessionId, taskId: tv.taskId, text }]);
+  }
+  const queued = tv.view.queued[tv.queuedIndex];
+  if (!queued) return step(say(state, 'system', 'Nothing to send now: type a message, or pick a queued one with ctrl-n/ctrl-p.'));
+  if (queued.handedOver) return step(say(state, 'system', 'The runner already has that message; it reads it after its current step.'));
+  return step(state, [{ type: 'forceSendQueuedTaskMessage', sessionId, taskId: tv.taskId, messageId: queued.id }]);
+}
+
+/**
  * The task view's own keys. Everything else — enter, escape, the editor, the
  * page keys — falls through to the normal chat-pane handling, so typing and
  * scrolling work exactly as in the planner chat.
@@ -191,6 +210,8 @@ export function handleTaskViewKey(state: TuiState, key: Key): Step | null {
     if (queued.handedOver) return step(say(state, 'system', 'The runner already has that message; it can no longer be taken back.'));
     return step(state, [{ type: 'removeTaskMessage', sessionId: state.sessionId, taskId: tv.taskId, messageId: queued.id }]);
   }
+
+  if (key.name === 'ctrl-s') return sendNow(state, tv, state.sessionId);
 
   if (key.name === 'ctrl-x') {
     return step(state, [{ type: 'interruptTask', sessionId: state.sessionId, taskId: tv.taskId }]);

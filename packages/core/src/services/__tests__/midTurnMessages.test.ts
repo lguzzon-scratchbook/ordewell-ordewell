@@ -4,7 +4,7 @@ import { createTaskOrchestrator } from '../TaskOrchestrator';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import { createTask } from '../../models/Task';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
-import { fakeConfig, FakeStructuredSession, flushMicrotasks } from '../../testing';
+import { fakeConfig, FakeStructuredSession, FakeTerminalSession, flushMicrotasks } from '../../testing';
 import { fakeNotification } from './sessionTestKit';
 import type { RunnerSpawnOptions } from '../AbstractRunner';
 import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter } from '../harness/AgentAdapter';
@@ -484,5 +484,206 @@ describe('the attempt\'s verdict when a message is read mid-turn', () => {
     session.emitOutput('Work with tests\n<<<ORDEWELL_DONE_mk-1>>>');
     await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')?.status).toBe('completed'));
     expect(orchestrator.storeInstance.get('t1')?.outputSummary?.logTail).toBe('Work with tests');
+  });
+});
+
+/**
+ * Force send (ADR-0023, F1–F3): the running turn is interrupted and the
+ * forced message opens the one that replaces it, ahead of what is still
+ * queued, with no stop at "waiting for input" in between.
+ */
+describe('force send', () => {
+  async function turnEnd() {
+    const { runner, adapters } = runnerOf(() => new TurnEndAdapter());
+    const task = observe(await runner.spawn(options({ runner: 'claude-code' })));
+    await vi.waitFor(() => expect(adapters[0].sent).toEqual(['Do the task']));
+    return { ...task, adapter: adapters[0], adapters };
+  }
+
+  it('interrupts the turn and opens the next one with the forced message, ahead of the queue, never idle in between', async () => {
+    const task = await turnEnd();
+    const one = task.session.sendMessage('one');
+    const two = task.session.sendMessage('two');
+    task.adapter.emit({ type: 'tool_call', id: 'c1', name: 'Bash', args: { command: 'sleep 60' } });
+
+    const now = task.session.forceSend('stop, use Postgres');
+    expect(task.session.queued()).toEqual([
+      { id: now, text: 'stop, use Postgres', forced: true }, { id: one, text: 'one' }, { id: two, text: 'two' },
+    ]);
+    await flushMicrotasks();
+
+    expect(task.turnEnds).toEqual(['interrupted']);
+    expect(task.statesAtTurnEnd).toEqual(['working']);
+    expect(task.adapter.sent).toEqual(['Do the task', 'stop, use Postgres']);
+    expect(of(task.events, 'turn_start').at(-1)).toEqual({ type: 'turn_start', text: 'stop, use Postgres', messageId: now, forced: true });
+    expect(of(task.events, 'message_queued').at(-1)).toEqual({ type: 'message_queued', messageId: now, text: 'stop, use Postgres', forced: true });
+    expect(task.session.queued()).toEqual([{ id: one, text: 'one' }, { id: two, text: 'two' }]);
+
+    task.adapter.endTurn();
+    await flushMicrotasks();
+    expect(task.adapter.sent).toEqual(['Do the task', 'stop, use Postgres', 'one']);
+  });
+
+  it('promotes a queued message by id; one the runner already has, or one gone, is refused', async () => {
+    const task = await turnEnd();
+    const one = task.session.sendMessage('one');
+    const two = task.session.sendMessage('two');
+    expect(task.session.forceSendQueued('msg-404')).toBe(false);
+
+    expect(task.session.forceSendQueued(two)).toBe(true);
+    await flushMicrotasks();
+
+    expect(task.adapter.sent).toEqual(['Do the task', 'two']);
+    expect(of(task.events, 'turn_start').at(-1)).toEqual({ type: 'turn_start', text: 'two', messageId: two, forced: true });
+    expect(task.session.queued()).toEqual([{ id: one, text: 'one' }]);
+    expect(task.statesAtTurnEnd).toEqual(['working']);
+
+    const steered = await steering();
+    const handed = steered.session.sendMessage('handed');
+    await flushMicrotasks();
+    expect(steered.session.forceSendQueued(handed)).toBe(false);
+    expect(steered.turnEnds).toEqual([]);
+  });
+
+  it('leaves what the runner was handed to the runner, and re-sends one it drops after the forced message', async () => {
+    const task = await steering((adapter) => { adapter.interruptAnswer = 'hold'; });
+    const kept = task.session.sendMessage('kept');
+    const dropped = task.session.sendMessage('dropped');
+    await flushMicrotasks();
+    expect(task.session.queued().every((m) => m.handedOver)).toBe(true);
+
+    const now = task.session.forceSend('now');
+    task.adapter.drop(dropped);
+    task.adapter.finishInterrupt();
+    await flushMicrotasks();
+
+    expect(task.adapter.sent).toEqual(['Do the task', 'now']);
+    expect(of(task.events, 'turn_start').at(-1)).toMatchObject({ messageId: now, forced: true });
+    // Codex discards what it had not consumed; the rest the runner still owes.
+    expect(task.adapter.steers.map((s) => s.text)).toEqual(['kept', 'dropped', 'dropped']);
+    expect(task.session.queued().map((m) => m.id)).toEqual([kept, dropped]);
+  });
+
+  it('is never steered into the turn it interrupts', async () => {
+    const task = await steering((adapter) => { adapter.interruptAnswer = 'hold'; });
+    task.session.forceSend('now');
+    await flushMicrotasks();
+    expect(task.adapter.steers).toEqual([]);
+    task.adapter.finishInterrupt();
+    await flushMicrotasks();
+    expect(task.adapter.sent).toEqual(['Do the task', 'now']);
+    expect(task.adapter.steers).toEqual([]);
+  });
+
+  it('kills and resumes the runner when the soft interrupt is ignored, and the resumed one gets the forced message first', async () => {
+    const task = await turnEnd();
+    task.adapter.interruptAnswer = 'ignore';
+    const queued = task.session.sendMessage('queued');
+    const now = task.session.forceSend('now');
+    await vi.waitFor(() => expect(task.adapters).toHaveLength(2));
+    await flushMicrotasks();
+
+    expect(task.turnEnds).toEqual(['interrupted']);
+    expect(task.statesAtTurnEnd).toEqual(['working']);
+    expect(task.adapters[1].sent).toEqual(['now']);
+    expect(of(task.events, 'turn_start').at(-1)).toMatchObject({ messageId: now, forced: true });
+    expect(task.session.queued()).toEqual([{ id: queued, text: 'queued' }]);
+  });
+
+  it('is a plain send when no turn runs', async () => {
+    const task = await turnEnd();
+    task.adapter.endTurn();
+    await flushMicrotasks();
+    expect(task.session.turnState()).toBe('idle');
+
+    task.session.forceSend('next');
+    await flushMicrotasks();
+    expect(task.adapter.sent).toEqual(['Do the task', 'next']);
+    expect(task.turnEnds).toEqual(['completed']);
+    expect(of(task.events, 'turn_start').at(-1)).toEqual({ type: 'turn_start', text: 'next' });
+  });
+
+  it('reports a forced message undelivered when the runner is gone', async () => {
+    const task = await turnEnd();
+    task.adapter.interruptAnswer = 'hold';
+    const now = task.session.forceSend('now');
+    task.adapter.exit(1);
+    await flushMicrotasks();
+    expect(task.events).toContainEqual({ type: 'message_undelivered', messageId: now, text: 'now' });
+  });
+});
+
+describe('force send through the orchestrator', () => {
+  function orchestratorFor(session: ITerminalSession) {
+    const runner = {
+      spawn: async () => session,
+      stop: () => session.kill(),
+      stopAll: () => session.kill(),
+      activeCount: 1,
+    } satisfies ITerminalRunner;
+    const orchestrator = createTaskOrchestrator({
+      config: fakeConfig(), notifications: fakeNotification(), terminalRunner: runner,
+      output: new BufferedTaskOutputSource({ transcripts: { finalAssistantText: async () => null } }),
+      registry: new RunnerRegistry(), workspaceRoot: () => '/repo',
+      workspaceEnv: async () => ({ env: {}, blockedEnvrc: null, refused: [], trackedEnvFile: null }),
+      runnerTransport: () => 'structured',
+    });
+    orchestrator.loadPlan([createTask({ id: 't1', order: 1, title: 'Forced task', prompt: 'Do it', completionMarker: 'mk-1' })]);
+    return orchestrator;
+  }
+
+  function scheduled() {
+    const session = new FakeStructuredSession();
+    return { orchestrator: orchestratorFor(session), session };
+  }
+
+  it('keeps the task in progress through the interrupt, and delivers the forced message first', async () => {
+    const { orchestrator, session } = scheduled();
+    await orchestrator.forceStartTask('t1');
+    const statuses: string[] = [];
+    orchestrator.subscribe({ onTaskChanged: () => { statuses.push(orchestrator.storeInstance.get('t1')?.status ?? ''); } });
+    orchestrator.sendTaskMessage('t1', 'later');
+
+    orchestrator.forceSendTaskMessage('t1', 'now');
+    await flushMicrotasks(50);
+
+    expect(session.interrupts).toBe(1);
+    expect(session.delivered).toEqual(['now']);
+    expect(statuses.every((s) => s === 'in_progress')).toBe(true);
+    expect(orchestrator.getQueuedTaskMessages('t1').map((m) => m.text)).toEqual(['later']);
+  });
+
+  it('promotes a queued message, and refuses one it does not hold', async () => {
+    const { orchestrator, session } = scheduled();
+    await orchestrator.forceStartTask('t1');
+    orchestrator.sendTaskMessage('t1', 'first');
+    const second = orchestrator.sendTaskMessage('t1', 'second');
+
+    expect(orchestrator.forceSendQueuedTaskMessage('t1', 'msg-404')).toBe(false);
+    expect(orchestrator.forceSendQueuedTaskMessage('t1', second)).toBe(true);
+    await flushMicrotasks(50);
+    expect(session.delivered).toEqual(['second']);
+    expect(orchestrator.storeInstance.get('t1')?.status).toBe('in_progress');
+  });
+
+  it('just delivers to a task waiting for input, which is back in progress', async () => {
+    const { orchestrator, session } = scheduled();
+    await orchestrator.forceStartTask('t1');
+    session.emitTurnEnd('completed');
+    await flushMicrotasks(50);
+    expect(orchestrator.storeInstance.get('t1')?.status).toBe('awaiting_user');
+
+    orchestrator.forceSendTaskMessage('t1', 'carry on');
+    expect(session.interrupts).toBe(0);
+    expect(session.delivered).toEqual(['carry on']);
+    expect(orchestrator.storeInstance.get('t1')?.status).toBe('in_progress');
+    orchestrator.stop();
+  });
+
+  it('refuses a task on the terminal transport, saying so', async () => {
+    const orchestrator = orchestratorFor(new FakeTerminalSession());
+    await orchestrator.forceStartTask('t1');
+    expect(() => orchestrator.forceSendTaskMessage('t1', 'now')).toThrow(/runs in a terminal, which cannot take a message sent now/);
+    expect(() => orchestrator.forceSendQueuedTaskMessage('t1', 'msg-1')).toThrow(/runs in a terminal/);
   });
 });

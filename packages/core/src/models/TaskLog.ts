@@ -13,8 +13,8 @@ import type { UsageRecord } from './Usage';
  * without a format version.
  */
 export type TaskLogEvent =
-  /** A turn began by delivering `message`; `messageId` names it when it had been queued. */
-  | { type: 'turn_start'; message: string; messageId?: string }
+  /** A turn began by delivering `message`; `messageId` names it when it had been queued, `forced` when it was force sent. */
+  | { type: 'turn_start'; message: string; messageId?: string; forced?: boolean }
   | { type: 'turn_end'; reason: StructuredTurnEnd }
   | { type: 'text_delta'; text: string }
   /** A complete run of the agent's reply, authoritative over the deltas streamed for it. */
@@ -28,8 +28,11 @@ export type TaskLogEvent =
   | { type: 'subagent_started'; subagentId: string; brief: string; model?: string }
   | { type: 'subagent_finished'; subagentId: string; outcome: SubagentOutcome; digest: string }
   | { type: 'usage'; record: UsageRecord }
-  /** Waiting in Ordewell's queue — again, for a message the runner was handed and let go of (ADR-0023, D4). */
-  | { type: 'message_queued'; messageId: string; text: string }
+  /**
+   * Waiting in Ordewell's queue — again, for a message the runner was handed
+   * and let go of (ADR-0023, D4). `forced` moves it ahead of the rest (F2).
+   */
+  | { type: 'message_queued'; messageId: string; text: string; forced?: boolean }
   | { type: 'message_removed'; messageId: string }
   | { type: 'message_undelivered'; messageId: string; text: string }
   /** The runner accepted a queued message into its running turn; it can no longer be taken back. */
@@ -91,7 +94,9 @@ function withSubagent<E extends TaskLogEvent>(event: E, subagentId: string | und
 export function toTaskLogEvent(event: StructuredEvent): TaskLogEvent | null {
   switch (event.type) {
     case 'turn_start':
-      return { type: 'turn_start', message: event.text, ...(event.messageId ? { messageId: event.messageId } : {}) };
+      return {
+        type: 'turn_start', message: event.text, ...(event.messageId ? { messageId: event.messageId } : {}), ...(event.forced ? { forced: true } : {}),
+      };
     case 'turn_end':
       return { type: 'turn_end', reason: event.reason };
     case 'assistant_text_delta':
@@ -114,7 +119,7 @@ export function toTaskLogEvent(event: StructuredEvent): TaskLogEvent | null {
     case 'usage':
       return { type: 'usage', record: event.record };
     case 'message_queued':
-      return { type: 'message_queued', messageId: event.messageId, text: event.text };
+      return { type: 'message_queued', messageId: event.messageId, text: event.text, ...(event.forced ? { forced: true } : {}) };
     case 'message_undelivered':
       return { type: 'message_undelivered', messageId: event.messageId, text: event.text };
     case 'message_removed':

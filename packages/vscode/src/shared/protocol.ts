@@ -115,6 +115,10 @@ export type WebviewToHost =
   | { type: 'sendTaskMessage'; taskId: string; text: string }
   /** Take back a message still queued behind a structured task's turn. */
   | { type: 'removeQueuedTaskMessage'; taskId: string; id: string }
+  /** Force send (ADR-0023, F1): interrupt the task's running turn and deliver `text` next, ahead of anything queued. */
+  | { type: 'sendTaskMessageNow'; taskId: string; text: string }
+  /** Force send a message still queued behind a structured task's turn. */
+  | { type: 'sendQueuedTaskMessageNow'; taskId: string; id: string }
   /** Stop a structured task's running turn; the task then waits for input. */
   | { type: 'interruptTask'; taskId: string }
   /** The planner merges these tasks into one (issue #18). */

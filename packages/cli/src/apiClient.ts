@@ -332,6 +332,27 @@ export class ApiClient {
     return res.data;
   }
 
+  /** Force send: interrupt the task's running turn and deliver `text` next, ahead of anything queued (ADR-0023, F1). */
+  async forceSendTaskMessage(sessionId: string, taskId: string, text: string): Promise<{ id: string }> {
+    const res = await this.httpRequest<{ id: string } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/messages/now`, { text });
+    if (res.status !== 200) {
+      throw new Error(res.data?.error || 'Send now failed');
+    }
+    return res.data;
+  }
+
+  /** Force send a message still queued; `sent` is false once the runner already has it. */
+  async forceSendQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<{ sent: boolean }> {
+    const res = await this.httpRequest<{ sent: boolean } & ErrorResponse>(
+      'POST',
+      `/api/plans/${sessionId}/tasks/${taskId}/messages/${encodeURIComponent(messageId)}/now`,
+    );
+    if (res.status !== 200) {
+      throw new Error(res.data?.error || 'Send now failed');
+    }
+    return res.data;
+  }
+
   /** Continue a finished structured task in its saved session, with `text` as its next turn. */
   async continueTask(sessionId: string, taskId: string, text: string): Promise<{ ok: boolean }> {
     const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/continue`, { text });

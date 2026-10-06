@@ -135,6 +135,31 @@ export function plansRoute(pool: OrchestratorPool) {
     }
   });
 
+  // Force send (ADR-0023, F1): interrupt the running turn and deliver this
+  // message next, ahead of anything queued. Refused like a message is, and on
+  // a terminal task, with the reason.
+  router.post('/:sessionId/tasks/:taskId/messages/now', async (c) => {
+    try {
+      const body: unknown = await c.req.json().catch(() => ({}));
+      const text = typeof body === 'object' && body !== null && 'text' in body ? body.text : undefined;
+      if (typeof text !== 'string' || !text.trim()) return c.json({ error: 'text is required' }, 400);
+      const id = pool.session(c.req.param('sessionId')).forceSendTaskMessage(c.req.param('taskId'), text);
+      return c.json({ id });
+    } catch (err) {
+      return editFailure(c, err);
+    }
+  });
+
+  // Force send a message still queued; `sent` is false once the runner has it.
+  router.post('/:sessionId/tasks/:taskId/messages/:messageId/now', (c) => {
+    try {
+      const sent = pool.session(c.req.param('sessionId')).forceSendQueuedTaskMessage(c.req.param('taskId'), c.req.param('messageId'));
+      return c.json({ sent });
+    } catch (err) {
+      return editFailure(c, err);
+    }
+  });
+
   // Continue a finished structured task in its saved session (ADR-0018, K1).
   // A task that cannot be continued is refused with the reason.
   router.post('/:sessionId/tasks/:taskId/continue', async (c) => {

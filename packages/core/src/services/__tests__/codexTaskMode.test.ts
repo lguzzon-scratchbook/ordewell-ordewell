@@ -332,6 +332,29 @@ describe('CodexAdapter task interrupt', () => {
     adapter.dispose();
   });
 
+  it('drops the late report of a command the interrupt left running, inside the turn that replaced it (ADR-0023, F4)', async () => {
+    const { adapter, proc } = await startedTask();
+    const sleep = { id: 'cmd-1', type: 'commandExecution', command: 'sleep 60', cwd: '/repo' };
+    const interrupted = adapter.send('go', () => {});
+    proc.emitStdout(turnStarted('turn-a') + line({ method: 'item/started', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: sleep } }));
+    const acknowledged = adapter.interrupt(1000);
+    await until(() => sentNamed(proc.written, 'turn/interrupt').length > 0);
+    proc.emitStdout(line({ id: sentNamed(proc.written, 'turn/interrupt')[0].id, result: {} }) + turnCompleted('turn-a', 'interrupted'));
+    await acknowledged;
+    await interrupted;
+
+    const events: AgentEvent[] = [];
+    const next = adapter.send('stop sleeping, write the file', (e) => events.push(e));
+    proc.emitStdout(turnStarted('turn-b')
+      + line({ method: 'item/completed', params: { threadId: 'thr-task-1', turnId: 'turn-a', item: { ...sleep, aggregatedOutput: '', exitCode: 0 } } })
+      + line({ method: 'item/started', params: { threadId: 'thr-task-1', turnId: 'turn-b', item: { id: 'cmd-2', type: 'commandExecution', command: 'touch done', cwd: '/repo' } } })
+      + turnCompleted('turn-b'));
+    await next;
+
+    expect(events.filter((e) => e.type === 'tool_call' || e.type === 'tool_result').map((e) => e.id)).toEqual(['cmd-2']);
+    adapter.dispose();
+  });
+
   it('has nothing to interrupt between turns', async () => {
     const { adapter } = await startedTask();
     expect(await adapter.interrupt(1000)).toBe(false);

@@ -77,6 +77,12 @@ export async function routeWebviewMessage(msg: WebviewToHost, deps: WebviewRoute
     case 'removeQueuedTaskMessage':
       await handleTaskControl({ kind: 'removeQueued', id: msg.id }, msg.taskId, deps);
       return;
+    case 'sendTaskMessageNow':
+      await handleTaskControl({ kind: 'messageNow', text: msg.text }, msg.taskId, deps);
+      return;
+    case 'sendQueuedTaskMessageNow':
+      await handleTaskControl({ kind: 'queuedNow', id: msg.id }, msg.taskId, deps);
+      return;
     case 'interruptTask':
       await handleTaskControl({ kind: 'interrupt' }, msg.taskId, deps);
       return;

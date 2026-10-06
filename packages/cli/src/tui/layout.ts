@@ -112,8 +112,10 @@ function queuedBubble(text: string, cols: number): string[] {
 /**
  * The task view's undelivered messages, one bubble each, in queue order. A
  * queued message has not reached the runner yet, and the highlighted one is
- * what ctrl-r takes back; a handed-over one the runner already has and will
- * show the model at its next step (ADR-0023).
+ * what ctrl-r takes back (and, with the composer empty, what ctrl-s sends
+ * now); a handed-over one the runner already has and will show the model at
+ * its next step; a forced one goes once the running turn is interrupted
+ * (ADR-0023).
  */
 export function taskQueuedRows(state: TuiState, cols: number): string[] {
   const tv = state.taskView;
@@ -121,9 +123,16 @@ export function taskQueuedRows(state: TuiState, cols: number): string[] {
   return tv.view.queued.flatMap((message, i) => queuedTaskBubble(message, i === tv.queuedIndex, cols));
 }
 
-function queuedTaskBubble({ text, handedOver }: QueuedTaskMessage, selected: boolean, cols: number): string[] {
+function queuedTaskTag({ handedOver, forced }: QueuedTaskMessage, selected: boolean): string {
+  if (forced) return ' · sending now';
+  if (handedOver) return ' · handed over';
+  return selected ? ' · queued · ctrl-r removes' : ' · queued';
+}
+
+function queuedTaskBubble(message: QueuedTaskMessage, selected: boolean, cols: number): string[] {
+  const { text } = message;
   const marker = selected ? style.accent('❯') : style.grey('◇');
-  const tag = handedOver ? ' · handed over' : selected ? ' · queued · ctrl-r removes' : ' · queued';
+  const tag = queuedTaskTag(message, selected);
   const room = Math.max(1, cols - width(`❯ ◇  ${tag}`));
   return wrap(text, room).map((line, i) => i === 0
     ? truncate(`${marker} ${selected ? style.bold(line) : line}${style.grey(tag)}`, cols)
@@ -156,7 +165,7 @@ function taskHeaderLines(state: TuiState, tv: NonNullable<TuiState['taskView']>,
   const approval = waitingApproval(tv);
   const hint = approval
     ? ['ctrl-y allow', ...(approval.allowForTask ? ['ctrl-t allow for task'] : []), 'ctrl-g deny (composer text is the note)']
-    : ['ctrl-r remove queued', 'ctrl-x interrupt'];
+    : ['ctrl-r remove queued', 'ctrl-x interrupt', 'ctrl-s send now'];
   const index = tv.attempts.indexOf(tv.attempt);
   if (tv.attempts.length > 1) hint.push(`alt←/→ attempt ${index >= 0 ? index + 1 : 1}/${tv.attempts.length}`);
   hint.push('esc back');
@@ -764,8 +773,15 @@ export function helpLayout(rows: number, cols: number): HelpLayout {
   body.push(
     style.grey('tab switches panes · pgup/pgdn scroll · ctrl-o toggles full detail · esc takes back a queued prompt, otherwise esc twice stops · ctrl-l clears · ctrl-c quits'),
   );
+  // One line each: the sheet clips every line to the frame, and the task
+  // view's keys run far past any width on a single one.
   body.push(
-    style.grey('in a task view (t or /terminal on a structured task): ctrl-r removes the selected queued message · ctrl-x interrupts · ctrl-y allows a tool request (its keys sit under it) · ctrl-t allows it for the task · ctrl-g denies it, with the composer text as the note · alt←/→ changes attempt · esc returns'),
+    '',
+    style.bold('In a task view (t or /terminal on a structured task)'),
+    style.grey('  ctrl-s sends now: interrupts the running step, then delivers the composer text — or, with it empty, the selected queued message'),
+    style.grey('  ctrl-n/ctrl-p select a queued message · ctrl-r removes it · ctrl-x interrupts'),
+    style.grey('  ctrl-y allows a tool request (its keys sit under it) · ctrl-t allows it for the task · ctrl-g denies it, with the composer text as the note'),
+    style.grey('  alt←/→ changes attempt · esc returns'),
   );
 
   // The sheet is a table: clip long descriptions to one row each rather than
