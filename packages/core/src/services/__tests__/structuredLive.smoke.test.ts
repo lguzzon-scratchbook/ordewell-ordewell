@@ -181,6 +181,48 @@ describe.runIf(live)('structured transport — live smoke', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, TIMEOUT_MS);
+  it('force sends during a 60s sleep: the sleep is cut short, the forced message acted on, no wait for input between (ADR-0023, F1–F3)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-'));
+    const runner = new StructuredRunner();
+    try {
+      const session = await runner.spawn({
+        taskId: 'live-force',
+        runner: 'claude-code',
+        // Claude Code refuses a foreground `sleep N && …` and steers the model
+        // to run it in the background, where there is no tool call to cut short.
+        prompt: 'Use the Bash tool, in the foreground, to run `python3 -c "import time; time.sleep(60)" && touch slept.txt`, then summarize the result.',
+        modelId: model,
+        mode: 'acceptEdits',
+        cwd: dir,
+        registry: new RunnerRegistry(),
+      });
+      const turns = turnEnds(session);
+      const events: StructuredEvent[] = [];
+      const states: string[] = [];
+      turns.session.onEvent((e) => events.push(e));
+      turns.session.onTurnEnd(() => states.push(turns.session.turnState()));
+      await new Promise<void>((resolve) => turns.session.onEvent((e) => { if (e.type === 'tool_call') resolve(); }));
+      await new Promise<void>((resolve) => setTimeout(resolve, 3000));
+
+      const forcedAt = Date.now();
+      const id = turns.session.forceSend('Stop waiting on that command. Use the Bash tool to run `touch forced.txt`, then reply with the word PINEAPPLE.');
+      while (turns.ends.length < 2) await turns.next();
+      const elapsed = Date.now() - forcedAt;
+      console.error(`[live] claude force send: ${elapsed}ms from the force to the end of the turn it opened`);
+
+      expect(turns.ends, session.getOutput()).toEqual(['interrupted', 'completed']);
+      expect(states[0]).toBe('working');
+      expect(events.filter((e) => e.type === 'turn_start').at(-1)).toMatchObject({ messageId: id, forced: true });
+      expect(existsSync(join(dir, 'forced.txt'))).toBe(true);
+      expect(existsSync(join(dir, 'slept.txt'))).toBe(false);
+      expect(session.getOutput()).toContain('PINEAPPLE');
+      expect(elapsed).toBeLessThan(50_000);
+    } finally {
+      runner.stopAll();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, TIMEOUT_MS);
+
   it('completes a task through task_complete in default mode, with nothing asked of a person (ADR-0022)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ordewell-structured-'));
     const runner = new StructuredRunner();

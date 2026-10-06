@@ -382,6 +382,34 @@ describe('ApiClient — adopting a saved session', () => {
     ]);
   });
 
+  it('force sends a new or a queued message on its own routes, and surfaces a refusal (ADR-0023, F1)', async () => {
+    const hits: string[] = [];
+    const srv = await startCustomServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += String(chunk); });
+      req.on('end', () => {
+        hits.push(`${req.method} ${req.url} ${body}`.trim());
+        res.setHeader('Content-Type', 'application/json');
+        if (req.url?.includes('/t2/')) {
+          res.statusCode = 400;
+          return res.end(JSON.stringify({ error: 'Task "Two" runs in a terminal, which cannot take a message sent now' }));
+        }
+        res.end(JSON.stringify(req.url?.endsWith('/messages/now') ? { id: 'msg-3' } : { sent: true }));
+      });
+    });
+    servers.push(srv);
+    const client = new ApiClient(srv.port);
+
+    expect(await client.forceSendTaskMessage('s1', 't1', 'stop now')).toEqual({ id: 'msg-3' });
+    expect(await client.forceSendQueuedTaskMessage('s1', 't1', 'msg-2')).toEqual({ sent: true });
+    await expect(client.forceSendTaskMessage('s1', 't2', 'stop now')).rejects.toThrow('cannot take a message sent now');
+
+    expect(hits.slice(0, 2)).toEqual([
+      'POST /api/plans/s1/tasks/t1/messages/now {"text":"stop now"}',
+      'POST /api/plans/s1/tasks/t1/messages/msg-2/now',
+    ]);
+  });
+
   it('continues a finished task on its own route, and surfaces a refusal (ADR-0018, K1)', async () => {
     const hits: string[] = [];
     const srv = await startCustomServer((req, res) => {

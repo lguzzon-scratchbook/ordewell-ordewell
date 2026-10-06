@@ -26,6 +26,8 @@ function harness(api: Partial<OrdewellApi> = {}, over: Partial<EffectDeps> = {})
       getTaskLog: vi.fn().mockResolvedValue([]),
       sendTaskMessage: vi.fn().mockResolvedValue({ id: 'm1' }),
       removeQueuedTaskMessage: vi.fn().mockResolvedValue({ removed: true }),
+      forceSendTaskMessage: vi.fn().mockResolvedValue({ id: 'm2' }),
+      forceSendQueuedTaskMessage: vi.fn().mockResolvedValue({ sent: true }),
       interruptTask: vi.fn().mockResolvedValue({ ok: true }),
       continueTask: vi.fn().mockResolvedValue({ ok: true }),
       addTask: vi.fn().mockResolvedValue({ ok: true }),

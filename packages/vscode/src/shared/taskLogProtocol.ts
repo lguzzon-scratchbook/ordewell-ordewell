@@ -14,6 +14,8 @@ export interface TaskLogQueuedMessage {
   text: string;
   /** The runner already has it, for its next step, so it cannot be taken back (ADR-0023). */
   handedOver?: boolean;
+  /** Force sent: it goes as soon as the running turn is interrupted (ADR-0023, F1). */
+  forced?: boolean;
 }
 
 /**
@@ -58,6 +60,10 @@ export type TaskLogToHost =
   | { type: 'ready' }
   | { type: 'sendTaskMessage'; text: string }
   | { type: 'removeQueuedTaskMessage'; id: string }
+  /** Force send (ADR-0023, F1): interrupt the running turn and deliver `text` next. */
+  | { type: 'sendTaskMessageNow'; text: string }
+  /** Force send a message still queued. */
+  | { type: 'sendQueuedTaskMessageNow'; id: string }
   | { type: 'interruptTask' }
   /** Continue the finished task in its saved session, with `text` as its next turn. */
   | { type: 'continueTask'; text: string }

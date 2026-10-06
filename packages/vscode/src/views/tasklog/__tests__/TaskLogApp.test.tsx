@@ -86,6 +86,55 @@ describe('the task log tab (ADR-0018, V1)', () => {
     expect(api.postMessage).toHaveBeenCalledWith({ type: 'removeQueuedTaskMessage', id: 'q1' });
   });
 
+  describe('Send now (ADR-0023, F1)', () => {
+    it('sits next to Send while a turn is live and something is typed, and force sends it', () => {
+      render(<TaskLogApp />);
+      init({ working: true });
+      expect(screen.queryByLabelText('Send now')).toBeNull();
+
+      const input = screen.getByPlaceholderText(/Message the task/);
+      act(() => { fireEvent.change(input, { target: { value: 'stop, use Postgres' } }); });
+      act(() => { fireEvent.click(screen.getByLabelText('Send now')); });
+
+      expect(api.postMessage).toHaveBeenCalledWith({ type: 'sendTaskMessageNow', text: 'stop, use Postgres' });
+      expect((input as HTMLTextAreaElement).value).toBe('');
+    });
+
+    it('force sends on Ctrl+Enter while a turn is live, and plain sends when none is', () => {
+      render(<TaskLogApp />);
+      init({ working: true });
+      const input = screen.getByPlaceholderText(/Message the task/);
+      act(() => { fireEvent.change(input, { target: { value: 'now' } }); });
+      act(() => { fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true }); });
+      expect(api.postMessage).toHaveBeenCalledWith({ type: 'sendTaskMessageNow', text: 'now' });
+
+      send({ type: 'status', status: status({ working: false }) });
+      act(() => { fireEvent.change(input, { target: { value: 'later' } }); });
+      act(() => { fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true }); });
+      expect(api.postMessage).toHaveBeenCalledWith({ type: 'sendTaskMessage', text: 'later' });
+      expect(screen.queryByLabelText('Send now')).toBeNull();
+    });
+
+    it('is not offered on a finished task, whose box continues it', () => {
+      render(<TaskLogApp />);
+      init({ working: true, planStatus: 'completed', continuable: true });
+      act(() => { fireEvent.change(screen.getByPlaceholderText(/Continue the task/), { target: { value: 'more' } }); });
+      expect(screen.queryByLabelText('Send now')).toBeNull();
+    });
+
+    it('is on each queued message, and a forced one shows as sending now', () => {
+      render(<TaskLogApp />);
+      init({ working: true, queued: [{ id: 'q0', text: 'stop now', forced: true }, { id: 'q1', text: 'then add tests' }, { id: 'q2', text: 'handed', handedOver: true }] });
+
+      const buttons = screen.getAllByText('Send now');
+      expect(buttons).toHaveLength(1);
+      act(() => { fireEvent.click(buttons[0]); });
+      expect(api.postMessage).toHaveBeenCalledWith({ type: 'sendQueuedTaskMessageNow', id: 'q1' });
+      expect(screen.getByText('sending now')).toBeTruthy();
+      expect(screen.getByText('handed over')).toBeTruthy();
+    });
+  });
+
   it('is one button: disabled when idle and empty, Stop while a turn is live and empty, Send once typed', () => {
     render(<TaskLogApp />);
     init({ working: false });

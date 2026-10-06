@@ -293,3 +293,35 @@ describe('reduceTaskLog with messages read mid-turn (ADR-0023)', () => {
     expect(reduceTaskLog(requeued, { type: 'message_queued', messageId: 'msg-1', text: 'use Postgres' })).toBe(requeued);
   });
 });
+
+describe('reduceTaskLog with force send (ADR-0023, F1–F2)', () => {
+  const queued = replayTaskLog([
+    start,
+    { type: 'message_queued', messageId: 'msg-1', text: 'use Postgres' },
+    { type: 'message_queued', messageId: 'msg-2', text: 'and docs' },
+    { type: 'message_handed_over', messageId: 'msg-1' },
+  ]);
+
+  it('lists a forced message ahead of the rest, behind an earlier forced one', () => {
+    const view = replayTaskLog([
+      { type: 'message_queued', messageId: 'msg-3', text: 'stop now', forced: true },
+      { type: 'message_queued', messageId: 'msg-4', text: 'and now', forced: true },
+    ], queued);
+    expect(view.queued.map((m) => m.id)).toEqual(['msg-3', 'msg-4', 'msg-1', 'msg-2']);
+    expect(view.queued[0]).toEqual({ id: 'msg-3', text: 'stop now', forced: true });
+  });
+
+  it('moves a queued message forward when it is force sent, and the turn it opens takes it off the queue', () => {
+    const promoted = reduceTaskLog(queued, { type: 'message_queued', messageId: 'msg-2', text: 'and docs', forced: true });
+    expect(promoted.queued).toEqual([{ id: 'msg-2', text: 'and docs', forced: true }, { id: 'msg-1', text: 'use Postgres', handedOver: true }]);
+
+    const view = replayTaskLog([
+      { type: 'turn_end', reason: 'interrupted' },
+      { type: 'turn_start', message: 'and docs', messageId: 'msg-2', forced: true },
+    ], promoted);
+    expect(view.queued).toEqual([{ id: 'msg-1', text: 'use Postgres', handedOver: true }]);
+    expect(view.working).toBe(true);
+    const shown = view.blocks.map((b) => (b.type === 'message' ? `${b.role}:${b.text}` : b.type));
+    expect(shown.slice(-2)).toEqual(['system:Interrupted.', 'user:and docs']);
+  });
+});

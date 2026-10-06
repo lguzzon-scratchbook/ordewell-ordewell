@@ -29,6 +29,8 @@ export interface OrdewellApi {
   getTaskLog(sessionId: string, taskId: string, attempt: number, workspace?: string): Promise<TaskLogEvent[]>;
   sendTaskMessage(sessionId: string, taskId: string, text: string): Promise<{ id: string }>;
   removeQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<{ removed: boolean }>;
+  forceSendTaskMessage(sessionId: string, taskId: string, text: string): Promise<{ id: string }>;
+  forceSendQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<{ sent: boolean }>;
   interruptTask(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
   continueTask(sessionId: string, taskId: string, text: string): Promise<{ ok: boolean }>;
   addTask(sessionId: string, task: Record<string, unknown>): Promise<{ ok: boolean }>;
@@ -357,6 +359,18 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
     case 'removeTaskMessage': {
       const { removed } = await api.removeQueuedTaskMessage(effect.sessionId, effect.taskId, effect.messageId);
       if (!removed) dispatch({ type: 'notice', message: 'That message was already delivered to the task.' });
+      return;
+    }
+
+    // The task log shows the forced message at the head of the queue, then
+    // the interrupt, then the turn it opens; nothing to dispatch here.
+    case 'forceSendTaskMessage':
+      await api.forceSendTaskMessage(effect.sessionId, effect.taskId, effect.text);
+      return;
+
+    case 'forceSendQueuedTaskMessage': {
+      const { sent } = await api.forceSendQueuedTaskMessage(effect.sessionId, effect.taskId, effect.messageId);
+      if (!sent) dispatch({ type: 'notice', message: 'The runner already has that message; it reads it after its current step.' });
       return;
     }
 

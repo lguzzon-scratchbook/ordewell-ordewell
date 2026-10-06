@@ -223,6 +223,19 @@ describe('webview messages reach the session through one entry point each', () =
       expect(interrupt).toHaveBeenCalledWith('t1');
     });
 
+    it('force sends a new or a queued message through the Session, and warns when the runner already had it', async () => {
+      const now = vi.spyOn(h.session, 'forceSendTaskMessage').mockReturnValue('msg-2');
+      const queued = vi.spyOn(h.session, 'forceSendQueuedTaskMessage').mockReturnValue(false);
+      showWarningMessage.mockClear();
+
+      await h.route({ type: 'sendTaskMessageNow', taskId: 't1', text: 'stop now' });
+      await h.route({ type: 'sendQueuedTaskMessageNow', taskId: 't1', id: 'msg-1' });
+
+      expect(now).toHaveBeenCalledWith('t1', 'stop now');
+      expect(queued).toHaveBeenCalledWith('t1', 'msg-1');
+      expect(showWarningMessage.mock.calls.map((c) => String(c[0]))).toEqual([expect.stringContaining('runner already has that message')]);
+    });
+
     it('shows the Session\'s refusal of a task that cannot take a message', async () => {
       showWarningMessage.mockClear();
 

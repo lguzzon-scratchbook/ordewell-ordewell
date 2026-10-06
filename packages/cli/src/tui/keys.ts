@@ -32,6 +32,7 @@ const CONTROL: Record<string, string> = {
   '\x0f': 'ctrl-o',
   '\x10': 'ctrl-p',
   '\x12': 'ctrl-r',
+  '\x13': 'ctrl-s',
   '\x14': 'ctrl-t',
   '\x15': 'ctrl-u',
   '\x17': 'ctrl-w',

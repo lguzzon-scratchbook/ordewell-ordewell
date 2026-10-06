@@ -212,8 +212,15 @@ function endTurn(view: TaskLogView, { reason }: Event<'turn_end'>): TaskLogView 
   return reason === 'interrupted' ? append(closed, (id) => settledMessage(id, 'system', 'Interrupted.')) : closed;
 }
 
-function queueMessage(view: TaskLogView, { messageId, text }: Event<'message_queued'>): TaskLogView {
+function queueMessage(view: TaskLogView, { messageId, text, forced }: Event<'message_queued'>): TaskLogView {
   const listed = view.queued.find((m) => m.id === messageId);
+  if (forced) {
+    // The session's own order (ADR-0023, F2): behind earlier forced messages, ahead of the rest.
+    const rest = view.queued.filter((m) => m !== listed);
+    const at = rest.findIndex((m) => !m.forced);
+    const placed = at < 0 ? rest.length : at;
+    return { ...view, queued: [...rest.slice(0, placed), { id: messageId, text, forced: true }, ...rest.slice(placed)] };
+  }
   if (!listed) return { ...view, queued: [...view.queued, { id: messageId, text }] };
   if (!listed.handedOver) return view;
   return { ...view, queued: view.queued.map((m) => (m === listed ? { id: m.id, text: m.text } : m)) };

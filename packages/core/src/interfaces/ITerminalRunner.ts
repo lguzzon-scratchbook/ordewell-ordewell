@@ -47,11 +47,18 @@ export type StructuredTurnEnd = 'completed' | 'interrupted' | 'failed';
  */
 export type StructuredEvent =
   | Exclude<AgentEvent, { type: 'turn_end' | 'permission_cancelled' | 'message_delivered' | 'message_dropped' }>
-  /** `text` is the user message the turn answers; `messageId` is set when it had waited in the queue. */
-  | { type: 'turn_start'; text: string; messageId?: string }
+  /**
+   * `text` is the user message the turn answers; `messageId` is set when it had
+   * waited in the queue, `forced` when it was force sent (ADR-0023, Q2).
+   */
+  | { type: 'turn_start'; text: string; messageId?: string; forced?: boolean }
   | { type: 'turn_end'; reason: StructuredTurnEnd }
-  /** Waiting in Ordewell's queue — again, for a message the runner was handed and let go of (ADR-0023, D4). */
-  | { type: 'message_queued'; messageId: string; text: string }
+  /**
+   * Waiting in Ordewell's queue — again, for a message the runner was handed
+   * and let go of (ADR-0023, D4). `forced` puts it ahead of the rest, behind
+   * earlier forced ones (F2); a message already listed moves there.
+   */
+  | { type: 'message_queued'; messageId: string; text: string; forced?: boolean }
   | { type: 'message_removed'; messageId: string }
   | { type: 'message_undelivered'; messageId: string; text: string }
   /** The runner accepted the message into its running turn; it can no longer be taken back (ADR-0023, D3). */
@@ -68,6 +75,8 @@ export interface QueuedTaskMessage {
   text: string;
   /** The runner has it and owes a delivery, so it cannot be taken back (ADR-0023, Q1). */
   handedOver?: boolean;
+  /** Force sent: it goes out as soon as the running turn is interrupted (ADR-0023, F1). */
+  forced?: boolean;
 }
 
 /**
@@ -87,6 +96,15 @@ export interface StructuredSessionCapability {
    * the turn ends (ADR-0023). Returns its id, for {@link removeQueued}.
    */
   sendMessage(text: string): string;
+  /**
+   * Force send (ADR-0023, F1–F3): interrupt the running turn, as
+   * {@link interrupt} does, and deliver this message as the turn that
+   * replaces it, ahead of anything still queued. The task does not wait for
+   * input in between. With no turn running it is {@link sendMessage}.
+   */
+  forceSend(text: string): string;
+  /** Force send a message still queued, by id. False once it was handed over or delivered. */
+  forceSendQueued(id: string): boolean;
   /** Take a message back before the runner has it. False once it was handed over or delivered. */
   removeQueued(id: string): boolean;
   /** Messages not yet delivered, oldest first: queued ones, and ones handed over that the runner owes. */

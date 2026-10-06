@@ -10,6 +10,7 @@ import { VsCodeConfig } from '../adapters/VsCodeConfig';
 import { VsCodeFileSystem } from '../adapters/VsCodeFileSystem';
 import { handleIsolationBlocked, handleIsolationHandoff } from './isolation';
 import { removalPrompt, taskFromDraft } from './taskEdit';
+import { ALREADY_HANDED_OVER } from '../providers/TaskLogPanel';
 
 export interface PlanManagerDeps {
   session: Session;
@@ -368,14 +369,20 @@ export function handleCheckpointAnswer(taskId: string, approved: boolean, reason
  * one not running — is the Session's answer, shown rather than swallowed.
  */
 export async function handleTaskControl(
-  control: { kind: 'message'; text: string } | { kind: 'removeQueued'; id: string } | { kind: 'interrupt' },
+  control:
+    | { kind: 'message' | 'messageNow'; text: string }
+    | { kind: 'removeQueued' | 'queuedNow'; id: string }
+    | { kind: 'interrupt' },
   taskId: string,
   deps: Pick<PlanManagerDeps, 'session'>,
 ): Promise<void> {
   try {
     if (control.kind === 'message') deps.session.sendTaskMessage(taskId, control.text);
+    else if (control.kind === 'messageNow') deps.session.forceSendTaskMessage(taskId, control.text);
     else if (control.kind === 'removeQueued') deps.session.removeQueuedTaskMessage(taskId, control.id);
-    else await deps.session.interruptTask(taskId);
+    else if (control.kind === 'queuedNow') {
+      if (!deps.session.forceSendQueuedTaskMessage(taskId, control.id)) throw new Error(ALREADY_HANDED_OVER);
+    } else await deps.session.interruptTask(taskId);
   } catch (err) {
     void vscode.window.showWarningMessage(err instanceof Error ? err.message : String(err));
   }

@@ -81,6 +81,13 @@ export class TaskControlError extends Error {
   }
 }
 
+/** How a refused {@link TaskControlError} names what was asked: "no turn to …", "cannot take … from Ordewell". */
+const CONTROL_WORDS = {
+  message: { noTurn: 'send a message to', terminal: 'a message' },
+  interrupt: { noTurn: 'interrupt', terminal: 'an interrupt' },
+  force: { noTurn: 'send a message to', terminal: 'a message sent now' },
+} as const;
+
 /**
  * One run of one task, from the moment the scheduler claims it until its
  * verdict, cancel, stop or plan load. Everything that has to die with the run
@@ -423,17 +430,42 @@ export class TaskOrchestrator {
    * progress. Returns the message's id, for {@link removeQueuedTaskMessage}.
    */
   sendTaskMessage(taskId: string, text: string): string {
+    return this.messageTask(taskId, text, 'message', (session, message) => session.sendMessage(message));
+  }
+
+  /**
+   * Force send (ADR-0023, F1–F3): interrupt the running turn and deliver the
+   * message as the next one, ahead of anything queued, without the task
+   * waiting for input in between. A task already waiting for input just takes it.
+   */
+  forceSendTaskMessage(taskId: string, text: string): string {
+    return this.messageTask(taskId, text, 'force', (session, message) => session.forceSend(message));
+  }
+
+  private messageTask(
+    taskId: string,
+    text: string,
+    action: 'message' | 'force',
+    send: (session: StructuredSessionCapability, message: string) => string,
+  ): string {
     const message = text.trim();
     if (!message) throw new TaskControlError('A message to a task cannot be empty.');
     const task = this.store.get(taskId);
-    const session = this.structuredSession(taskId, 'message');
+    const session = this.structuredSession(taskId, action);
     if (task?.status === 'awaiting_user' && task.awaitingReason !== 'input') {
       throw new TaskControlError(`Task "${task.title}" is at a checkpoint: approve or reject it instead.`);
     }
-    const id = session.sendMessage(message);
+    const id = send(session, message);
     if (task?.status === 'awaiting_user') this.store.markInProgress(taskId);
     this.emit('onTaskChanged');
     return id;
+  }
+
+  /** Force send a message still queued behind the running turn; false once the runner has it. */
+  forceSendQueuedTaskMessage(taskId: string, id: string): boolean {
+    const sent = this.structuredSession(taskId, 'force').forceSendQueued(id);
+    if (sent) this.emit('onTaskChanged');
+    return sent;
   }
 
   /** Take back a message still queued behind a turn; false once it was delivered. */
@@ -454,16 +486,17 @@ export class TaskOrchestrator {
     return session && isStructuredSession(session) ? session.queued() : [];
   }
 
-  private structuredSession(taskId: string, action: 'message' | 'interrupt'): StructuredSessionCapability {
+  private structuredSession(taskId: string, action: keyof typeof CONTROL_WORDS): StructuredSessionCapability {
     const task = this.store.get(taskId);
     if (!task) throw new TaskControlError(`No task ${taskId} in this plan.`);
     const attempt = this.attempts.get(taskId);
     const session = attempt?.session;
+    const words = CONTROL_WORDS[action];
     if (!attempt || !session || attempt.phase !== 'running' || attempt.decided) {
-      throw new TaskControlError(`Task "${task.title}" is not running, so there is no turn to ${action === 'message' ? 'send a message to' : 'interrupt'}.`);
+      throw new TaskControlError(`Task "${task.title}" is not running, so there is no turn to ${words.noTurn}.`);
     }
     if (!isStructuredSession(session)) {
-      throw new TaskControlError(`Task "${task.title}" runs in a terminal, which cannot take a ${action === 'message' ? 'message' : 'interrupt'} from Ordewell: use its terminal instead.`);
+      throw new TaskControlError(`Task "${task.title}" runs in a terminal, which cannot take ${words.terminal} from Ordewell: use its terminal instead.`);
     }
     return session;
   }

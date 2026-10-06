@@ -80,6 +80,10 @@ export type Effect =
   /** Takes back one queued message before it is delivered. */
   | { type: 'removeTaskMessage'; sessionId: string; taskId: string; messageId: string }
   | { type: 'interruptTask'; sessionId: string; taskId: string }
+  /** Force send (ADR-0023, F1): interrupt the running turn and deliver `text` next. */
+  | { type: 'forceSendTaskMessage'; sessionId: string; taskId: string; text: string }
+  /** Force send one queued message, by id. */
+  | { type: 'forceSendQueuedTaskMessage'; sessionId: string; taskId: string; messageId: string }
   /** Continue a finished structured task in its saved session, with `text` as its next turn (ADR-0018, K1). */
   | { type: 'continueTask'; sessionId: string; taskId: string; text: string; watch?: boolean }
   | { type: 'respondApproval'; sessionId: string; approvalId: string; granted: boolean }

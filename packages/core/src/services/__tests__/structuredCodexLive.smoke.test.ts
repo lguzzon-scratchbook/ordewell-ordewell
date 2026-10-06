@@ -144,6 +144,34 @@ describe.runIf(live)('structured transport, Codex — live smoke', () => {
     } finally { own.stopAll(); }
   }, TIMEOUT_MS);
 
+  // Codex aborts the turn but lets the command run on (F4), so only the
+  // forced turn's timing shows the wait was cut short — not a missing file.
+  it('force sends during `sleep 60`: the wait is cut short, the forced message acted on, no wait for input between (ADR-0023, F1–F4)', async () => {
+    const dir = dirFor();
+    const own = new StructuredRunner();
+    try {
+      const session = await spawnTask(own, dir, 'live-codex-force', 'Run the shell command `sleep 60 && echo slept`, then summarize the result.', 'fullAccess');
+      const turns = turnEnds(session);
+      const states: string[] = [];
+      turns.session.onTurnEnd(() => states.push(turns.session.turnState()));
+      await new Promise<void>((resolve) => turns.session.onEvent((e) => { if (e.type === 'tool_call') resolve(); }));
+      await new Promise<void>((resolve) => setTimeout(resolve, 3000));
+
+      const forcedAt = Date.now();
+      const id = turns.session.forceSend('Stop waiting on that command. Run the shell command `touch forced.txt`, then reply with the word PINEAPPLE.');
+      while (turns.ends.length < 2) await turns.next();
+      const elapsed = Date.now() - forcedAt;
+      console.error(`[live] codex force send: ${elapsed}ms from the force to the end of the turn it opened`);
+
+      expect(turns.ends, session.getOutput()).toEqual(['interrupted', 'completed']);
+      expect(states[0]).toBe('working');
+      expect(turns.events.filter((e) => e.type === 'turn_start').at(-1)).toMatchObject({ messageId: id, forced: true });
+      expect(existsSync(join(dir, 'forced.txt'))).toBe(true);
+      expect(session.getOutput()).toContain('PINEAPPLE');
+      expect(elapsed).toBeLessThan(50_000);
+    } finally { own.stopAll(); }
+  }, TIMEOUT_MS);
+
   it('continues a finished session by its native id', async () => {
     const dir = dirFor();
     const first = new StructuredRunner();

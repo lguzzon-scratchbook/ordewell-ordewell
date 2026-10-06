@@ -5255,6 +5255,33 @@ body {
   color: var(--red);
 }
 
+.task-log-queued-now,
+.task-log-send-now {
+  font-family: inherit;
+  font-size: 11px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.task-log-queued-now {
+  padding: 1px 6px;
+}
+
+.task-log-send-now {
+  align-self: stretch;
+  padding: 0 10px;
+}
+
+.task-log-queued-now:hover,
+.task-log-send-now:hover {
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+
 .task-log-queued-state {
   font-size: 11px;
   color: var(--text-muted);

@@ -150,6 +150,8 @@ interface PendingMessage {
   id: string;
   text: string;
   stage: 'queued' | 'steering' | 'handed_over';
+  /** Force sent (ADR-0023, F1): it opens the turn that replaces the interrupted one. */
+  forced?: boolean;
 }
 
 interface SessionLaunch {
@@ -322,6 +324,53 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     return id;
   }
 
+  /**
+   * Force send (ADR-0023, F1–F3): interrupt the running turn — and the tool
+   * call in flight — then deliver this message as the turn that replaces it,
+   * ahead of everything still queued. With no turn to interrupt it is a plain
+   * {@link sendMessage}.
+   */
+  forceSend(text: string): string {
+    if (!this.runningTurn()) return this.sendMessage(text);
+    this.messageCount += 1;
+    const message: PendingMessage = { id: `msg-${this.messageCount}`, text, stage: 'queued' };
+    this.force(message);
+    return message.id;
+  }
+
+  /** Force send a message still waiting in the queue. False once the runner has it, or it is gone. */
+  forceSendQueued(id: string): boolean {
+    const message = this.queue.find((m) => m.id === id);
+    if (message?.stage !== 'queued') return false;
+    this.queue = this.queue.filter((m) => m !== message);
+    this.force(message);
+    return true;
+  }
+
+  /**
+   * Behind earlier forced messages and ahead of the rest, handed-over ones
+   * included: what the runner already has is the runner's to order (F2). Held
+   * back from steering while the interrupt runs, it opens the next turn — and
+   * a queue that is not empty when the turn ends is what keeps the task out of
+   * "waiting for input" between the two (F3).
+   */
+  private force(message: PendingMessage): void {
+    message.forced = true;
+    const at = this.queue.findIndex((m) => !m.forced);
+    this.queue.splice(at < 0 ? this.queue.length : at, 0, message);
+    this.emitEvent({ type: 'message_queued', messageId: message.id, text: message.text, forced: true });
+    if (!this.runningTurn()) return;
+    // Nobody awaits a force send's interrupt. Should it throw, the message
+    // still opens the next turn — only later, when this one ends by itself.
+    this.interrupt().catch((err: unknown) => {
+      console.error(`[structured] Force send could not interrupt task ${this.taskId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
+  private runningTurn(): boolean {
+    return !this.exited && this.adapter !== null && this.turn !== null && !this.turn.ended;
+  }
+
   /** No runner can recall a message once offered to it, so only a queued one comes back. */
   removeQueued(id: string): boolean {
     const message = this.queue.find((m) => m.id === id);
@@ -332,7 +381,9 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
   }
 
   queued(): QueuedTaskMessage[] {
-    return this.queue.map(({ id, text, stage }) => (stage === 'queued' ? { id, text } : { id, text, handedOver: true }));
+    return this.queue.map(({ id, text, stage, forced }) => ({
+      id, text, ...(stage === 'queued' ? {} : { handedOver: true }), ...(forced ? { forced: true } : {}),
+    }));
   }
 
   nativeSessionId(): string | null {
@@ -433,19 +484,19 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     });
   }
 
-  private openTurn(text: string, messageId?: string): OpenTurn {
+  private openTurn(text: string, message?: Pick<PendingMessage, 'id' | 'forced'>): OpenTurn {
     this.turnCount += 1;
     const turn: OpenTurn = { id: this.turnCount, abort: new AbortController(), ended: false, reason: 'completed', steerRefused: false };
     this.turn = turn;
     this.state = 'working';
-    this.emitEvent({ type: 'turn_start', text, ...(messageId ? { messageId } : {}) });
+    this.emitEvent({ type: 'turn_start', text, ...(message ? { messageId: message.id } : {}), ...(message?.forced ? { forced: true } : {}) });
     return turn;
   }
 
-  private deliver(text: string, messageId?: string): void {
+  private deliver(text: string, message?: PendingMessage): void {
     const adapter = this.adapter;
     if (!adapter) return;
-    const turn = this.openTurn(text, messageId);
+    const turn = this.openTurn(text, message);
     const generation = this.generation;
 
     void adapter.send(text, (event) => {
@@ -547,7 +598,7 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
       // last one closed, so the message is that turn's, not a mid-turn read.
       const message = this.delivered(event.id);
       if (message) {
-        this.openTurn(message.text, message.id);
+        this.openTurn(message.text, message);
         this.offerNext();
       }
       return;
@@ -619,7 +670,7 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     const head = this.queue[0];
     if (head?.stage !== 'queued') return;
     this.queue.shift();
-    this.deliver(head.text, head.id);
+    this.deliver(head.text, head);
   }
 
   private undeliverQueued(): void {
