@@ -1,9 +1,9 @@
 import { createAiService, type IAiService } from './AiService';
-import { applyTaskOps, canMergeTasks, canSplitTask, type TaskOp } from './TaskOps';
+import { applyTaskOps, type TaskOp } from './TaskOps';
 import type { TaskQueryCatalog } from './TaskQuery';
 import { plannerToolHandler, runnersOf, type PlanEditOutcome } from './plannerTools';
 import { sharedMcpServer, type OrdewellMcpServer, type PlannerToolHandler } from './mcp';
-import { validateTaskEdit, type EditCatalog } from './TaskEditValidator';
+import type { EditCatalog } from './TaskEditValidator';
 import { ConversationEditError, PlannerConversation, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type PlannerSubmission, type RewindTarget } from './PlannerConversation';
 import { forkPlanState, type ForkedDialogue } from './conversationFork';
 import { Planner } from './Planner';
@@ -16,15 +16,13 @@ import { RunnerApprovals } from './RunnerApprovals';
 import { approvalScopes, isRunnerApproval, type ApprovalAnswer, type ApprovalRequest } from '../interfaces/IApproval';
 import { HttpWebFetcher } from './HttpWebFetcher';
 import { ModelResolver } from './ModelResolver';
-import { filterModelsForPrompt, coerceAssignments, effectiveAllowlist } from './ModelAllowlistResolver';
-import { retargetTaskRunner, runnerAssignment, type RunnerCatalog } from './TaskRetarget';
+import { filterModelsForPrompt, coerceAssignments } from './ModelAllowlistResolver';
+import type { RunnerCatalog } from './TaskRetarget';
 import { plannerModesFrom, plannerRuntimeToggles } from './plannerModes';
 import type { UserSettings } from './SettingsService';
 import { SkillsService } from './SkillsService';
-import { buildMergePrompt, buildSplitPrompt } from './PlanPrompts';
 import type { MergeGateView, SessionBroadcaster, SessionNotice } from './SessionMessage';
 import { SessionEventRelay } from './SessionEventRelay';
-import { conflictResolverTask } from './Landing';
 import { saveSession } from '../utils/sessionStore';
 import { listTaskLogAttempts, readTaskLog, type TaskLogFile, type TaskLogLocation } from '../utils/taskLogStore';
 import { digestTaskLog, type TaskLogEvent } from '../models/TaskLog';
@@ -41,22 +39,11 @@ import type { ITerminalRunner, RunnerTransport } from '../interfaces/ITerminalRu
 import type { TaskOutputSource } from '../interfaces/TaskOutputSource';
 import type { IsolationMergeResult, IsolationView, IWorktreeIsolation } from '../interfaces/IWorktreeIsolation';
 import { migratePlanStateIsolation } from './isolationRecord';
+import type { IsolationRunController } from './IsolationRunController';
+import { PlanEditor } from './PlanEditor';
+import { PlanEditError } from './PlanEditError';
 import type { RunnerRegistry } from '../plugins/RunnerRegistry';
 import { runnerModesFrom, resolveDefaultMode, type RunnerModeInfo } from './ModeResolver';
-
-/**
- * A direct (non-planner) plan edit the session refused. Distinct from a plain
- * Error so a surface can tell "you asked for something invalid" from "something
- * broke" and say which — the HTTP routes used to collapse both into 404/500,
- * which read to the TUI and VS Code as the edit silently doing nothing. Carries
- * no status code: core is transport-agnostic, the route maps it.
- */
-export class PlanEditError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'PlanEditError';
-  }
-}
 
 /**
  * Options for plan generation. Progress is not overridable: every planner
@@ -339,7 +326,7 @@ export function createSession(deps: SessionDeps): Session {
   });
   const usage = new PlannerUsageLedger();
   const events = new SessionEventRelay({
-    broadcast: deps.broadcast, onNotice: deps.onNotice, store, orchestrator, usage,
+    broadcast: deps.broadcast, onNotice: deps.onNotice, store, orchestrator, runs: orchestrator.runs, usage,
     awaitingApproval: (taskId) => runnerApprovals.waiting(taskId),
   });
 
@@ -379,6 +366,7 @@ export function createSession(deps: SessionDeps): Session {
     planner: deps.planner ?? new Planner(deps.config, aiService),
     store,
     orchestrator,
+    runs: orchestrator.runs,
     events,
     usage,
     approvals,
@@ -408,6 +396,8 @@ export interface SessionParts {
   planner: SessionPlanner;
   store: PlanStore;
   orchestrator: TaskOrchestrator;
+  /** The orchestrator's own: Session reads the run and acts on it there, Merge all aside. */
+  runs: IsolationRunController;
   events: SessionEventRelay;
   usage: PlannerUsageLedger;
   approvals: PendingApprovals;
@@ -437,6 +427,7 @@ export class Session {
   private readonly events: SessionEventRelay;
   private readonly planner: SessionPlanner;
   private readonly orchestrator: TaskOrchestrator;
+  private readonly runs: IsolationRunController;
   private readonly store: PlanStore;
   private readonly config: IConfig;
   private readonly registry: RunnerRegistry;
@@ -459,6 +450,7 @@ export class Session {
   private currentSessionId: string;
   private readonly skillsService: Pick<SkillsService, 'findSkill' | 'listSkills'>;
   private readonly conversation: PlannerConversation;
+  private readonly editor: PlanEditor;
   private readonly plannerTools: PlannerToolHandler = plannerToolHandler({
     liveCatalog: () => this.liveCatalog(),
     coerce: (tasks, runners) => coerceAssignments(tasks, this.allowlist(), runners, this.models()),
@@ -485,6 +477,7 @@ export class Session {
     this.planner = parts.planner;
     this.store = parts.store;
     this.orchestrator = parts.orchestrator;
+    this.runs = parts.runs;
     this.events = parts.events;
     this.usage = parts.usage;
     this.approvals = parts.approvals;
@@ -515,6 +508,23 @@ export class Session {
         return this.orchestrator.queuedCount;
       },
       afterEdit: () => this.orchestrator.tick(),
+    });
+
+    this.editor = new PlanEditor({
+      store: this.store,
+      plan: () => this.plan,
+      catalog: {
+        edit: () => this.editCatalog(),
+        runner: (runner) => this.catalogFor(runner),
+        allowlist: (runner) => this.allowlist()[runner],
+        models: () => this.models(),
+        remember: (runner, models) => { this.modelsCache = { ...this.modelsCache, [runner]: models }; },
+      },
+      mutate: (op, notify) => this.mutatePlan(op, notify),
+      scheduler: this.orchestrator,
+      runs: this.runs,
+      broadcast: (msg) => this.broadcast(msg),
+      plannerTools: () => this.aiService().plannerToolsAttached?.() ?? false,
     });
 
     this.unsubObserver = this.orchestrator.subscribe(this.observer());
@@ -604,7 +614,7 @@ export class Session {
     if (!this.plan) return;
     this.events.flushSubagentRuns(this.plan);
     this.syncPlanTasks();
-    this.plan.isolation = this.orchestrator.isolationRecord ?? undefined;
+    this.plan.isolation = this.runs.planIsolation ?? undefined;
     this.plan.runnerTransport = this.orchestrator.runnerTransport ?? undefined;
     this.plan.plannerUsage = this.usage.snapshot();
     this.plan.lastUpdated = new Date().toISOString();
@@ -637,7 +647,7 @@ export class Session {
     this.orchestrator.clearQueuedMessages();
     this.store.clearLog();
     this.orchestrator.loadPlan([]);
-    void this.orchestrator.adoptIsolation(null);
+    void this.runs.adopt(null);
     this.orchestrator.adoptRunnerTransport(null);
   }
 
@@ -736,6 +746,16 @@ export class Session {
     return out;
   }
 
+  /** What a runner offers, as `runnerAssignment` needs it. Spawns the runner's CLI to list models. */
+  private async catalogFor(runner: RunnerId): Promise<RunnerCatalog> {
+    const modes = this.runnerModesFor([runner])[runner];
+    return {
+      models: (await this.modelResolver.modelsForRunners([runner]))[runner] ?? [],
+      modes,
+      defaultMode: resolveDefaultMode(modes, this.config.autonomousMode),
+    };
+  }
+
   get planState(): LegacyPlanState | null { return this.plan; }
 
   /**
@@ -814,7 +834,7 @@ export class Session {
     // drops the ones a one-shot run cannot honour, so a structural toggle like
     // verify — which only appends a task — stops being silently lost between
     // here and the prompt.
-    const modes = { ...plannerModesFrom(settings, this.config.autonomousMode), isolatedExecution: await this.orchestrator.plannerIsolation() };
+    const modes = { ...plannerModesFrom(settings, this.config.autonomousMode), isolatedExecution: await this.runs.plannerLayout() };
 
     const releaseAbort = this.denyApprovalsOnAbort(options?.signal);
     let plan: LegacyPlanState;
@@ -962,7 +982,7 @@ export class Session {
    */
   private submitPlanFromTool(tasks: Task[], runners: RunnerId[]): boolean {
     if (!this.plan || !this.conversation.submit({ kind: 'plan', tasks })) return false;
-    for (const runner of runners) this.admitRunner(runner, this.modelsCache[runner] ?? []);
+    for (const runner of runners) this.editor.admitRunner(runner, this.modelsCache[runner] ?? []);
     return true;
   }
 
@@ -989,7 +1009,7 @@ export class Session {
       const result = applyTaskOps(this.store.planTasks, batch, catalog.runners, this.editCatalog(catalog.runners));
       if (!result.ok) return { ok: false, errors: result.errors };
       summary = result.summary;
-      for (const runner of runnersOf(result.tasks)) this.admitRunner(runner, this.modelsCache[runner] ?? []);
+      for (const runner of runnersOf(result.tasks)) this.editor.admitRunner(runner, this.modelsCache[runner] ?? []);
     }
     if (!this.conversation.submit({ kind: 'task_ops', ops: batch })) return refuse('No planning turn is open to take the edit.');
     return { ok: true, summary, queued };
@@ -1038,7 +1058,7 @@ export class Session {
       runnerModes,
       autonomousDefault: this.config.autonomousMode,
       verificationEnabled: settings.verificationEnabled ?? false,
-      isolatedExecution: await this.orchestrator.plannerIsolation(),
+      isolatedExecution: await this.runs.plannerLayout(),
       // The planner's own model window, when a cached catalog knows it, so the
       // usage line can show context fill (#49). Unknown stays absent.
       contextWindow: this.modelResolver.contextWindowFor?.(this.config.orchestratorModel),
@@ -1107,7 +1127,7 @@ export class Session {
     this.orchestrator.loadPlan(this.store.planTasks, this.plan.runners);
     await this.orchestrator.approveReview();
 
-    if (!this.orchestrator.isRunning && !this.orchestrator.awaitingIsolationChoice) {
+    if (!this.orchestrator.isRunning && !this.runs.blocked) {
       this.events.executionComplete(this.plan);
       this.persist();
     }
@@ -1207,7 +1227,7 @@ export class Session {
         runnerModes,
         autonomousDefault: this.config.autonomousMode,
         perRunnerAllowlist: modelAllowlist,
-        isolatedExecution: await this.orchestrator.plannerIsolation(),
+        isolatedExecution: await this.runs.plannerLayout(),
       });
 
       this.mutatePlan(() => {
@@ -1310,7 +1330,7 @@ export class Session {
    * session asks here instead.
    */
   isolationView(): IsolationView | null {
-    return this.orchestrator.isolationView();
+    return this.runs.view();
   }
 
   /** The dependencies a task waits on at its merge gate (ADR-0020); empty when it waits for no Merge all. */
@@ -1325,8 +1345,7 @@ export class Session {
 
   /** The run's integration branch against its base ref, as a unified diff. */
   async reviewRunDiff(): Promise<string> {
-    if (!this.orchestrator.isolationRecord) throw new PlanEditError('This plan has no isolated run');
-    return this.orchestrator.reviewRunDiff();
+    return this.runs.reviewDiff();
   }
 
   /**
@@ -1338,7 +1357,8 @@ export class Session {
    * and refuses while one runs.
    */
   async mergeRun(): Promise<IsolationMergeResult> {
-    if (!this.orchestrator.isolationRecord) throw new PlanEditError('This plan has no isolated run');
+    // Ahead of the ops refusal: with no run there is nothing to merge once the ops task ends either.
+    this.runs.requireRun();
     const result = await this.orchestrator.mergeRun();
     this.broadcast({ type: 'isolation_merge', result });
     return result;
@@ -1347,7 +1367,7 @@ export class Session {
   /** Remove the run's worktrees and task branches; keep its integration branch to review or merge. */
   async cleanupRun(): Promise<void> {
     this.requireSettledRun();
-    await this.orchestrator.cleanupRun();
+    await this.runs.cleanup();
     this.persist();
   }
 
@@ -1358,33 +1378,18 @@ export class Session {
    */
   async discardRun(): Promise<void> {
     this.requireSettledRun();
-    await this.orchestrator.discardRun();
+    await this.runs.discard();
     this.persist();
   }
 
   private requireSettledRun(): void {
-    if (!this.orchestrator.isolationRecord) throw new PlanEditError('This plan has no isolated run');
+    this.runs.requireRun();
     if (this.orchestrator.isRunning) throw new PlanEditError('The run is still running — stop it first');
   }
 
-  /**
-   * The opt-in way through a merge conflict: add an AI task, on the conflicted
-   * task's own runner and model, that merges its branch by hand in a worktree
-   * of its own. When that task lands, the conflicted one lands through it (see
-   * {@link TaskOrchestrator.linkConflictResolver}). The automatic answer to a
-   * conflict is a repair, a new attempt of the same task (ADR-0015); a task is
-   * only ever added to the plan by this call.
-   */
+  /** Add the task that merges a conflicted task's branch by hand; see {@link PlanEditor.addConflictResolver}. */
   async resolveConflictAsTask(taskId: string): Promise<LegacyPlanState | null> {
-    if (!this.plan) return null;
-    const task = this.store.get(taskId);
-    const draft = task ? conflictResolverTask(task, this.orchestrator.isolationRecord?.run ?? null) : null;
-    if (!draft) throw new PlanEditError('Only a task whose merge conflicted can be resolved as a task');
-    return this.editPlan(() => {
-      const resolver = this.store.add(draft);
-      this.orchestrator.linkConflictResolver(resolver.id, taskId);
-      return true;
-    });
+    return this.editor.addConflictResolver(taskId);
   }
 
   stopExecution(): void {
@@ -1398,6 +1403,8 @@ export class Session {
    * broadcast — in that order, once. A store op returning false aborts
    * before anything is persisted. PlanStore is the single authority for
    * task state; LegacyPlanState.tasks is populated only at persist time.
+   * Direct edits reach it through the {@link PlanEditor}, which adds the
+   * reschedule they owe.
    */
   private mutatePlan(op: () => boolean, notify: () => void = () => this.events.planGenerated(this.plan, this.goal)): LegacyPlanState | null {
     if (!this.plan) return null;
@@ -1409,176 +1416,29 @@ export class Session {
     return this.plan;
   }
 
-  /**
-   * The direct-edit seam: {@link mutatePlan} plus the reschedule every
-   * structural edit owes an armed scheduler. Nothing else wakes one after a
-   * hand edit — the queue-drain path never runs, because a direct edit never
-   * queues — so a task the edit just unblocked would sit ready and never
-   * start. `tick()` no-ops while the scheduler is idle, so this costs nothing
-   * during plain planning. The planner-driven path re-ticks in
-   * {@link PlannerConversation} instead (`afterEdit`); it must not tick twice.
-   */
-  private async editPlan(op: () => boolean, notify?: () => void): Promise<LegacyPlanState | null> {
-    const plan = this.mutatePlan(op, notify);
-    if (!plan) return null;
-    await this.orchestrator.tick();
-    return plan;
-  }
-
-  /**
-   * Patch one task's fields. A hand-set dependency list, or a type flip
-   * between AI and MAN, are the patches that can leave a task incoherent
-   * (unschedulable, or carrying fields that mean nothing for its new type),
-   * so both go through the same {@link validateTaskEdit} guard the planner's
-   * task-ops applier uses (as the 'direct' actor, which skips the lock rule)
-   * rather than a second copy of the rules — and throws, so the surface can
-   * say why. Gated on the task existing so an edit to an unknown id still
-   * falls through to the no-op `store.update` below instead of throwing.
-   */
+  /** Patch one task's fields, checked as the planner's task ops are; see {@link PlanEditor.updateTask}. */
   async updateTask(taskId: string, changes: Partial<Task>): Promise<LegacyPlanState | null> {
-    if ('ops' in changes) changes = { ...changes, ops: changes.ops === true ? true : undefined };
-    if ((changes.dependencies || changes.type || changes.assignedModel || changes.taskMode || 'ops' in changes) && this.store.get(taskId)) {
-      const check = validateTaskEdit('direct', this.store.planTasks, taskId, changes, this.editCatalog());
-      if (!check.ok) throw new PlanEditError(check.error ?? 'Those changes are not valid');
-      if (check.clear?.length) {
-        changes = { ...changes, ...Object.fromEntries(check.clear.map((f) => [f, undefined])) };
-      }
-    }
-    return this.editPlan(
-      () => Boolean(this.store.update(taskId, changes)),
-      () => this.broadcast({ type: 'task_updated', taskId, changes: changes as Record<string, unknown> }),
-    );
+    return this.editor.updateTask(taskId, changes);
   }
 
-  /**
-   * Move one task onto a different runner. Distinct from {@link updateTask}
-   * because a runner change is never a single-field edit: the task's model,
-   * thinking effort and mode are all scoped to its runner, so they are
-   * re-derived from the new runner's catalog (see {@link retargetTaskRunner}).
-   * That needs discovery, which is why it is not a branch inside `updateTask`.
-   *
-   * The runner is also admitted into `plan.runners` — see {@link admitRunner}.
-   */
+  /** Move one task onto a different runner, re-deriving what is scoped to it; see {@link PlanEditor.setTaskRunner}. */
   async setTaskRunner(taskId: string, runner: RunnerId): Promise<LegacyPlanState | null> {
-    if (!this.plan) return null;
-    const task = this.store.get(taskId);
-    if (!task) return null;
-    // Guard before discovery, not after: `modelsForRunners` spawns the runner's
-    // own CLI to list models, which is far too expensive for a no-op re-pick.
-    if (task.assignedRunner === runner || task.type === 'user') return this.plan;
-
-    const catalog = await this.catalogFor(runner);
-    const changes = retargetTaskRunner(task, runner, this.allowedCatalog(catalog, runner));
-    if (Object.keys(changes).length === 0) return this.plan;
-
-    return this.editPlan(() => {
-      if (!this.store.update(taskId, changes)) return false;
-      this.admitRunner(runner, catalog.models);
-      return true;
-    });
+    return this.editor.setTaskRunner(taskId, runner);
   }
 
-  /** What a runner offers, as {@link runnerAssignment} needs it. Spawns the runner's CLI to list models. */
-  private async catalogFor(runner: RunnerId): Promise<RunnerCatalog> {
-    const modes = this.runnerModesFor([runner])[runner];
-    return {
-      models: (await this.modelResolver.modelsForRunners([runner]))[runner] ?? [],
-      modes,
-      defaultMode: resolveDefaultMode(modes, this.config.autonomousMode),
-    };
-  }
-
-  /**
-   * What a *derived* assignment may draw from: the runner's catalog narrowed to
-   * the user's allowlist. Deriving from the full catalog would hand a task the
-   * runner's first model regardless of a restriction the user set — the next
-   * planner turn's `coerceAssignments` would snap it back anyway, so the user
-   * would see their pick silently change instead of never being offered.
-   *
-   * `catalogFor` stays unnarrowed because {@link admitRunner} caches it as what
-   * the runner really offers, which is what effort clamping needs.
-   */
-  private allowedCatalog(catalog: RunnerCatalog, runner: RunnerId): RunnerCatalog {
-    // The other runners' catalogs are what lets `effectiveAllowlist` tell an id
-    // this runner hasn't listed yet from one that belongs to a different runner.
-    const allowed = effectiveAllowlist(
-      this.settingsFn().modelAllowlist?.[runner],
-      runner,
-      { ...this.models(), [runner]: catalog.models },
-    );
-    if (!allowed) return catalog;
-    const models = catalog.models.filter((m) => allowed.includes(m.modelId));
-    // Nothing left means the allowlist named only ids this runner hasn't
-    // listed. An empty catalog reads as "discovery failed" to
-    // `runnerAssignment`, which then leaves the task on the *old* runner's
-    // model — a worse outcome than ignoring the restriction for this derivation.
-    return models.length > 0 ? { ...catalog, models } : catalog;
-  }
-
-  /**
-   * Make a runner a first-class member of this plan. Without this, the next
-   * planner turn's `coerceAssignments` would treat it as disallowed and snap
-   * every task on it back, silently undoing the user's choice; and that same
-   * pass clamps efforts against `modelsCache`, so a catalog missing from there
-   * makes the effort we just derived read as unverifiable.
-   */
-  private admitRunner(runner: RunnerId, models: DiscoveredModel[]): void {
-    if (!this.plan) return;
-    if (!this.plan.runners.includes(runner)) this.plan.runners = [...this.plan.runners, runner];
-    // The store is what the orchestrator resolves a spawn against, and nothing
-    // reloads it between this edit and a single-task run.
-    this.store.admitRunner(runner);
-    if (models.length > 0) this.modelsCache = { ...this.modelsCache, [runner]: models };
-  }
-
-  /**
-   * Replace one task's dependency list — the named entry point the surfaces'
-   * dependency pickers call. The guard itself lives in {@link updateTask}, so
-   * a dependency list arriving as a plain field patch is rejected by the same
-   * rule instead of slipping past it.
-   */
+  /** Replace one task's dependency list, under the same guard as a field patch; see {@link PlanEditor.setTaskDependencies}. */
   async setTaskDependencies(taskId: string, dependencies: string[]): Promise<LegacyPlanState | null> {
-    if (!this.plan) return null;
-    return this.updateTask(taskId, { dependencies });
+    return this.editor.setTaskDependencies(taskId, dependencies);
   }
 
-  /**
-   * Delete one task. A running task is cancelled first: the plan can drop it
-   * either way, but nothing can reach its runner afterwards — the tmux session
-   * outlives the plan and the orchestrator keeps counting it as active. The
-   * planner-driven path refuses instead (see {@link applyTaskOps}); a user
-   * deleting their own task means it.
-   */
+  /** Delete one task, cancelling its runner first if it runs; see {@link PlanEditor.removeTask}. */
   async removeTask(taskId: string): Promise<LegacyPlanState | null> {
-    if (!this.plan || !this.store.get(taskId)) return null;
-    await this.orchestrator.releaseTask(taskId);
-    return this.editPlan(() => (this.store.remove(taskId), true));
+    return this.editor.removeTask(taskId);
   }
 
-  /**
-   * Add one task, filling in whatever the caller left unset. A task with no
-   * runnable assignment is not a lighter task but an unspawnable one, so the
-   * runner falls back to the plan's first and the model, effort and mode are
-   * derived from that runner's catalog — the same derivation a runner change
-   * uses ({@link runnerAssignment}), which is why this is async like
-   * {@link setTaskRunner}. Anything the caller did choose survives when the
-   * runner offers it.
-   *
-   * Dependencies naming tasks that don't exist are dropped rather than rejected:
-   * the caller is a picker over the current plan, so a stale id means the plan
-   * moved on, not that the whole task should be refused.
-   */
+  /** Add one task, deriving what the caller left unset; see {@link PlanEditor.addTask}. */
   async addTask(draft: Partial<Task>): Promise<LegacyPlanState | null> {
-    if (!this.plan) return null;
-    const runner = draft.assignedRunner ?? this.plan.runners[0];
-    const dependencies = (draft.dependencies ?? []).filter((id) => this.store.get(id));
-    const catalog = draft.type === 'user' ? null : await this.catalogFor(runner);
-
-    return this.editPlan(() => {
-      this.store.add({ ...draft, ...(catalog ? runnerAssignment(this.allowedCatalog(catalog, runner), draft) : {}), assignedRunner: runner, dependencies });
-      if (catalog) this.admitRunner(runner, catalog.models);
-      return true;
-    });
+    return this.editor.addTask(draft);
   }
 
   /**
@@ -1590,11 +1450,7 @@ export class Session {
    * before any LLM call.
    */
   async requestMerge(taskIds: string[], options?: GeneratePlanOptions): Promise<LegacyPlanState> {
-    if (!this.plan) throw new Error('No active plan state');
-    const check = canMergeTasks(this.store.planTasks, taskIds);
-    if (!check.ok) throw new Error(check.error ?? 'These tasks cannot be merged');
-    const prompt = buildMergePrompt(taskIds, this.store.planTasks, this.aiService().plannerToolsAttached?.());
-    return this.continueConversation(prompt, options);
+    return this.continueConversation(this.editor.mergeRequest(taskIds), options);
   }
 
   /**
@@ -1603,11 +1459,7 @@ export class Session {
    * per-task specs from the user). Same conversation-loop/repair path as merge.
    */
   async requestSplit(taskId: string, options?: GeneratePlanOptions): Promise<LegacyPlanState> {
-    if (!this.plan) throw new Error('No active plan state');
-    const check = canSplitTask(this.store.planTasks, taskId);
-    if (!check.ok) throw new Error(check.error ?? 'This task cannot be split');
-    const prompt = buildSplitPrompt(taskId, this.store.planTasks, this.aiService().plannerToolsAttached?.());
-    return this.continueConversation(prompt, options);
+    return this.continueConversation(this.editor.splitRequest(taskId), options);
   }
 
   loadPlan(plan: LegacyPlanState, goal: string, workspace: string, opts?: { sessionId?: string; persist?: boolean }): void {
@@ -1646,7 +1498,7 @@ export class Session {
     // The run record is taken synchronously; only the orphan prune is awaited
     // in the background, and git serializes it ahead of any worktree a run adds.
     if (adopting) {
-      void this.orchestrator.adoptIsolation(plan.isolation ?? null);
+      void this.runs.adopt(plan.isolation ?? null);
       this.orchestrator.adoptRunnerTransport(plan.runnerTransport ?? null);
     }
     if (opts?.persist !== false) this.persist();

@@ -12,17 +12,13 @@ import type { RunnerRegistry } from '../plugins/RunnerRegistry';
 import type {
   IsolationHandoff,
   IsolationMergeResult,
-  IsolationView,
   IWorktreeIsolation,
-  PlanIsolation,
-  TaskIsolation,
   TreeSnapshot,
 } from '../interfaces/IWorktreeIsolation';
 import { createWorktreeIsolation } from './GitWorktreeIsolation';
 import { SELF_REPO } from './isolationRecord';
 import { IsolationRunController } from './IsolationRunController';
 import { completesTask, Landing, type LandingMessage, type LandingOutcome, type RepairAttempt, type UnlandedOutcome } from './Landing';
-import type { IsolatedExecution } from './plannerModes';
 import { watchBlockingPrompts } from './blockingPrompts';
 import { classifyRunnerStop, keepsTerminalReadable, stopsRunner, LingeringRunners, type AttemptEnd } from './runnerExit';
 import { MessageQueue } from './MessageQueue';
@@ -243,8 +239,13 @@ export class TaskOrchestrator {
    */
   private onHold = new Set<string>();
 
-  /** The plan's isolation run and the open run's lifecycle (ADR-0013); see {@link IsolationRunController}. */
-  private runs: IsolationRunController;
+  /**
+   * The plan's isolation run and the open run's lifecycle (ADR-0013); see
+   * {@link IsolationRunController}. Read and acted on there directly, except
+   * Merge all: that goes through {@link mergeRun}, which keeps it apart from
+   * ops tasks and starts the tasks its merge lets through.
+   */
+  readonly runs: IsolationRunController;
   /** A passed attempt's work onto the integration branch, and the conflict repair a landing may need. */
   private landing: Landing;
 
@@ -545,39 +546,10 @@ export class TaskOrchestrator {
     return { taskId: id, attempt: n, phase, sessionId: session?.id ?? null, runner, cwd, startedAt };
   }
 
-  /** Where a task's isolated work stands; null when the plan has no isolation run to speak of. */
-  getTaskIsolation(taskId: string): TaskIsolation | null {
-    return this.runs.taskIsolation(taskId);
-  }
-
-  /**
-   * The plan's isolation as a surface shows it, for one with no stream to have
-   * told it — a reconnected webview, a session just loaded. Null without a run.
-   */
-  isolationView(): IsolationView | null {
-    return this.runs.view();
-  }
-
   getAttemptSession(taskId: string): ITerminalSession | undefined {
     return this.attempts.get(taskId)?.session ?? undefined;
   }
   get queuedCount(): number { return this.messageQueue.length; }
-
-  /** A run is waiting on the user to stash or to go on without isolation. */
-  get awaitingIsolationChoice(): boolean { return this.runs.blocked; }
-
-  /**
-   * Take over a plan's persisted isolation, or none for a plan that has not
-   * isolated yet, pruning what a crashed process left behind. Silent on the
-   * observer: adopting is not a change to persist.
-   */
-  async adoptIsolation(state: PlanIsolation | null): Promise<void> {
-    await this.runs.adopt(state);
-  }
-
-  async reviewRunDiff(): Promise<string> {
-    return this.runs.reviewDiff();
-  }
 
   /**
    * "Merge all"; a settled run that merged everything is cleared up and
@@ -625,27 +597,12 @@ export class TaskOrchestrator {
     return mergeGate(task, this.store, this.runs);
   }
 
-  /** Worktrees and task branches go; the integration branch and the record stay for review and merge. */
-  async cleanupRun(): Promise<void> {
-    await this.runs.cleanup();
-  }
-
-  /** The run and everything it made go, and the plan forgets it; the next run starts afresh. */
-  async discardRun(): Promise<void> {
-    await this.runs.discard();
-  }
-
   private watchBlockingPrompts(task: Task, attempt: TaskAttempt, session: ITerminalSession): void {
     const manifest = this.registry?.get(attempt.runner)?.manifest;
     watchBlockingPrompts(session, manifest?.runner.blockingPrompts ?? [], (prompt) => {
       if (this.attempts.get(task.id) !== attempt) return;
       this.notifications.warn(`Task "${task.title}" is waiting for you: ${manifest?.displayName ?? attempt.runner} is asking ${prompt.asks}. Answer it in the task's terminal.`);
     });
-  }
-
-  /** What the plan persists of isolated execution; null when no run ever isolated. */
-  get isolationRecord(): PlanIsolation | null {
-    return this.runs.planIsolation;
   }
 
   /** The transport the plan's latest run copied from the setting; null before its first run. */
@@ -904,17 +861,6 @@ export class TaskOrchestrator {
       this.store.markPending(task.id);
       this.tell('info', `Task "${task.title}" is repaired once a slot is free.`);
     }
-  }
-
-  /**
-   * Mark which added task resolves which conflict. The resolver merges the
-   * conflicted task's branch by hand in its own worktree; once that lands, the
-   * conflicted task's branch is already on the integration branch and it can
-   * land in turn — through the same merge, so a resolver that did not really
-   * bring it along conflicts again instead of being taken at its word.
-   */
-  linkConflictResolver(resolverId: string, conflictedId: string): void {
-    this.runs.linkResolver(resolverId, conflictedId);
   }
 
   private async landResolved(resolverId: string): Promise<void> {
@@ -1491,14 +1437,6 @@ export class TaskOrchestrator {
       if (repairLog) this.tell(level, text);
       else this.notifications[level](text);
     }
-  }
-
-  /**
-   * Whether the run in force, or else the next one, gives each task its own
-   * worktrees, and of which repo group — what the planner is told.
-   */
-  async plannerIsolation(): Promise<IsolatedExecution> {
-    return this.runs.plannerLayout();
   }
 
   /**

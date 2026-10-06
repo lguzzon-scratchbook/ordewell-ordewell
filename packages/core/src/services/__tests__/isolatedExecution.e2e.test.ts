@@ -163,7 +163,7 @@ describe.skipIf(!hasGit)('isolated execution against a real repository', () => {
       expect(git(root, 'symbolic-ref', '--short', 'HEAD')).toBe('main');
     }
     expect(git(web, 'show', 'main:page.txt')).toBe('written by t3');
-    expect(orchestrator.isolationView()).toBeNull();
+    expect(orchestrator.runs.view()).toBeNull();
   }, 30_000);
 
   it('a later run clears an earlier one the user merged by hand, and keeps one they have not', async () => {
@@ -429,7 +429,7 @@ describe.skipIf(!hasGit)('isolated execution against a real repository', () => {
     await vi.waitFor(() => expect(second.storeInstance.get('t2')!.status).toBe('awaiting_user'), { timeout: 30_000 });
     // The first repair was spent, its unmerged work refused; a repair that does not land waits for the user instead of spending the next attempt.
     expect(spawns.filter((s) => s.taskId === 't2')).toHaveLength(2);
-    expect(second.getTaskIsolation('t2')).toMatchObject({ state: 'conflict', conflictFiles: ['shared.txt'], repair: { attempt: 1, limit: 2 } });
+    expect(second.runs.taskIsolation('t2')).toMatchObject({ state: 'conflict', conflictFiles: ['shared.txt'], repair: { attempt: 1, limit: 2 } });
     expect(second.storeInstance.get('t2')!.verdict?.outcome).toBe('pass');
     expect(git(root, 'show', `${integration}:shared.txt`)).toBe('written by t1');
   }, 60_000);

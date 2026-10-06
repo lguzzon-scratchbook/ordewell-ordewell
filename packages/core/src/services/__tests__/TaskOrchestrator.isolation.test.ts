@@ -66,7 +66,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
     await vi.waitFor(() => expect(orchestrator.getAttempt('t1')?.phase).toBe('running'));
     expect(orchestrator.storeInstance.get('t1')!.status).toBe('in_progress');
-    expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'active' });
+    expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'active' });
     expect(isolation.taskIdsFor('release')).toEqual([]);
     expect(errorSpy).toHaveBeenCalled();
 
@@ -86,7 +86,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
     openMerge();
     await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('completed'));
-    expect(orchestrator.getTaskIsolation('t1')).toEqual({
+    expect(orchestrator.runs.taskIsolation('t1')).toEqual({
       state: 'integrated', branch: 'ordewell/run1/1-t1', worktree: '/fake-worktrees/run1/1-t1', repos: ['.'],
     });
   });
@@ -121,7 +121,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
     await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('awaiting_user'));
     await flushMicrotasks();
 
-    expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'conflict', branch: 'ordewell/run1/1-t1' });
+    expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'conflict', branch: 'ordewell/run1/1-t1' });
     expect(orchestrator.storeInstance.get('t1')!.awaitingReason).toBe('conflict');
     expect(isolation.taskIdsFor('release')).toEqual([]);
     expect(spawn).toHaveBeenCalledTimes(1);
@@ -141,7 +141,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
     expect(orchestrator.storeInstance.get('t1')!.verdict!.outcome).toBe('pass');
     expect(orchestrator.storeInstance.get('t1')!.awaitingReason).toBe('conflict');
-    expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'kept' });
+    expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'kept' });
     expect(isolation.taskIdsFor('release')).toEqual([]);
     expect(vi.mocked(notifications.error).mock.calls.flat().join('\n')).toMatch(/integrat/i);
     expect(orchestrator.status).toBe('running');
@@ -177,7 +177,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
     expect(isolation.calls).toContainEqual({ op: 'release', taskId: 't1', keep: true });
     expect(isolation.taskIdsFor('integrate')).toEqual([]);
-    expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'kept' });
+    expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'kept' });
   });
 
   it('retries from a fresh worktree on the current integration tip, discarding the kept one', async () => {
@@ -268,7 +268,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
     expect(spawn).not.toHaveBeenCalled();
     expect(isolation.calls).toContainEqual({ op: 'release', taskId: 't1', keep: false });
-    expect(orchestrator.getTaskIsolation('t1')).toEqual({ state: 'none' });
+    expect(orchestrator.runs.taskIsolation('t1')).toEqual({ state: 'none' });
   });
 
   it('keeps an interrupted task\'s worktree when the run is stopped', async () => {
@@ -317,7 +317,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
     await orchestrator.runTask('t1');
     await orchestrator.cancelTask('t1');
 
-    await orchestrator.discardRun();
+    await orchestrator.runs.discard();
     await orchestrator.runTask('t1');
 
     expect(spawn.mock.calls[1][0].cwd).toBe('/fake-worktrees/run2/1-t1');
@@ -343,7 +343,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       expect(spawnedCwd('t1')).toBe('/plain');
       expect(isolation.calls.map((c) => c.op)).toEqual(['isActive']);
       expect(vi.mocked(notifications.info).mock.calls.flat().filter((m) => notice.test(String(m)))).toHaveLength(1);
-      expect(orchestrator.getTaskIsolation('t1')).toBeNull();
+      expect(orchestrator.runs.taskIsolation('t1')).toBeNull();
     });
   });
 
@@ -440,13 +440,13 @@ describe('TaskOrchestrator with worktree isolation', () => {
       const isolation = new FakeWorktreeIsolation();
       isolation.availability = { active: true, repos: ['api', 'web'], shared: ['NOTES.md'] };
       const { orchestrator } = setup({ isolation, workspace: '/group' });
-      expect(await orchestrator.plannerIsolation()).toEqual({ repos: ['api', 'web'], shared: ['NOTES.md'] });
+      expect(await orchestrator.runs.plannerLayout()).toEqual({ repos: ['api', 'web'], shared: ['NOTES.md'] });
 
       isolation.repos = ['api', 'web', 'infra'];
       isolation.shared = ['design'];
       orchestrator.loadPlan([task('t1', 1)]);
       await orchestrator.approveReview();
-      expect(await orchestrator.plannerIsolation()).toEqual({ repos: ['api', 'web', 'infra'], shared: ['design'] });
+      expect(await orchestrator.runs.plannerLayout()).toEqual({ repos: ['api', 'web', 'infra'], shared: ['design'] });
     });
 
     function group(configure: (isolation: FakeWorktreeIsolation) => void = () => undefined) {
@@ -469,7 +469,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       pass(t1);
       await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('awaiting_user'));
 
-      expect(orchestrator.getTaskIsolation('t1')).toEqual({
+      expect(orchestrator.runs.taskIsolation('t1')).toEqual({
         state: 'conflict', branch: 'ordewell/run1/1-t1', worktree: '/fake-worktrees/run1/1-t1', repos: ['api', 'web'], conflictRepo: 'web', conflictFiles: ['web.txt'],
       });
       expect(vi.mocked(notifications.warn).mock.calls.map((c) => String(c[0]))).toContain(
@@ -509,7 +509,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('awaiting_user'));
 
       expect(orchestrator.storeInstance.get('t1')!.verdict!.outcome).toBe('pass');
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'kept', conflictRepo: 'api' });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'kept', conflictRepo: 'api' });
       expect(vi.mocked(notifications.error).mock.calls.map((c) => String(c[0]))).toContain(
         'Task "Task t1" passed, but git could not integrate its work in api, so none of it landed. Its worktrees are kept for inspection.',
       );
@@ -618,7 +618,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       expect(vi.mocked(notifications.info).mock.calls.map((c) => String(c[0]))).toContain(
         'No repository could be isolated: api, web — tasks run in the workspace root without worktree isolation.',
       );
-      expect(orchestrator.getTaskIsolation('t1')).toBeNull();
+      expect(orchestrator.runs.taskIsolation('t1')).toBeNull();
     });
   });
 
@@ -653,7 +653,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       expect(spawn).not.toHaveBeenCalled();
       expect(observed).toEqual(['dirty']);
-      expect(orchestrator.awaitingIsolationChoice).toBe(true);
+      expect(orchestrator.runs.blocked).toBe(true);
       expect(orchestrator.hasLiveWork).toBe(false);
     });
 
@@ -665,7 +665,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       expect(isolation.calls.map((c) => c.op)).toContain('stash');
       expect(spawnedCwd('t1')).toBe('/fake-worktrees/run1/1-t1');
-      expect(orchestrator.awaitingIsolationChoice).toBe(false);
+      expect(orchestrator.runs.blocked).toBe(false);
     });
 
     it('goes on in the workspace root for this run when the user opts out of isolation', async () => {
@@ -774,7 +774,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
   it('has the run saved with its landing before anything merges', async () => {
     const { orchestrator, isolation, pass } = setup();
     const saved: unknown[] = [];
-    orchestrator.subscribe({ onIsolationChanged: () => saved.push(JSON.parse(JSON.stringify(orchestrator.isolationRecord!.run.landing ?? null))) });
+    orchestrator.subscribe({ onIsolationChanged: () => saved.push(JSON.parse(JSON.stringify(orchestrator.runs.planIsolation!.run.landing ?? null))) });
     const t1 = task('t1', 1);
     orchestrator.loadPlan([t1]);
     await orchestrator.approveReview();
@@ -852,7 +852,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
     await orchestrator.approveReview();
     sessionFor('t1')!.emitExit(1);
     await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('failed'));
-    expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'kept' });
+    expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'kept' });
 
     orchestrator.stop();
     await orchestrator.start();
@@ -861,7 +861,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
     // the kept attempt's branch.
     expect(isolation.calls.filter((c) => c.op === 'startRun')).toHaveLength(1);
     expect(isolation.calls.map((c) => c.op)).not.toContain('discard');
-    expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'kept' });
+    expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'kept' });
   });
 
   describe('Mark complete', () => {
@@ -874,7 +874,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       expect(isolation.taskIdsFor('integrate')).toEqual(['t1']);
       expect(orchestrator.storeInstance.get('t1')!.status).toBe('completed');
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'integrated' });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'integrated' });
     });
 
     it('lands a conflicted task once the user has resolved it by hand', async () => {
@@ -953,7 +953,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       expect(isolation.taskIdsFor('prepare')).toEqual(['t1']);
       expect(isolation.taskIdsFor('reopen')).toEqual(['t1']);
       expect(orchestrator.storeInstance.get('t1')!.status).toBe('in_progress');
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 1, limit: 2 } });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 1, limit: 2 } });
       expect(messages(notifications.info)).toContain('Repairing the conflict of task "Task t1" in its own worktree (repair 1 of 2).');
 
       isolation.outcomes.set('t1', 'merged');
@@ -964,7 +964,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       expect(isolation.taskIdsFor('integrate')).toEqual(['t1', 't1']);
       await vi.waitFor(() => expect(spawnedCwd('t2')).toBe('/fake-worktrees/run1/2-t2'));
       expect(messages(notifications.info)).toContain('Task "Task t1" landed after repairing a conflict in a.ts.');
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'integrated', repair: { attempt: 1, limit: 2 }, repairedFiles: ['a.ts'] });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'integrated', repair: { attempt: 1, limit: 2 }, repairedFiles: ['a.ts'] });
     });
 
     it('repairs again when the repaired work conflicts again, then leaves the conflict for the user once the repairs are used up', async () => {
@@ -978,7 +978,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       isolation.conflictFiles.set('t1', ['b.ts']);
       passLatest(t1);
       await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(3));
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 2, limit: 2 }, conflictFiles: ['b.ts'] });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 2, limit: 2 }, conflictFiles: ['b.ts'] });
       expect(spawn.mock.calls[2][0].prompt).toContain('conflicted in b.ts');
       expect(messages(notifications.info)).toContain('Repairing the conflict of task "Task t1" in its own worktree (repair 2 of 2).');
 
@@ -988,7 +988,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       expect(spawn).toHaveBeenCalledTimes(3);
       expect(isolation.taskIdsFor('reopen')).toEqual(['t1', 't1']);
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'conflict', conflictFiles: ['b.ts'], repair: { attempt: 2, limit: 2 }, repairedFiles: ['a.ts', 'b.ts'] });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'conflict', conflictFiles: ['b.ts'], repair: { attempt: 2, limit: 2 }, repairedFiles: ['a.ts', 'b.ts'] });
       expect(isolation.taskIdsFor('release')).toEqual([]);
       expect(messages(notifications.warn)).toContain('Task "Task t1" passed, but merging it into ordewell/run1/integration conflicted (b.ts). Its worktree is kept — resolve it by hand and mark it complete, retry it, or resolve it as a task.');
       expect(messages(notifications.info)).toContain('Task "Task t1" has had 2 of its 2 conflict repairs, so its conflict waits for you.');
@@ -1007,7 +1007,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       expect(spawn).toHaveBeenCalledTimes(1);
       expect(isolation.taskIdsFor('reopen')).toEqual([]);
-      expect(orchestrator.getTaskIsolation('t1')).toEqual({
+      expect(orchestrator.runs.taskIsolation('t1')).toEqual({
         state: 'conflict', branch: 'ordewell/run1/1-t1', worktree: '/fake-worktrees/run1/1-t1', repos: ['.'], conflictRepo: '.', conflictFiles: ['a.ts'],
       });
       expect(messages(notifications.warn)).toContain('Task "Task t1" passed, but merging it into ordewell/run1/integration conflicted (a.ts). Its worktree is kept — resolve it by hand and mark it complete, retry it, or resolve it as a task.');
@@ -1028,7 +1028,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('awaiting_user'));
 
       expect(orchestrator.storeInstance.get('t1')!.verdict).toEqual(originalVerdict);
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'conflict', conflictFiles: ['a.ts'], repair: { attempt: 1, limit: 2 } });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'conflict', conflictFiles: ['a.ts'], repair: { attempt: 1, limit: 2 } });
       expect(isolation.calls).toContainEqual({ op: 'release', taskId: 't1', keep: true });
       expect(orchestrator.status).toBe('running');
       expect(messages(notifications.warn).some((m) => m.startsWith('The conflict repair of task "Task t1" did not finish ('))).toBe(true);
@@ -1065,7 +1065,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       pass(t2);
       await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(4));
       expect(spawn.mock.calls[3][0]).toMatchObject({ taskId: 't1', cwd: '/fake-worktrees/run1/1-t1' });
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 2, limit: 2 } });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 2, limit: 2 } });
       expect(orchestrator.activeTaskIds).toEqual(['t1']);
     });
 
@@ -1081,12 +1081,12 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       await orchestrator.retryTask('t1');
       expect(isolation.taskIdsFor('prepare')).toEqual(['t1', 't1']);
-      expect(orchestrator.getTaskIsolation('t1')).not.toHaveProperty('repair');
+      expect(orchestrator.runs.taskIsolation('t1')).not.toHaveProperty('repair');
       passLatest(t1);
 
       await vi.waitFor(() => expect(spawn).toHaveBeenCalledTimes(4));
       expect(isolation.taskIdsFor('reopen')).toEqual(['t1', 't1']);
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 1, limit: 1 } });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 1, limit: 1 } });
     });
 
     it.each<[string, RepairEvidence, string]>([
@@ -1113,7 +1113,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       expect(isolation.taskIdsFor('integrate')).toEqual(['t1']);
       expect(spawn).toHaveBeenCalledTimes(2);
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'conflict', conflictRepo: 'web', conflictFiles: ['a.ts'] });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'conflict', conflictRepo: 'web', conflictFiles: ['a.ts'] });
       expect(messages(notifications.warn)).toContain(`The conflict repair of task "Task t1" ${why}, so it did not land. Its worktrees are kept — resolve it by hand and mark it complete, retry it, or resolve it as a task.`);
     });
 
@@ -1138,7 +1138,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       const asTask = await failedRepair();
       const resolver = asTask.orchestrator.storeInstance.add({ title: 'Resolve', prompt: 'merge it' });
-      asTask.orchestrator.linkConflictResolver(resolver.id, 't1');
+      asTask.orchestrator.runs.linkResolver(resolver.id, 't1');
       await asTask.orchestrator.tick();
       asTask.pass(resolver);
       await vi.waitFor(() => expect(asTask.orchestrator.storeInstance.get('t1')!.status).toBe('completed'));
@@ -1157,7 +1157,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
         'The conflict repair of task "Task t1" could not start: runner vanished, so it did not land. Its worktree is kept — resolve it by hand and mark it complete, retry it, or resolve it as a task.',
       ));
       expect(orchestrator.storeInstance.get('t1')!.status).toBe('awaiting_user');
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'conflict', repair: { attempt: 1, limit: 2 } });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'conflict', repair: { attempt: 1, limit: 2 } });
       expect(isolation.taskIdsFor('release')).toEqual(['t1']);
       expect(orchestrator.status).toBe('running');
       expect(orchestrator.activeTaskIds).toEqual(['t2']);
@@ -1174,7 +1174,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       orchestrator.stop();
 
-      await vi.waitFor(() => expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'conflict', conflictFiles: ['a.ts'], repair: { attempt: 1, limit: 2 } }));
+      await vi.waitFor(() => expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'conflict', conflictFiles: ['a.ts'], repair: { attempt: 1, limit: 2 } }));
       expect(orchestrator.storeInstance.get('t1')!.status).toBe('awaiting_user');
       expect(orchestrator.storeInstance.get('t1')!.verdict?.outcome).toBe('pass');
       expect(isolation.calls).toContainEqual({ op: 'release', taskId: 't1', keep: true });
@@ -1197,7 +1197,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
           },
         };
         env.orchestrator.loadPlan([task('t0', 0, { status: 'completed' }), task('t1', 1, { status: 'approved' })]);
-        return { ...env, adopt: () => env.orchestrator.adoptIsolation({ run, resolvers: {} }), workspace };
+        return { ...env, adopt: () => env.orchestrator.runs.adopt({ run, resolvers: {} }), workspace };
       }
 
       it('repairs a conflicted task with repairs left when the run next schedules, counting from what was spent', async () => {
@@ -1209,7 +1209,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
         expect(isolation.taskIdsFor('prepare')).toEqual([]);
         expect(isolation.taskIdsFor('reopen')).toEqual(['t1']);
         expect(spawn.mock.calls[0][0]).toMatchObject({ taskId: 't1', cwd: workspace });
-        expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 2, limit: 2 } });
+        expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'repairing', repair: { attempt: 2, limit: 2 } });
         passLatest(orchestrator.storeInstance.get('t1')!);
         await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('completed'));
       });
@@ -1242,7 +1242,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
     it('re-integrates the conflicted task once the resolver lands, which frees its dependents', async () => {
       const { orchestrator, isolation, pass, spawnedCwd } = await conflicted();
       const resolver = orchestrator.storeInstance.add({ title: 'Resolve', prompt: 'merge it' });
-      orchestrator.linkConflictResolver(resolver.id, 't1');
+      orchestrator.runs.linkResolver(resolver.id, 't1');
       isolation.outcomes.set('t1', 'merged');
 
       await orchestrator.tick();
@@ -1252,13 +1252,13 @@ describe('TaskOrchestrator with worktree isolation', () => {
       await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('completed'));
       expect(isolation.taskIdsFor('integrate')).toEqual(['t1', resolver.id, 't1']);
       await vi.waitFor(() => expect(spawnedCwd('t2')).toBe('/fake-worktrees/run1/2-t2'));
-      expect(orchestrator.isolationRecord?.resolvers).toEqual({});
+      expect(orchestrator.runs.planIsolation?.resolvers).toEqual({});
     });
 
     it('does not land a conflicted task the user retried meanwhile, whose new attempt is still running', async () => {
       const { orchestrator, isolation, pass, sessionFor } = await conflicted();
       const resolver = orchestrator.storeInstance.add({ title: 'Resolve', prompt: 'merge it' });
-      orchestrator.linkConflictResolver(resolver.id, 't1');
+      orchestrator.runs.linkResolver(resolver.id, 't1');
       isolation.outcomes.set('t1', 'merged');
       await orchestrator.retryTask('t1');
       await vi.waitFor(() => expect(sessionFor(resolver.id)).toBeDefined());
@@ -1293,9 +1293,9 @@ describe('TaskOrchestrator with worktree isolation', () => {
       expect(await orchestrator.mergeRun()).toEqual({ outcome: 'merged' });
 
       expect(isolation.calls.slice(-3)).toEqual([{ op: 'mergeIntoCheckedOut' }, { op: 'findInHead' }, { op: 'discard', integration: 'delete-merged' }]);
-      expect(orchestrator.isolationRecord).toBeNull();
-      expect(orchestrator.isolationView()).toBeNull();
-      expect(orchestrator.getTaskIsolation('t1')).toBeNull();
+      expect(orchestrator.runs.planIsolation).toBeNull();
+      expect(orchestrator.runs.view()).toBeNull();
+      expect(orchestrator.runs.taskIsolation('t1')).toBeNull();
       expect(changed).toBe(2);
       expect(orchestrator.storeInstance.get('t1')!.status).toBe('completed');
     });
@@ -1310,7 +1310,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       await orchestrator.mergeRun();
 
       expect(isolation.calls.map((c) => c.op)).not.toContain('discard');
-      expect(orchestrator.isolationView()?.handoff.landed).toEqual([{ taskId: 't1', order: 1, title: 'Task t1' }]);
+      expect(orchestrator.runs.view()?.handoff.landed).toEqual([{ taskId: 't1', order: 1, title: 'Task t1' }]);
     });
 
     it('keeps the run, and says why, when clearing it up after Merge all fails', async () => {
@@ -1318,7 +1318,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
 
       expect(await orchestrator.mergeRun()).toEqual({ outcome: 'merged' });
 
-      expect(orchestrator.isolationRecord).not.toBeNull();
+      expect(orchestrator.runs.planIsolation).not.toBeNull();
       expect(vi.mocked(notifications.warn).mock.calls.map((c) => String(c[0]))).toContain(
         'Merged, but could not clean up the run\'s worktrees and branches: disk full',
       );
@@ -1360,14 +1360,14 @@ describe('TaskOrchestrator with worktree isolation', () => {
       };
       orchestrator.loadPlan([task('t1', 1, { status: 'completed' }), task('t2', 2, { dependencies: ['t1'] })]);
 
-      await orchestrator.adoptIsolation({ run, resolvers: {} });
+      await orchestrator.runs.adopt({ run, resolvers: {} });
       expect(isolation.calls).toEqual([{ op: 'pruneOrphans' }]);
 
       await orchestrator.approveReview();
       expect(spawnedCwd('t2')).toBe('/fake-worktrees/old/2-t2');
       expect(isolation.calls.map((c) => c.op)).not.toContain('startRun');
       expect(isolation.calls.map((c) => c.op)).toContain('sweep');
-      expect(orchestrator.getTaskIsolation('t1')).toMatchObject({ state: 'integrated' });
+      expect(orchestrator.runs.taskIsolation('t1')).toMatchObject({ state: 'integrated' });
     });
 
     it('gives up the integration branch of a run it cannot continue only where the user has merged it', async () => {
@@ -1378,7 +1378,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
         tasks: { t1: { taskId: 't1', order: 1, title: 'Task t1', branch: 'ordewell/old/1-t1', workspace: '/wt/1', status: 'merged' as const, repos: { '.': { worktree: '/wt/1', linked: [], changed: true } } } },
       };
       orchestrator.loadPlan([task('t1', 1, { status: 'completed' }), task('t2', 2)]);
-      await orchestrator.adoptIsolation({ run, resolvers: {} });
+      await orchestrator.runs.adopt({ run, resolvers: {} });
 
       await orchestrator.approveReview();
 
@@ -1396,7 +1396,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       };
       orchestrator.loadPlan([task('t1', 1)]);
 
-      await orchestrator.adoptIsolation({ run, resolvers: {} });
+      await orchestrator.runs.adopt({ run, resolvers: {} });
 
       const warned = vi.mocked(notifications.warn).mock.calls.map((c) => String(c[0])).join('\n');
       expect(warned).toMatch(/unlanded work/i);
@@ -1440,7 +1440,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       expect(runner.stop).toHaveBeenCalledWith(sessionFor('t1')!.id);
     });
 
-    it.each(['discardRun', 'cleanupRun'] as const)('close on %s', async (action) => {
+    it.each(['discard', 'cleanup'] as const)('close on %s', async (action) => {
       const { orchestrator, pass, sessionFor, runner } = setup();
       const t1 = task('t1', 1);
       orchestrator.loadPlan([t1]);
@@ -1448,7 +1448,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
       pass(t1);
       await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('completed'));
 
-      await orchestrator[action]();
+      await orchestrator.runs[action]();
 
       expect(runner.stop).toHaveBeenCalledWith(sessionFor('t1')!.id);
     });

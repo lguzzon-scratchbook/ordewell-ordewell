@@ -1,5 +1,6 @@
 import type { OrchestratorObserver, TaskOrchestrator } from './TaskOrchestrator';
 import type { PlanStore } from './PlanStore';
+import type { IsolationRunController } from './IsolationRunController';
 import type { PlannerUsageLedger } from './PlannerUsage';
 import {
   executionSummary,
@@ -16,7 +17,8 @@ export interface SessionEventRelayDeps {
   /** Where isolation notices go, for a host whose notifications are not seen by the user. */
   onNotice?: (notice: SessionNotice) => void;
   store: Pick<PlanStore, 'allTasks' | 'snapshot'>;
-  orchestrator: Pick<TaskOrchestrator, 'getIdleSince' | 'getTaskIsolation' | 'getQueuedTaskMessages' | 'getMergeGate' | 'mergeGateView'>;
+  orchestrator: Pick<TaskOrchestrator, 'getIdleSince' | 'getQueuedTaskMessages' | 'getMergeGate' | 'mergeGateView'>;
+  runs: Pick<IsolationRunController, 'taskIsolation'>;
   /** Shared with the Session, which snapshots, restores and clears it. */
   usage: PlannerUsageLedger;
   /** How many of a task's runner requests wait for an answer (ADR-0018, A1). */
@@ -43,6 +45,7 @@ export class SessionEventRelay {
   private readonly onNotice?: (notice: SessionNotice) => void;
   private readonly store: SessionEventRelayDeps['store'];
   private readonly orchestrator: SessionEventRelayDeps['orchestrator'];
+  private readonly runs: SessionEventRelayDeps['runs'];
   private readonly usage: PlannerUsageLedger;
   private readonly awaitingApproval: (taskId: string) => number;
   /**
@@ -59,6 +62,7 @@ export class SessionEventRelay {
     this.onNotice = deps.onNotice;
     this.store = deps.store;
     this.orchestrator = deps.orchestrator;
+    this.runs = deps.runs;
     this.usage = deps.usage;
     this.awaitingApproval = deps.awaitingApproval ?? (() => 0);
   }
@@ -107,7 +111,7 @@ export class SessionEventRelay {
       tasks: this.store.allTasks.map((t) => serializeTaskStatus(
         t,
         this.orchestrator.getIdleSince(t.id),
-        this.orchestrator.getTaskIsolation(t.id),
+        this.runs.taskIsolation(t.id),
         this.orchestrator.getQueuedTaskMessages(t.id),
         this.awaitingApproval(t.id),
         this.orchestrator.getMergeGate(t.id),

@@ -11,6 +11,8 @@ import type { SessionMessage, SessionNotice } from '../SessionMessage';
 import type { IsolationMergeResult } from '../../interfaces/IWorktreeIsolation';
 import type { ConversationTurn, IAiService } from '../AiService';
 import type { Session } from '../createSession';
+import { PlanEditError } from '../PlanEditError';
+import { TaskControlError } from '../TaskOrchestrator';
 
 function runner() {
   const sessions: FakeTerminalSession[] = [];
@@ -556,5 +558,110 @@ describe('Session with worktree isolation', () => {
       expect(startConversation).toHaveBeenCalledWith(expect.objectContaining({ isolatedExecution: false }));
       expect(generate).toHaveBeenCalledWith(expect.objectContaining({ modes: expect.objectContaining({ isolatedExecution: false }) }));
     });
+  });
+});
+
+describe('Session isolation actions it refuses', () => {
+  it.each(['reviewRunDiff', 'mergeRun', 'cleanupRun', 'discardRun'] as const)('%s refuses a plan that never isolated, as a refused request', async (action) => {
+    const { session, isolation, messages } = setup();
+    session.loadPlan(plan([task('t1', 1)]), 'goal', '/repo', { persist: false });
+
+    const refused = session[action]();
+
+    await expect(refused).rejects.toThrow('This plan has no isolated run');
+    await expect(refused).rejects.toBeInstanceOf(PlanEditError);
+    expect(isolation.calls).toEqual([]);
+    expect(messages.map((m) => m.type)).not.toContain('isolation_merge');
+    expect(saves(session)).not.toHaveBeenCalled();
+  });
+
+  it('says a run in the workspace root has no isolated run, before saying it still runs', async () => {
+    const isolation = new FakeWorktreeIsolation();
+    isolation.availability = { active: false, reason: 'not-git' };
+    const { session, spawn } = setup(isolation);
+    session.loadPlan(plan([task('t1', 1)]), 'goal', '/repo');
+    await session.executePlan();
+    expect(spawn).toHaveBeenCalled();
+
+    await expect(session.cleanupRun()).rejects.toThrow('This plan has no isolated run');
+    await expect(session.discardRun()).rejects.toThrow('This plan has no isolated run');
+  });
+
+  it('says an ops-only run has no isolated run, rather than waiting for its ops task', async () => {
+    const { session, spawn } = setup();
+    session.loadPlan(plan([task('o1', 1, { ops: true })]), 'goal', '/repo');
+    await session.executePlan();
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalled());
+
+    const refused = session.mergeRun();
+
+    await expect(refused).rejects.toThrow('This plan has no isolated run');
+    await expect(refused).rejects.toBeInstanceOf(PlanEditError);
+  });
+
+  it('refuses Merge all while an ops task runs in the checkout, and announces no merge', async () => {
+    const { session, isolation, messages, pass } = setup();
+    const t1 = task('t1', 1);
+    session.loadPlan(plan([t1, task('o2', 2, { ops: true })]), 'goal', '/repo');
+    await session.executePlan();
+    await vi.waitFor(() => expect(taskOf(session, 'o2')!.status).toBe('in_progress'));
+    pass(t1);
+    await vi.waitFor(() => expect(taskOf(session, 't1')!.status).toBe('completed'));
+
+    await expect(session.mergeRun()).rejects.toBeInstanceOf(TaskControlError);
+
+    expect(isolation.calls.map((c) => c.op)).not.toContain('mergeIntoCheckedOut');
+    expect(messages.map((m) => m.type)).not.toContain('isolation_merge');
+  });
+
+  it('refuses to clean up a run still going, as a refused request', async () => {
+    const { session, isolation } = setup();
+    session.loadPlan(plan([task('t1', 1)]), 'goal', '/repo');
+    await session.executePlan();
+
+    const refused = session.cleanupRun();
+
+    await expect(refused).rejects.toThrow(/running/i);
+    await expect(refused).rejects.toBeInstanceOf(PlanEditError);
+    expect(isolation.calls.map((c) => c.op)).not.toContain('discard');
+  });
+});
+
+describe('Session isolation actions on a landed run', () => {
+  async function landed() {
+    const env = setup();
+    const t1 = task('t1', 1);
+    env.session.loadPlan(plan([t1]), 'goal', '/repo');
+    await env.session.executePlan();
+    env.pass(t1);
+    await vi.waitFor(() => expect(env.messages.map((m) => m.type)).toContain('execution_complete'));
+    return env;
+  }
+
+  it('hands back the run\'s diff as git wrote it', async () => {
+    const { session, isolation } = await landed();
+    vi.spyOn(isolation, 'reviewDiff').mockResolvedValue('diff --git a/x b/x\n');
+
+    expect(await session.reviewRunDiff()).toBe('diff --git a/x b/x\n');
+  });
+
+  it('starts the run afresh after a discard', async () => {
+    const { session, spawn } = await landed();
+
+    await session.discardRun();
+    await session.runTask('t1');
+
+    expect(spawn.mock.calls.at(-1)![0].cwd).toBe('/fake-worktrees/run2/1-t1');
+  });
+
+  it('keeps the run after a clean-up, so it can still be reviewed and merged', async () => {
+    const { session, isolation } = await landed();
+
+    await session.cleanupRun();
+    await session.reviewRunDiff();
+
+    expect(session.isolationView()).not.toBeNull();
+    expect(await session.mergeRun()).toEqual({ outcome: 'merged' });
+    expect(isolation.calls.map((c) => c.op)).toEqual(expect.arrayContaining(['reviewDiff', 'mergeIntoCheckedOut']));
   });
 });
