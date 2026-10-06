@@ -1,30 +1,19 @@
 import { TaskModeUnsupportedError, type AgentProcessDeps, type TaskModeAgentAdapter } from './AgentAdapter';
-import { ClaudeCodeAdapter } from './ClaudeCodeAdapter';
-import { CodexAdapter } from './CodexAdapter';
-import { OpenCodeAdapter } from './OpenCodeAdapter';
+import { connectorFor } from './connectors';
 
-/** The runners with a task-mode connector (ADR-0018, S3). */
-const TASK_MODE_ADAPTERS: Record<string, (deps: AgentProcessDeps) => TaskModeAgentAdapter> = {
-  'claude-code': (deps) => new ClaudeCodeAdapter(deps),
-  codex: (deps) => new CodexAdapter(deps),
-  opencode: (deps) => new OpenCodeAdapter(deps),
-};
-
-/** The connectors that hand their runner the Ordewell MCP server (ADR-0022). */
-const ORDEWELL_TOOL_RUNNERS = new Set(['claude-code', 'codex', 'opencode']);
-
-/** Whether a runner's tasks can run on the structured transport. */
+/** Whether a runner's tasks can run on the structured transport (ADR-0018, S3). */
 export function supportsTaskMode(runner: string): boolean {
-  return Object.hasOwn(TASK_MODE_ADAPTERS, runner);
+  return connectorFor(runner) !== undefined;
 }
 
-/** Whether a structured task on this runner is given the Ordewell task tools. */
+/** Whether a structured task on this runner is given the Ordewell task tools (ADR-0022). */
 export function takesOrdewellTools(runner: string): boolean {
-  return ORDEWELL_TOOL_RUNNERS.has(runner);
+  return connectorFor(runner)?.ordewellTools !== undefined;
 }
 
 /** The adapter that drives one task. Throws {@link TaskModeUnsupportedError} for a runner without a connector. */
 export function createTaskAdapter(runner: string, deps: AgentProcessDeps): TaskModeAgentAdapter {
-  if (!supportsTaskMode(runner)) throw new TaskModeUnsupportedError(runner);
-  return TASK_MODE_ADAPTERS[runner](deps);
+  const connector = connectorFor(runner);
+  if (!connector) throw new TaskModeUnsupportedError(runner);
+  return connector.create(deps);
 }

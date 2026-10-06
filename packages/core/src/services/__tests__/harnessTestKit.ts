@@ -112,23 +112,15 @@ function makeProcess(): FakeAgentProcess {
 }
 
 /**
- * A fake spawn whose process answers each stdin write with the next scripted
- * reply. Unscripted writes are ignored, which is how "the agent never
- * answered" is tested.
- *
- * One reply is consumed per *write*, not per turn — and adapters write on the
- * control channel too (a Claude Code permission denial, a Codex JSON-RPC
- * response). A scenario that answers a request mid-turn must either account for
- * those writes or use a function reply that inspects `written` and only answers
- * the user turns.
+ * The fake process boundary both spawns below are built on: every write to a
+ * process's stdin is handed to `onWrite` with the argv it was spawned under.
  */
-export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = {}): FakeSpawnResult {
+function spawner(onWrite: (written: string, proc: FakeAgentProcess, args: string[]) => void, options: FakeSpawnOptions): FakeSpawnResult {
   const processes: FakeAgentProcess[] = [];
   const probes: string[][] = [];
   let command = '';
   let args: string[] = [];
   let env: NodeJS.ProcessEnv = {};
-  const queue = [...replies];
 
   const spawn: SpawnFn = (cmd, argv, spawnOptions) => {
     // The sandbox probe is a short-lived side process, not the agent's
@@ -150,12 +142,7 @@ export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = 
     env = spawnOptions?.env ?? {};
     const proc = makeProcess();
     processes.push(proc);
-    proc.on('__written', (chunk: string) => {
-      const reply = queue.shift();
-      if (reply === undefined) return;
-      if (typeof reply === 'function') reply(chunk, proc);
-      else proc.emitStdout(reply);
-    });
+    proc.on('__written', (chunk: string) => onWrite(chunk, proc, argv));
     return proc as unknown as ChildProcess;
   };
 
@@ -170,23 +157,36 @@ export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = 
 }
 
 /**
+ * A fake spawn whose process answers each stdin write with the next scripted
+ * reply. Unscripted writes are ignored, which is how "the agent never
+ * answered" is tested.
+ *
+ * One reply is consumed per *write*, not per turn — and adapters write on the
+ * control channel too (a Claude Code permission denial, a Codex JSON-RPC
+ * response). A scenario that answers a request mid-turn must either account for
+ * those writes or use a function reply that inspects `written` and only answers
+ * the user turns.
+ */
+export function fakeSpawn(replies: ScriptedReply[], options: FakeSpawnOptions = {}): FakeSpawnResult {
+  const queue = [...replies];
+  return spawner((chunk, proc) => {
+    const reply = queue.shift();
+    if (reply === undefined) return;
+    if (typeof reply === 'function') reply(chunk, proc);
+    else proc.emitStdout(reply);
+  }, options);
+}
+
+/**
  * A fake spawn whose every process hands each stdin write to `onWrite`, with
  * the argv it was spawned under — for an agent that must answer the control
  * channel and the turns alike, however many of each a scenario sends.
  */
-export function respondingSpawn(onWrite: (written: string, proc: FakeAgentProcess, args: string[]) => void): FakeSpawnResult {
-  const processes: FakeAgentProcess[] = [];
-  let command = '';
-  let args: string[] = [];
-  const spawn: SpawnFn = (cmd, argv) => {
-    command = cmd;
-    args = argv;
-    const proc = makeProcess();
-    processes.push(proc);
-    proc.on('__written', (chunk: string) => onWrite(chunk, proc, argv));
-    return proc as unknown as ChildProcess;
-  };
-  return { spawn, processes, lastArgs: () => args, lastCommand: () => command, lastEnv: () => ({}), probeArgs: () => [] };
+export function respondingSpawn(
+  onWrite: (written: string, proc: FakeAgentProcess, args: string[]) => void,
+  options: FakeSpawnOptions = {},
+): FakeSpawnResult {
+  return spawner(onWrite, options);
 }
 
 /**

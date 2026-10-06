@@ -2,7 +2,7 @@ import { partedPromptUsage, type UsageRecord } from '../../models/Usage';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { McpClientConfig } from '../mcp';
 import { LineBuffer, type AgentEvent, type TaskStartOptions } from './AgentAdapter';
-import { isOrdewellTool } from './openCodeOrdewell';
+import { OPENCODE_ORDEWELL } from './openCodeOrdewell';
 
 /**
  * The HTTP protocol work OpenCode's two server APIs share: 1.x (`/event`,
@@ -125,7 +125,7 @@ export class OpenCodePermissions {
    */
   refuse(request: PermissionRequest, sessionId: string, seen: Set<string>, onEvent: OnEvent): void {
     if (!firstSight(request.id, seen)) return;
-    if (isOrdewellTool(this.ordewell(), request.name)) {
+    if (this.isOrdewellTool(request.name)) {
       this.send(request.id, sessionId, ALLOW);
       return;
     }
@@ -143,7 +143,7 @@ export class OpenCodePermissions {
   ask(request: PermissionRequest, sessionId: string, autoApprove: boolean, seen: Set<string>, onEvent: OnEvent): void {
     if (!firstSight(request.id, seen)) return;
     // Whatever the mode, a completion that waited on a person would hold the verdict hostage (ADR-0022, S3).
-    if (isOrdewellTool(this.ordewell(), request.name) || autoApprove) {
+    if (this.isOrdewellTool(request.name) || autoApprove) {
       onEvent({ ...request, decided: ALLOW });
       this.send(request.id, sessionId, ALLOW);
       return;
@@ -172,6 +172,10 @@ export class OpenCodePermissions {
       this.open.delete(id);
       onEvent({ type: 'permission_cancelled', id });
     }
+  }
+
+  private isOrdewellTool(name: string): boolean {
+    return !!this.ordewell() && OPENCODE_ORDEWELL.isOrdewellAsk(name);
   }
 
   private send(id: string, sessionId: string, decision: ApprovalDecision): void {
