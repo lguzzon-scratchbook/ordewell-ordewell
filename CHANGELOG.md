@@ -21,6 +21,9 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 - **OpenCode 2.x task logs show file edits as diffs**, as they do on 1.x. An edit
   row used to say only that the edit succeeded.
+- **The TUI shows how to answer a runner's tool request right under it**
+  (`ctrl-y` allow, `ctrl-t` allow for the task, `ctrl-g` deny), and the notice in
+  other panes names the keys too.
 
 ## [0.7.0] — 2026-10-05
 

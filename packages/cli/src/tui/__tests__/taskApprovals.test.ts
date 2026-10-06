@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { replayTaskLog, type TaskLogEvent } from '@ordewell/core';
 import { initialState, reduce, type Action } from '../reducer';
 import { render } from '../render';
+import { chatLayout } from '../layout';
 import { inboundFor } from '../inbound';
 import { decodeKey } from '../keys';
 import type { TaskLogState, TaskView, TuiState } from '../state';
@@ -141,7 +142,7 @@ describe('the notice a request raises', () => {
   it('speaks in the planner chat, where the task view is not open', () => {
     const state = initialState({ sessionId: 's1', tasks: [task()] });
     const next = reduce(state, arrived([asked('ap-1')])).state;
-    expect(next.conversation.blocks.at(-1)).toMatchObject({ text: '· Task 2 waits for approval: Bash(npm test) — t on it to answer' });
+    expect(next.conversation.blocks.at(-1)).toMatchObject({ text: '· Task 2 waits for approval: Bash(npm test) — t on it, then ctrl-y to allow or ctrl-g to deny' });
   });
 
   it('says nothing in the view already showing the card', () => {
@@ -163,6 +164,39 @@ describe('the notice a request raises', () => {
     const state = initialState({ sessionId: 's1', tasks: [task()] });
     const next = reduce(state, arrived([{ type: 'text', text: 'hi' }, { type: 'approval_decided', approvalId: 'ap-1', decision: 'allow' }])).state;
     expect(next.conversation).toBe(state.conversation);
+  });
+});
+
+describe('the keys under the waiting request', () => {
+  // The body only: the header row repeats the keys, so the frame would pass for the wrong reason.
+  // eslint-disable-next-line no-control-regex
+  const body = (state: TuiState, cols = 160): string => chatLayout(state, 30, cols).lines.join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+
+  it('sit under the request, with ctrl-t when the runner offered it', () => {
+    const text = body(opened(log(asked('ap-1'))));
+    expect(text).toMatch(/Waiting for you[^\n]*\n {2}ctrl-y allow · ctrl-t allow for task · ctrl-g deny/);
+  });
+
+  it('leave ctrl-t out when the runner offered no grant', () => {
+    const text = body(opened(log(asked('ap-1', false))));
+    expect(text).toContain('ctrl-y allow · ctrl-g deny');
+    expect(text).not.toContain('ctrl-t');
+  });
+
+  it.each([
+    ['granted', { type: 'approval_decided', approvalId: 'ap-1', decision: 'allow' } as const],
+    ['denied', { type: 'approval_decided', approvalId: 'ap-1', decision: 'deny' } as const],
+    ['withdrawn', { type: 'approval_withdrawn', approvalId: 'ap-1' } as const],
+  ])('are gone once the request is %s', (_name, settle) => {
+    expect(body(opened(log(asked('ap-1'), settle)))).not.toContain('ctrl-y');
+  });
+
+  it('keep ctrl-y on a narrow pane', () => {
+    expect(body(opened(log(asked('ap-1'))), 24)).toContain('ctrl-y');
+  });
+
+  it('are not drawn in the planner chat', () => {
+    expect(body(initialState({ sessionId: 's1', rows: 30, cols: 160 }))).not.toContain('ctrl-y');
   });
 });
 
