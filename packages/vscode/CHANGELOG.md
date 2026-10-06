@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-06
+
 ### Added
 
 - **A message reaches a running task between tool calls.** A message typed in

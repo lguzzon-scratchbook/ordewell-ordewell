@@ -8,6 +8,8 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-10-06
+
 ### Added
 
 - **A message reaches a running task between tool calls.** On the structured
