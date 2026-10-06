@@ -2,7 +2,6 @@ import { spawn } from 'child_process';
 import { describe, it, expect } from 'vitest';
 import { CliAgentAiService } from '../harness/CliAgentAiService';
 import { fakeConfig, fakeFileSystem } from '../../testing';
-import type { AiProvider } from '../../interfaces/IConfig';
 import type { ResearchStep } from '../../models/Task';
 
 /**
@@ -14,8 +13,11 @@ import type { ResearchStep } from '../../models/Task';
  * that is not a real failure. Recorded fixtures carry the suite; this exists to
  * catch schema drift deliberately rather than through a user's bug report.
  *
- *   ORDEWELL_LIVE_AGENTS=claude-code,codex,opencode \
- *     npx vitest run --root packages/core harnessLive
+ *   ORDEWELL_LIVE_AGENTS=claude-code npx vitest run --root packages/core harnessLive
+ *
+ * Each planner runs on its runner's cheapest model unless ORDEWELL_LIVE_MODEL
+ * says otherwise; that variable applies to every runner, so with it set run
+ * one runner at a time.
  *
  * What it asserts stops short of judging the model: the transport works, the
  * agent actually reaches the workspace, a refusal does not hang the turn, and
@@ -36,9 +38,22 @@ const requested = (process.env.ORDEWELL_LIVE_AGENTS ?? '')
  */
 const TIMEOUT_MS = 420_000;
 
-function liveService(provider: AiProvider) {
+/**
+ * The cheapest model of each runner, at its lowest effort where it has one.
+ * ORDEWELL_LIVE_MODEL overrides every runner at once, so set it only when
+ * running a single one, and the effort is then the runner's own default.
+ */
+const liveModel = process.env.ORDEWELL_LIVE_MODEL;
+const CHEAPEST: Record<'claude-code' | 'codex' | 'opencode', { model: string; effort?: string }> = {
+  'claude-code': { model: 'haiku' },
+  codex: { model: 'gpt-5.6-luna', effort: 'low' },
+  opencode: { model: 'opencode-go/deepseek-v4.1-flash', effort: 'low' },
+};
+
+function liveService(provider: 'claude-code' | 'codex' | 'opencode') {
+  const { model, effort } = CHEAPEST[provider];
   return new CliAgentAiService(
-    fakeConfig({ aiProvider: provider, enabledRunners: [provider] }),
+    fakeConfig({ aiProvider: provider, enabledRunners: [provider], orchestratorModel: liveModel ?? model, plannerThinkingEffort: liveModel ? undefined : effort }),
     { spawn, workspaceRoot: () => process.cwd() },
   );
 }

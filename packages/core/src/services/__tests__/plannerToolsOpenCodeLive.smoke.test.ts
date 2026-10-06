@@ -17,6 +17,10 @@ import { fakeConfig, makeSession } from './sessionTestKit';
  *
  *   ORDEWELL_LIVE_AGENTS=opencode npx vitest run --root packages/core plannerToolsOpenCodeLive
  *
+ * The planner runs on a cheap model at its lowest variant unless
+ * ORDEWELL_LIVE_MODEL says otherwise, in which case the variant is the
+ * model's own default.
+ *
  * Not part of the suite: it costs real tokens and a minute or two.
  */
 
@@ -25,7 +29,7 @@ const model = process.env.ORDEWELL_LIVE_MODEL ?? 'opencode-go/deepseek-v4.1-flas
 
 const CATALOG: Record<string, DiscoveredModel[]> = {
   opencode: [{ modelId: model, modelLabel: 'Live model', variants: [] }],
-  'claude-code': [{ modelId: 'sonnet', modelLabel: 'Sonnet', variants: [] }],
+  'claude-code': [{ modelId: 'haiku', modelLabel: 'Haiku', variants: [] }],
 };
 
 const cleanup: (() => Promise<void> | void)[] = [];
@@ -37,7 +41,7 @@ describe.runIf(live)('OpenCode planner tools — live', () => {
     cleanup.push(() => rmSync(workspace, { recursive: true, force: true }));
     const server = new OrdewellMcpServer();
     cleanup.push(() => server.dispose());
-    const config = fakeConfig({ aiProvider: 'opencode', orchestratorModel: model });
+    const config = fakeConfig({ aiProvider: 'opencode', orchestratorModel: model, plannerThinkingEffort: process.env.ORDEWELL_LIVE_MODEL ? undefined : 'low' });
     const ai = new CliAgentAiService(config, { spawn, workspaceRoot: () => workspace, mcpServer: server });
     cleanup.push(() => ai.reset());
 

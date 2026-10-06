@@ -2,14 +2,15 @@ import { execFileSync, spawn } from 'child_process';
 import { describe, it, expect, vi } from 'vitest';
 import { CliAgentAiService } from '../harness/CliAgentAiService';
 import { fakeConfig, fakeFileSystem } from '../../testing';
-import type { AiProvider } from '../../interfaces/IConfig';
-import type { RunnerId } from '../../models/Task';
 
 /**
  * The opt-in live check for the planner harness process lifecycle.
  *
- *   ORDEWELL_LIVE_AGENTS=claude-code,codex,opencode \
- *     npx vitest run --root packages/core plannerLive
+ *   ORDEWELL_LIVE_AGENTS=claude-code npx vitest run --root packages/core plannerLive
+ *
+ * Each planner runs on its runner's cheapest model unless ORDEWELL_LIVE_MODEL
+ * says otherwise; that variable applies to every runner, so with it set run
+ * one runner at a time.
  *
  * Not part of the suite: it costs real tokens and tens of seconds per case.
  */
@@ -23,9 +24,22 @@ const agents = (process.env.ORDEWELL_LIVE_AGENTS ?? '').split(',').map((s) => s.
  */
 const TIMEOUT_MS = 600_000;
 
-function liveService(agent: AiProvider) {
+/**
+ * The cheapest model of each runner, at its lowest effort where it has one.
+ * ORDEWELL_LIVE_MODEL overrides every runner at once, so set it only when
+ * running a single one, and the effort is then the runner's own default.
+ */
+const liveModel = process.env.ORDEWELL_LIVE_MODEL;
+const CHEAPEST: Record<'claude-code' | 'codex' | 'opencode', { model: string; effort?: string }> = {
+  'claude-code': { model: 'haiku' },
+  codex: { model: 'gpt-5.6-luna', effort: 'low' },
+  opencode: { model: 'opencode-go/deepseek-v4.1-flash', effort: 'low' },
+};
+
+function liveService(agent: 'claude-code' | 'codex' | 'opencode') {
+  const { model, effort } = CHEAPEST[agent];
   return new CliAgentAiService(
-    fakeConfig({ aiProvider: agent, enabledRunners: [agent as RunnerId] }),
+    fakeConfig({ aiProvider: agent, enabledRunners: [agent], orchestratorModel: liveModel ?? model, plannerThinkingEffort: liveModel ? undefined : effort }),
     { spawn, workspaceRoot: () => process.cwd() },
   );
 }
