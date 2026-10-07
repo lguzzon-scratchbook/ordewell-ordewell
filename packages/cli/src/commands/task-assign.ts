@@ -1,7 +1,7 @@
 import { canSetDependencies, dependencyCandidates, taskRef, titledTaskRef } from '@ordewell/core/plan-utils';
 import { assignedModelFor, effortsForTask, modelsForTask, modesForTask, runnerAccepts } from '../tui/taskAssignment';
 import type { TaskView } from '../tui/state';
-import type { ApiClient } from '../daemonClient';
+import type { ApiClient } from '../apiClient';
 import { positionals } from '../utils';
 import { fail, fetchCatalog, taskViews } from './shared';
 import { withResolvedTask } from './task-control';

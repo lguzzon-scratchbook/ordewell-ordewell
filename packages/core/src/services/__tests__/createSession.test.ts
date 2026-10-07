@@ -1653,7 +1653,7 @@ describe('saving a run as its tasks settle', () => {
     await vi.waitFor(() => expect(order).toContain('save:completed'));
     expect(order.indexOf('save:completed')).toBeLessThan(order.indexOf('status:completed'));
     expect(order).not.toContain('complete');
-    expect(session.hasLiveWork).toBe(true);
+    expect(session.isExecuting).toBe(true);
   });
 
   it('saves a failed verdict as well', async () => {

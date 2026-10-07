@@ -611,8 +611,8 @@ the attempt. A passed verdict keeps the attempt live through its merge,
 so the task completes — and frees its dependents — only once its work is on the
 integration branch. Holds, retry counts and spawn counts are
 deliberately *not* on the record — they describe the task across attempts and
-must survive one ending. Surfaces read an attempt through `getAttempt` /
-`getAttemptSession`; `activeSessionMap` is derived from it. Runner session ids
+must survive one ending. Surfaces read an attempt through `getAttempt`;
+`activeSessionMap` is derived from it. Runner session ids
 are unique per spawn for the same reason: a retry reuses its task id, and a
 registry keyed by task let the old attempt's exit unregister the new one.
 *Avoid:* "session" for this concept — the session is the runner's process, one

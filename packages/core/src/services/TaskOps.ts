@@ -5,7 +5,7 @@ import {
   createTask, opsFlag, inheritedOps,
 } from '../models/Task';
 import { extractObjectsWithKey, stripTrailingCommas, escapeControlCharsInStrings, PlanParseError, TASK_OPS_ENVELOPE_KEY } from './JsonExtractor';
-import { validateTaskEdit, checkModelAndModeValidity, type EditCatalog } from './TaskEditValidator';
+import { validateTaskEdit, checkModelAndModeValidity, type EditCatalog, type TaskEditActor, type TaskEditCheck } from './TaskEditValidator';
 
 /**
  * Targeted task edits emitted by the planner conversation (the 'task_ops'
@@ -447,32 +447,51 @@ export function applyTaskOps(currentTasks: readonly Task[], ops: TaskOp[], runne
     return { ids, bad };
   };
 
+  /**
+   * The resolve-and-validate half shared by "update" and "rearm": resolve the
+   * target, apply the field allowlist and runner check, run the edit validator
+   * under the op's audience, then resolve any dependency refs. `refuseRunning`
+   * is rearm's extra lock check, kept before the field work so its message wins.
+   */
+  const prepareEdit = (
+    op: { taskId: string; changes?: Partial<Task> },
+    opIndex: number,
+    label: string,
+    audience: TaskEditActor,
+    refuseRunning = false,
+  ): { target: Task; changes: Partial<Task>; check: TaskEditCheck } | { error: string } => {
+    const ref = resolveRef(op.taskId, originalFlatAll, flattenTasks(tasks), handleOwner, handleId, opIndex);
+    if ('error' in ref) return { error: `${label}: ${ref.error}` };
+    const target = findInTasks(tasks, ref.id);
+    if (!target) return { error: `${label}: task "${op.taskId}" no longer exists in this batch (removed, merged, or split by an earlier op)` };
+    if (refuseRunning && target.status === 'in_progress') return { error: `${label}: "${target.title}" is running and cannot be re-armed` };
+    const changes = updatableChanges(op.changes);
+    if (changes.assignedRunner && !runners.includes(changes.assignedRunner)) {
+      return { error: `${label}: runner "${changes.assignedRunner}" is not in this plan's runner set [${runners.join(', ')}]` };
+    }
+    // Dependency refs are still unresolved (e.g. "#3") at this point, so the
+    // check runs on everything but them; resolveDeps below handles them once
+    // they're real ids.
+    const changesForCheck: Partial<Task> = { ...changes };
+    delete changesForCheck.dependencies;
+    const check = validateTaskEdit(audience, flattenTasks(tasks), target.id, changesForCheck, catalog);
+    if (!check.ok) return { error: `${label}: ${check.error}` };
+    for (const field of check.clear ?? []) (changes as Record<string, unknown>)[field] = undefined;
+    if ('dependencies' in changes) {
+      const { ids, bad } = resolveDeps(changes.dependencies, opIndex);
+      if (bad.length) return { error: `${label}: unknown dependencies: ${bad.join(', ')}` };
+      changes.dependencies = ids.filter((id) => id !== target.id);
+    }
+    return { target, changes, check };
+  };
+
   for (const [i, op] of ops.entries()) {
     const label = `op ${i + 1} (${op.op})`;
     switch (op.op) {
       case 'update': {
-        const ref = resolveRef(op.taskId, originalFlatAll, flattenTasks(tasks), handleOwner, handleId, i);
-        if ('error' in ref) { errors.push(`${label}: ${ref.error}`); break; }
-        const target = findInTasks(tasks, ref.id);
-        if (!target) { errors.push(`${label}: task "${op.taskId}" no longer exists in this batch (removed, merged, or split by an earlier op)`); break; }
-        const changes = updatableChanges(op.changes);
-        if (changes.assignedRunner && !runners.includes(changes.assignedRunner)) {
-          errors.push(`${label}: runner "${changes.assignedRunner}" is not in this plan's runner set [${runners.join(', ')}]`);
-          break;
-        }
-        // Dependency refs are still unresolved (e.g. "#3") at this point, so
-        // this check runs on everything but them; resolveDeps below handles
-        // dependency well-formedness once they're real ids.
-        const changesForCheck: Partial<Task> = { ...changes };
-        delete changesForCheck.dependencies;
-        const check = validateTaskEdit('planner', flattenTasks(tasks), target.id, changesForCheck, catalog);
-        if (!check.ok) { errors.push(`${label}: ${check.error}`); break; }
-        for (const field of check.clear ?? []) (changes as Record<string, unknown>)[field] = undefined;
-        if ('dependencies' in changes) {
-          const { ids, bad } = resolveDeps(changes.dependencies, i);
-          if (bad.length) { errors.push(`${label}: unknown dependencies: ${bad.join(', ')}`); break; }
-          changes.dependencies = ids.filter((id) => id !== target.id);
-        }
+        const prep = prepareEdit(op, i, label, 'planner');
+        if ('error' in prep) { errors.push(prep.error); break; }
+        const { target, changes, check } = prep;
         if (Object.keys(changes).length === 0) { errors.push(`${label}: no valid changes provided`); break; }
         tasks = updateTaskInPlan(tasks, target.id, changes);
         const clearedNote = check.clear?.length ? `; cleared ${check.clear.join(', ')}` : '';
@@ -638,30 +657,12 @@ export function applyTaskOps(currentTasks: readonly Task[], ops: TaskOp[], runne
         break;
       }
       case 'rearm': {
-        const ref = resolveRef(op.taskId, originalFlatAll, flattenTasks(tasks), handleOwner, handleId, i);
-        if ('error' in ref) { errors.push(`${label}: ${ref.error}`); break; }
-        const target = findInTasks(tasks, ref.id);
-        if (!target) { errors.push(`${label}: task "${op.taskId}" no longer exists in this batch (removed, merged, or split by an earlier op)`); break; }
-        if (target.status === 'in_progress') { errors.push(`${label}: "${target.title}" is running and cannot be re-armed`); break; }
-        const changes = updatableChanges(op.changes);
-        if (changes.assignedRunner && !runners.includes(changes.assignedRunner)) {
-          errors.push(`${label}: runner "${changes.assignedRunner}" is not in this plan's runner set [${runners.join(', ')}]`);
-          break;
-        }
-        // Validated as a direct edit (not 'planner'): re-arming is the sanctioned
-        // exception to the planner lock — its whole point is to touch a task the
-        // lock would otherwise refuse. Well-formedness (type coherence, model/mode
-        // validity, dependency shape) still applies, same as every other edit.
-        const changesForCheck: Partial<Task> = { ...changes };
-        delete changesForCheck.dependencies;
-        const check = validateTaskEdit('direct', flattenTasks(tasks), target.id, changesForCheck, catalog);
-        if (!check.ok) { errors.push(`${label}: ${check.error}`); break; }
-        for (const field of check.clear ?? []) (changes as Record<string, unknown>)[field] = undefined;
-        if ('dependencies' in changes) {
-          const { ids, bad } = resolveDeps(changes.dependencies, i);
-          if (bad.length) { errors.push(`${label}: unknown dependencies: ${bad.join(', ')}`); break; }
-          changes.dependencies = ids.filter((id) => id !== target.id);
-        }
+        // Re-arming is the sanctioned exception to the planner lock — its whole
+        // point is to touch a task the lock would otherwise refuse — so it
+        // validates as a direct edit; well-formedness still applies.
+        const prep = prepareEdit(op, i, label, 'direct', true);
+        if ('error' in prep) { errors.push(prep.error); break; }
+        const { target, changes, check } = prep;
         tasks = updateTaskInPlan(tasks, target.id, { ...changes, status: 'pending', verdict: undefined, outputSummary: undefined, awaitingReason: undefined });
         // Dependents parked at 'blocked' by this task's earlier failure have
         // nothing else to release them — the scheduler reads `status` directly,

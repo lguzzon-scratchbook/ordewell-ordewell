@@ -1,4 +1,5 @@
-import { resolvePort, type ApiClient } from '../daemonClient';
+import { resolvePort } from '../daemon';
+import type { ApiClient } from '../apiClient';
 import { openTaskTerminal } from '../tui/terminalLauncher';
 import { withResolvedTask } from './task-control';
 

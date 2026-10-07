@@ -99,7 +99,7 @@ export interface PlannerConversationHost {
    * conversation never reaches into execution state directly.
    */
   liveOutput: LiveOutputLookup;
-  hasLiveWork(): boolean;
+  isExecuting(): boolean;
   /** The session's single mutation ritual: op → persist → notify (default: the plan). */
   mutate(op: () => boolean, notify?: () => void): LegacyPlanState | null;
   broadcast: SessionBroadcaster;
@@ -574,7 +574,7 @@ export class PlannerConversation {
    * plan in place while the running batch keeps going.
    */
   private editTouchesLiveWork(turn: SettleableTurn): boolean {
-    if (turn.kind === 'plan') return this.host.hasLiveWork();
+    if (turn.kind === 'plan') return this.host.isExecuting();
     if (turn.kind !== 'task_ops') return false;
     const running = flattenTasks(this.host.tasks()).filter((t) => t.status === 'in_progress');
     if (running.length === 0) return false;
@@ -898,7 +898,7 @@ export class PlannerConversation {
     // takes edits immediately, so promising a queue there is a lie the model
     // plans around (it stops emitting ops and asks the user to wait).
     const locked = tasks.filter((t) => t.status === 'in_progress');
-    const execNote = this.host.hasLiveWork()
+    const execNote = this.host.isExecuting()
       ? `\nExecution is RUNNING${locked.length ? ` — these tasks are locked: ${locked.map((t) => `#${t.order}`).join(', ')}` : ''}. Any task edits you emit will be queued and applied between batches.`
       : '';
     return [

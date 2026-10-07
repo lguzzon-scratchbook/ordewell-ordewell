@@ -2,7 +2,8 @@
 import { migrateOldConfigDir } from '@ordewell/core';
 import { loadEnvFile } from './utils/env';
 import { printHelp } from './help';
-import { ApiClient, describeConnectionRefused, isConnectionRefused, resolvePort } from './daemonClient';
+import { describeConnectionRefused, isConnectionRefused, resolvePort } from './daemon';
+import { ApiClient } from './apiClient';
 import { COMMANDS } from './commands/registry';
 import { cliVersion } from './version';
 import { expandSessionId, flag } from './utils';

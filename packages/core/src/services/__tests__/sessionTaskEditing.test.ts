@@ -200,7 +200,7 @@ describe('Session.removeTask', () => {
     await session.removeTask('only');
 
     expect(runner.stopped).toEqual(['s-only']);
-    expect(session.hasLiveWork).toBe(false);
+    expect(session.isExecuting).toBe(false);
     expect(session.planTasks).toEqual([]);
   });
 
@@ -488,7 +488,7 @@ describe('Session.removeTask of a task not in the plan', () => {
     expect(await session.removeTask('ghost')).toBeNull();
 
     expect(runner.stopped).toEqual([]);
-    expect(session.hasLiveWork).toBe(true);
+    expect(session.isExecuting).toBe(true);
     expect(saves(session)).not.toHaveBeenCalled();
   });
 });

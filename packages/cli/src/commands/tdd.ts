@@ -1,4 +1,5 @@
-import { ensureDaemon, ApiClient, resolvePort } from '../daemonClient';
+import { ensureDaemon, resolvePort } from '../daemon';
+import { ApiClient } from '../apiClient';
 
 export async function handleTdd(subArgs: string[]): Promise<void> {
   const action = subArgs[0];

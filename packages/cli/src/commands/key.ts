@@ -1,5 +1,5 @@
 import { ALL_PROVIDERS, PROVIDER_PRIORITY, type AiProvider } from '@ordewell/core';
-import type { ApiClient } from '../daemonClient';
+import type { ApiClient } from '../apiClient';
 import { positionals } from '../utils';
 import { connect, fail, fetchCatalog, persistEnv } from './shared';
 

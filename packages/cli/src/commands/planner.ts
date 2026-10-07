@@ -7,7 +7,7 @@ import {
   type AiProvider,
   type PlannerModelRecall,
 } from '@ordewell/core';
-import type { ApiClient } from '../daemonClient';
+import type { ApiClient } from '../apiClient';
 import { positionals } from '../utils';
 import { connect, fail, fetchCatalog, persistEnv, writeEnv } from './shared';
 import { describePlannerSwitch } from '../plannerModelSwitch';

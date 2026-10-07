@@ -293,7 +293,7 @@ export async function handleSendMessage(
     await handleContinueConversation(text, deps);
     // Only a live runner can queue an edit — an armed-but-idle scheduler applies
     // it, so the strip would announce a queue that never forms.
-    if (deps.session.hasLiveWork) deps.chatProvider.showPendingPlanEdits(deps.session.getQueuedMessages());
+    if (deps.session.isExecuting) deps.chatProvider.showPendingPlanEdits(deps.session.getQueuedMessages());
   } else {
     await handleStartPlanning(text, deps, pendingRunners);
   }

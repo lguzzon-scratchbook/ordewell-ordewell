@@ -1,5 +1,6 @@
 import { flag, flags, readLastSession } from '../utils';
-import { ensureDaemon, ApiClient, resolvePort } from '../daemonClient';
+import { ensureDaemon, resolvePort } from '../daemon';
+import { ApiClient } from '../apiClient';
 
 export async function handleAddTask(subArgs: string[], injectedApi?: ApiClient): Promise<void> {
   const title = flag(subArgs, '--title');

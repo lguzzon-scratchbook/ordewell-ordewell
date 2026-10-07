@@ -2,7 +2,8 @@ import { writeFileSync } from 'fs';
 import { flag, hasFlag, readLastSession } from '../utils';
 import { iconFor } from '../utils/output';
 import { taskOrderLabel } from '@ordewell/core';
-import { ensureDaemon, ApiClient, resolvePort, type SessionMeta } from '../daemonClient';
+import { ensureDaemon, resolvePort } from '../daemon';
+import { ApiClient, type SessionMeta } from '../apiClient';
 
 export async function handleStatus(subArgs: string[], injectedApi?: ApiClient): Promise<void> {
   const sessionId = flag(subArgs, '--session-id');

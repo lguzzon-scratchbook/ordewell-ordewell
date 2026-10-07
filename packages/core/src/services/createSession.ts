@@ -500,7 +500,7 @@ export class Session {
       catalog: () => this.catalogOf(this.plan?.runners ?? []),
       tasks: () => this.store.planTasks,
       liveOutput: (taskId, opts) => this.orchestrator.getLiveOutput(taskId, opts),
-      hasLiveWork: () => this.hasLiveWork,
+      isExecuting: () => this.isExecuting,
       mutate: (op, notify) => this.mutatePlan(op, notify),
       broadcast: (msg) => this.broadcast(msg),
       broadcastPlan: (turnId) => this.events.planGenerated(this.plan, this.goal, turnId),
@@ -796,9 +796,8 @@ export class Session {
    * nothing executing, and reporting it as executing is what left the plan
    * unstartable after its last live task was cancelled.
    */
-  get isExecuting(): boolean { return this.orchestrator.hasLiveWork; }
   /** See {@link TaskOrchestrator.hasLiveWork} — a spawned runner, not merely an armed scheduler. */
-  get hasLiveWork(): boolean { return this.orchestrator.hasLiveWork; }
+  get isExecuting(): boolean { return this.orchestrator.hasLiveWork; }
   get status(): 'approved' | 'running' | 'completed' { return this.orchestrator.status; }
 
   /**
@@ -825,6 +824,16 @@ export class Session {
     return () => signal.removeEventListener('abort', onAbort);
   }
 
+  /** Run a planner call with {@link denyApprovalsOnAbort} wired for its duration only. */
+  private async withAbortDenial<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+    const releaseAbort = this.denyApprovalsOnAbort(signal);
+    try {
+      return await fn();
+    } finally {
+      releaseAbort();
+    }
+  }
+
   async generatePlan(goal: string, runners: RunnerId[], options?: GeneratePlanOptions): Promise<LegacyPlanState> {
     this.plan = null;
     this.goal = goal;
@@ -841,25 +850,19 @@ export class Session {
     // here and the prompt.
     const modes = { ...plannerModesFrom(settings, this.config.autonomousMode), isolatedExecution: await this.runs.plannerLayout() };
 
-    const releaseAbort = this.denyApprovalsOnAbort(options?.signal);
-    let plan: LegacyPlanState;
-    try {
-      plan = await this.planner.generate({
-        goal,
-        runners: chosenRunners,
-        modelsByRunner,
-        runnerModes,
-        autonomousDefault: this.config.autonomousMode,
-        fs: this.fsAdapter,
-        fetcher: this.fetcher,
-        onProgress: (p) => this.events.progress(p),
-        signal: options?.signal,
-        perRunnerAllowlist: settings.modelAllowlist,
-        modes,
-      });
-    } finally {
-      releaseAbort();
-    }
+    const plan = await this.withAbortDenial(options?.signal, () => this.planner.generate({
+      goal,
+      runners: chosenRunners,
+      modelsByRunner,
+      runnerModes,
+      autonomousDefault: this.config.autonomousMode,
+      fs: this.fsAdapter,
+      fetcher: this.fetcher,
+      onProgress: (p) => this.events.progress(p),
+      signal: options?.signal,
+      perRunnerAllowlist: settings.modelAllowlist,
+      modes,
+    }));
 
     this.plan = plan;
     this.events.holdStatus(() => {
@@ -890,12 +893,7 @@ export class Session {
     const now = new Date().toISOString();
     this.plan = { tasks: [], generatedAt: now, status: 'draft', runners: chosenRunners, lastUpdated: now };
 
-    const releaseAbort = this.denyApprovalsOnAbort(options?.signal);
-    try {
-      return await this.conversation.start(this.goal, opening, options?.signal);
-    } finally {
-      releaseAbort();
-    }
+    return this.withAbortDenial(options?.signal, () => this.conversation.start(this.goal, opening, options?.signal));
   }
 
   /**
@@ -907,15 +905,10 @@ export class Session {
     // A turn that failed before persist leaves its runs unflushed; drop them so
     // the next turn's log cannot absorb a previous turn's uncommitted activity.
     this.events.dropSubagentRuns();
-    const releaseAbort = this.denyApprovalsOnAbort(options?.signal);
-    try {
-      return await this.conversation.reply(this.resolveSkillInvocation(userMessage), {
-        signal: options?.signal,
-        verbatim: userMessage,
-      });
-    } finally {
-      releaseAbort();
-    }
+    return this.withAbortDenial(options?.signal, () => this.conversation.reply(this.resolveSkillInvocation(userMessage), {
+      signal: options?.signal,
+      verbatim: userMessage,
+    }));
   }
 
   /**
@@ -959,12 +952,7 @@ export class Session {
    */
   async compactConversation(signal?: AbortSignal): Promise<ConversationCompaction> {
     if (!this.plan) throw new ConversationEditError('No planning conversation to condense');
-    const releaseAbort = this.denyApprovalsOnAbort(signal);
-    try {
-      return await this.conversation.compact(signal);
-    } finally {
-      releaseAbort();
-    }
+    return this.withAbortDenial(signal, () => this.conversation.compact(signal));
   }
 
   rewindTargets(): RewindTarget[] {
@@ -1529,7 +1517,8 @@ export class Session {
     // planner re-emits that session's plan here. The same-object case (e.g.
     // re-adopting the current plan on approval) keeps the conversation; after
     // a drop, the first user send reseeds it from this plan's own transcript.
-    if (plan !== this.plan) {
+    const adopting = plan !== this.plan;
+    if (adopting) {
       this.conversation.reset();
       // The execution log and queued messages are scoped to the outgoing plan;
       // callers restoring a saved queue re-apply it after adoption.
@@ -1540,7 +1529,6 @@ export class Session {
       this.approvals.clear(isPlannerApproval);
       this.approvalPolicy.reset();
     }
-    const adopting = plan !== this.plan;
     this.plan = plan;
     this.goal = goal;
     this.workspace = workspace;

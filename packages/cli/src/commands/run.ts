@@ -1,7 +1,7 @@
 import { flag, hasFlag, readLastSession } from '../utils';
 import { handoffBranch, isRepoGroup, repoResultLines } from '../isolation';
 import { iconFor } from '../utils/output';
-import type { ApiClient, TaskStatus } from '../daemonClient';
+import type { ApiClient, TaskStatus } from '../apiClient';
 import { taskStartedNotice, truncateCheckpointSummary } from '@ordewell/core';
 import { connect } from './shared';
 

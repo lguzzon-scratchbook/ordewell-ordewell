@@ -1,5 +1,5 @@
 import { existsSync } from 'fs';
-import { startDaemon, resolvePort } from '../daemonClient';
+import { startDaemon, resolvePort } from '../daemon';
 import { spawn } from 'child_process';
 import { resolve } from 'path';
 export async function handleWeb(subArgs: string[]): Promise<void> {

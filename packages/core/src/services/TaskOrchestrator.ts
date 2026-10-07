@@ -31,6 +31,7 @@ import { capConflictFiles } from './conflictFiles';
 import { resolveWorkspaceEnv, type WorkspaceEnv } from './workspaceEnv';
 import { givesCompletionTool, routeTransport } from './TransportRouter';
 import { continuability } from './continuation';
+import { quotedList } from '../utils/quotedList';
 import type { MergeGateView } from './SessionMessage';
 
 /**
@@ -585,9 +586,6 @@ export class TaskOrchestrator {
     return { taskId: id, attempt: n, phase, sessionId: session?.id ?? null, runner, cwd, startedAt };
   }
 
-  getAttemptSession(taskId: string): ITerminalSession | undefined {
-    return this.attempts.get(taskId)?.session ?? undefined;
-  }
   get queuedCount(): number { return this.messageQueue.length; }
 
   /**
@@ -675,10 +673,6 @@ export class TaskOrchestrator {
 
   clearQueuedMessages(): void {
     this.messageQueue.clear();
-  }
-
-  processNextQueuedMessage(): QueuedMessage | null {
-    return this.messageQueue.next();
   }
 
   loadPlan(tasks: readonly Task[], planRunners: RunnerId[] = ['claude-code']): void {
@@ -783,7 +777,7 @@ export class TaskOrchestrator {
   private sayStopped(stopped: readonly TaskAttempt[]): void {
     if (stopped.length === 0) return;
     const one = stopped.length === 1;
-    const named = quotedTitles(stopped.map((a) => this.store.get(a.taskId)?.title ?? a.taskId));
+    const named = quotedList(stopped.map((a) => this.store.get(a.taskId)?.title ?? a.taskId));
     const kept = stopped.some((a) => a.worktree)
       ? ` What ${one ? 'it' : 'they'} did is kept in ${one ? 'its worktree' : 'their worktrees'}: Mark complete lands it; Retry starts over and keeps it on a branch.`
       : '';
@@ -801,7 +795,7 @@ export class TaskOrchestrator {
     if (orphans.length === 0) return;
     for (const t of orphans) this.store.markPending(t.id);
     const one = orphans.length === 1;
-    const titles = quotedTitles(orphans.map((t) => t.title));
+    const titles = quotedList(orphans.map((t) => t.title));
     this.tell('warn', `${one ? 'Task' : 'Tasks'} ${titles} ${one ? 'was' : 'were'} shown as running, but nothing was running ${one ? 'it' : 'them'} — back to not started. Retry or force-start ${one ? 'it' : 'them'}; a worktree ${one ? 'it' : 'they'} had is kept.`);
     this.emit('onTaskChanged');
   }
@@ -830,10 +824,6 @@ export class TaskOrchestrator {
    */
   private get settled(): boolean {
     return this.liveTaskIds().size === 0;
-  }
-
-  async onUserTaskComplete(taskId: string): Promise<void> {
-    return this.markTaskComplete(taskId);
   }
 
   /**
@@ -1132,10 +1122,6 @@ export class TaskOrchestrator {
     await this.tick();
   }
 
-  async markAiTaskComplete(taskId: string): Promise<void> {
-    return this.markTaskComplete(taskId);
-  }
-
   /**
    * Undo a completion: return the task to "not executed" — pending, verdict and
    * summary dropped, archive entry removed. It is put on hold like a cancel, so
@@ -1293,8 +1279,6 @@ export class TaskOrchestrator {
     this.emit('onReviewApproved', { tasks: this.store.planTasks });
     await this.start();
   }
-
-  getPlanVisualization() { return this.store.getPlanVisualization(); }
 
   async tick(): Promise<void> {
     this.recoverOrphans();
@@ -1651,12 +1635,6 @@ export class TaskOrchestrator {
 
 /** How much of an ops task's last attempt the next one is shown. */
 const OPS_RETRY_TAIL_LINES = 60;
-
-/** `"A"`, `"A" and "B"`, `"A", "B" and "C"`. */
-function quotedTitles(titles: readonly string[]): string {
-  const quoted = titles.map((t) => `"${t}"`);
-  return quoted.length > 1 ? `${quoted.slice(0, -1).join(', ')} and ${quoted.at(-1)}` : quoted.join('');
-}
 
 function unresumedMessage(task: Task, why: string): string {
   return `Could not continue task "${task.title}": ${why}. Retry starts it afresh.`;

@@ -1,4 +1,5 @@
-import { ensureDaemon, ApiClient, resolvePort } from '../daemonClient';
+import { ensureDaemon, resolvePort } from '../daemon';
+import { ApiClient } from '../apiClient';
 
 const USAGE = `Usage:
   ordewell allowlist set <runner> <id1,id2,…>    Set allowlist for a runner

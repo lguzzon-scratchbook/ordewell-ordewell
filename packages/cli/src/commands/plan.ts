@@ -1,6 +1,7 @@
 import { createInterface } from 'readline';
 import { allTasksOf, flag, flags, hasFlag, saveLastSession } from '../utils';
-import { ensureDaemon, ApiClient, resolvePort } from '../daemonClient';
+import { ensureDaemon, resolvePort } from '../daemon';
+import { ApiClient } from '../apiClient';
 import { createApprovalHandler } from '../approvals';
 import { createStepLog, type LogLine } from './researchLog';
 import type { SerializedPlan, SerializedTask, DiscoveredModel } from '@ordewell/core';

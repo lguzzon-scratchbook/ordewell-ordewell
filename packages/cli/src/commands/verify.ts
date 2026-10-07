@@ -1,4 +1,5 @@
-import { ensureDaemon, ApiClient, resolvePort } from '../daemonClient';
+import { ensureDaemon, resolvePort } from '../daemon';
+import { ApiClient } from '../apiClient';
 
 export async function handleVerify(subArgs: string[], api?: ApiClient): Promise<void> {
   const action = subArgs[0];

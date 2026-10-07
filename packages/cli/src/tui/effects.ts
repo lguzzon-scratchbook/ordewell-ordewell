@@ -3,7 +3,7 @@ import {
   ALL_PROVIDERS, autonomyLevelLabel, clipboardCopyCommand, isCliProvider, markRequestFor, newTaskFields, type AiProvider, type ApprovalAnswer, type HasBinFn, type LegacyPlanState,
   type PlannerModelRecall, type SerializedPlan, type SessionMeta, type TaskLogEvent,
 } from '@ordewell/core';
-import { describeConnectionRefused, isConnectionRefused } from '../daemonClient';
+import { describeConnectionRefused, isConnectionRefused } from '../daemon';
 import { WorkspaceInitNeededError } from '../apiClient';
 import { normalizeCatalog, type RawCatalog } from '../catalog';
 import { describePlannerSwitch } from '../plannerModelSwitch';
