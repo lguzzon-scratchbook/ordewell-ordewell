@@ -49,8 +49,8 @@ export { ModelCatalog } from './services/ModelCatalog';
 export type { CatalogModel } from './services/ModelCatalog';
 export { resolveProvider, fetchAllProviderModels, collectProviderCredentials, toOrchestratorOptions } from './services/ProviderRouting';
 export type { ProviderModelLists, FetchAllProviderModelsOptions, AllProviderModels, OrchestratorOption, ProviderModelsResult, ProviderCredentialSource } from './services/ProviderRouting';
-export { ALL_PROVIDERS, getProviderMeta, prefixModelId, stripModelPrefix, resolveProviderFromPrefix, isOpenAiProvider, isCliProvider, runnerForProvider, providerForRunner, configuredProviders, PROVIDER_LABEL, PROVIDER_SHORT_LABEL, PROVIDER_PRIORITY, PROVIDER_DETECT_PRIORITY, CLI_PROVIDERS } from './services/ProviderRegistry';
-export type { ProviderRegistration } from './services/ProviderRegistry';
+export { ALL_PROVIDERS, getProviderMeta, prefixModelId, stripModelPrefix, resolveProviderFromPrefix, isOpenAiProvider, isCliProvider, runnerForProvider, providerForRunner, plannerBackendEntries, configuredProviders, PROVIDER_LABEL, PROVIDER_SHORT_LABEL, HARNESS_PLANNER_REASON, PROVIDER_PRIORITY, PROVIDER_DETECT_PRIORITY, CLI_PROVIDERS } from './services/ProviderRegistry';
+export type { ProviderRegistration, PlannerUsability, PlannerBackendEntry } from './services/ProviderRegistry';
 export {
   admitSettingsEnv,
   SETTINGS_ENV_ALLOWLIST,

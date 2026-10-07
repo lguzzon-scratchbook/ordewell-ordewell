@@ -1,9 +1,8 @@
 import {
-  CLI_PROVIDERS, getProviderMeta, PROVIDER_PRIORITY, runnerForProvider,
+  CLI_PROVIDERS, getProviderMeta, plannerBackendEntries, runnerForProvider,
   type AiProvider, type ModelResolver, type PlannerModelMemory,
-  type RunnerInstallation, type RunnerTransport, type SettingsService,
+  type PlannerUsability, type RunnerInstallation, type RunnerTransport, type SettingsService,
 } from '@ordewell/core';
-import type { ApiProvider } from './adapters/SecretStore';
 import type { VsCodeConfig } from './adapters/VsCodeConfig';
 import type { ChatViewProvider, PlannerBackend } from './providers/ChatViewProvider';
 import { recallPlannerModel } from './plan/PlannerModelSwitch';
@@ -36,22 +35,12 @@ export class PlannerSelection {
    * it.
    */
   async backends(): Promise<PlannerBackend[]> {
-    const harness = await Promise.all(CLI_PROVIDERS.map(async (id) => {
+    const usability: Record<string, PlannerUsability> = {};
+    await Promise.all(CLI_PROVIDERS.map(async (id) => {
       const runner = runnerForProvider(id)!;
-      const { usable, reason } = await this.deps.runnerInstallation.plannerUsability(runner);
-      return {
-        id, label: getProviderMeta(id).label, kind: 'harness' as const,
-        runner, usable, reason: reason ?? 'coding agent · no API key needed',
-      };
+      usability[runner] = await this.deps.runnerInstallation.plannerUsability(runner);
     }));
-    const configured = this.deps.config.configuredProviders;
-    const vendors: PlannerBackend[] = PROVIDER_PRIORITY
-      .filter((id) => configured.includes(id as ApiProvider))
-      .map((id) => ({
-        id, label: getProviderMeta(id).label, kind: 'vendor' as const,
-        usable: true, reason: getProviderMeta(id).apiKeyEnvVar,
-      }));
-    return [...harness, ...vendors];
+    return plannerBackendEntries(usability, this.deps.config.configuredProviders);
   }
 
   /** Switch who plans. */

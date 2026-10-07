@@ -1,4 +1,4 @@
-import { ALL_PROVIDERS, CLI_PROVIDERS, PROVIDER_PRIORITY, runnerForProvider, titledTaskRef, type AiProvider } from '@ordewell/core';
+import { ALL_PROVIDERS, CLI_PROVIDERS, plannerBackendEntries, runnerForProvider, titledTaskRef, type AiProvider, type PlannerUsability } from '@ordewell/core';
 import { dependencyCandidates } from '@ordewell/core/plan-utils';
 import { findTask, type ModelView, type PickerItem, type PickerState, type TuiState } from '../state';
 import { effortsForTask, modelsForRunner, modelsForTask, modesForTask } from '../taskAssignment';
@@ -202,30 +202,27 @@ export function pickerItemsFor(state: TuiState, action: PickerState['action']): 
  * the preflight exists to prevent.
  */
 export function plannerItems(state: TuiState): PickerItem[] {
+  // The daemon's runner list is the TUI's only preflight: an installed runner
+  // is usable, an absent one gets the same not-on-PATH reason VS Code probes for.
   const installed = new Set(state.runners.map((r) => r.id));
-
-  const agents: PickerItem[] = CLI_PROVIDERS.map((id) => {
+  const usability: Record<string, PlannerUsability> = {};
+  for (const id of CLI_PROVIDERS) {
     const runner = runnerForProvider(id)!;
-    const ready = installed.has(runner);
-    return {
-      id,
-      label: ALL_PROVIDERS[id].label,
-      detail: ready ? 'coding agent · no API key needed' : 'CLI not installed or not on PATH',
-      selected: state.plannerProvider === id,
-      disabled: !ready,
-    };
-  });
+    usability[runner] = installed.has(runner)
+      ? { usable: true }
+      : { usable: false, reason: 'CLI not installed or not on PATH' };
+  }
 
-  const vendors: PickerItem[] = PROVIDER_PRIORITY
-    .filter((id) => state.configuredProviders.includes(id))
-    .map((id) => ({
-      id,
-      label: ALL_PROVIDERS[id].label,
-      detail: ALL_PROVIDERS[id].apiKeyEnvVar,
-      selected: state.plannerProvider === id,
-    }));
+  const entries = plannerBackendEntries(usability, state.configuredProviders as AiProvider[]);
+  const items: PickerItem[] = entries.map((entry) => ({
+    id: entry.id,
+    label: entry.label,
+    detail: entry.reason,
+    selected: state.plannerProvider === entry.id,
+    disabled: !entry.usable,
+  }));
 
-  return vendors.length > 0
-    ? [...agents, ...vendors]
-    : [...agents, { id: '', label: 'No API providers configured', detail: 'add a key with /key', disabled: true }];
+  return entries.some((entry) => entry.kind === 'vendor')
+    ? items
+    : [...items, { id: '', label: 'No API providers configured', detail: 'add a key with /key', disabled: true }];
 }
