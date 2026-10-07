@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTaskOrchestrator, TaskControlError } from '../TaskOrchestrator';
+import { TaskOrchestrator, TaskControlError } from '../TaskOrchestrator';
 import { createTask, type Task } from '../../models/Task';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
@@ -36,7 +36,7 @@ function setup(opts: { isolation?: FakeWorktreeIsolation; config?: Partial<IConf
     stopAll: vi.fn(),
     activeCount: 0,
   } satisfies ITerminalRunner;
-  const orchestrator = createTaskOrchestrator({
+  const orchestrator = TaskOrchestrator.compose({
     config: fakeConfig({ worktreeIsolation: true, ...opts.config }),
     notifications: fakeNotification(),
     terminalRunner: runner,

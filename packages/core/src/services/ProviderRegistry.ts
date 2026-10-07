@@ -512,6 +512,9 @@ export interface PlannerBackendEntry {
 /** The detail a usable harness planner is always shown with. */
 export const HARNESS_PLANNER_REASON = 'coding agent · no API key needed';
 
+/** Shown for a harness planner no host has reported a status for: it may not be installed. */
+export const HARNESS_PLANNER_UNAVAILABLE_REASON = 'not available';
+
 /**
  * The planner backends every surface offers, in order: the harness planners
  * first, always listed so a missing CLI is greyed with its reason rather than
@@ -534,7 +537,7 @@ export function plannerBackendEntries(
       kind: 'harness' as const,
       runner,
       usable: status?.usable ?? false,
-      reason: status?.reason ?? HARNESS_PLANNER_REASON,
+      reason: status ? (status.reason ?? HARNESS_PLANNER_REASON) : HARNESS_PLANNER_UNAVAILABLE_REASON,
     };
   });
   const vendors: PlannerBackendEntry[] = PROVIDER_PRIORITY

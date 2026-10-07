@@ -137,7 +137,7 @@ async function main() {
   // Set up orchestrator with real config/notifications/runner
   const config = makeConfig(RUNNER_ID);
   const notifications = makeNotifications();
-  const orchestrator = core.createTaskOrchestrator({
+  const orchestrator = core.TaskOrchestrator.compose({
     config,
     notifications,
     terminalRunner: runner,

@@ -268,7 +268,6 @@ export function createExtension(services: ExtensionServices, vscodeApi: typeof v
     services.chatProvider.showPendingPlanEdits(managerDeps.session.getQueuedMessages());
     if (state.plan.tasks.length > 0) {
       services.chatProvider.showPlan(state.plan);
-      if (state.goal) services.chatProvider.setGoal(state.goal);
       replayIsolation(managerDeps.session, services.chatProvider);
     } else {
       services.chatProvider.setState('empty');

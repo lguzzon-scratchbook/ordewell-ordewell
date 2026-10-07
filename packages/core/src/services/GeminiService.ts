@@ -4,7 +4,7 @@ import {
   GenerativeModel,
   Part,
 } from '@google/generative-ai';
-import { Task, DiscoveredModel, ResearchLogEntry, ResearchProgress, RunnerId } from '../models/Task';
+import { Task, DiscoveredModel, ResearchLogEntry, ResearchProgress, RunnerId, DEFAULT_RUNNERS } from '../models/Task';
 import type { UsageRecord } from '../models/Usage';
 import { IConfig } from '../interfaces/IConfig';
 import { IFileSystem } from '../interfaces/IFileSystem';
@@ -360,7 +360,7 @@ export class GeminiService extends BaseAiService implements IAiService {
 
   async generatePlanDirect(
     userDescription: string,
-    runners: RunnerId[] = ['claude-code'],
+    runners: RunnerId[] = [...DEFAULT_RUNNERS],
     modelsByRunner: Partial<Record<RunnerId, DiscoveredModel[]>> = {},
     onToken?: (token: string) => void,
     fs?: IFileSystem,

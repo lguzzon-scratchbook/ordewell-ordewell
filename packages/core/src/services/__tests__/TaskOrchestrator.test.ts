@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTaskOrchestrator } from '../TaskOrchestrator';
-import type { TaskOrchestrator } from '../TaskOrchestrator';
+import { TaskOrchestrator } from '../TaskOrchestrator';
 import { composeAugmentedPrompt } from '../promptAugment';
 import { createTask } from '../../models/Task';
 import type { IConfig } from '../../interfaces/IConfig';
@@ -61,7 +60,7 @@ function makeOrchestrator(overrides: {
   const notifications = { ...fakeNotification(), ...overrides.notifications };
   const terminalRunner = { ...fakeTerminalRunner(), ...overrides.terminalRunner } as ITerminalRunner;
   const output = overrides.output ?? new BufferedTaskOutputSource({ transcripts: fakeTranscripts() });
-  return createTaskOrchestrator({
+  return TaskOrchestrator.compose({
     config,
     notifications,
     terminalRunner,
@@ -745,32 +744,6 @@ describe('TaskOrchestrator', () => {
       const orchestrator = makeOrchestrator();
       orchestrator.loadPlan([createTask({ id: 'a', order: 1, title: 'A', prompt: 'x' })]);
       expect(() => orchestrator.storeInstance.split('a', [])).toThrow('at least one');
-    });
-  });
-
-  describe('getPlanVisualization', () => {
-    it('groups independent tasks into parallel batches', () => {
-      const orchestrator = makeOrchestrator();
-      orchestrator.loadPlan([
-        createTask({ id: 'a', order: 1, title: 'A', prompt: 'x', sliceType: 'AFK', autonomy: 'AFK' }),
-        createTask({ id: 'b', order: 2, title: 'B', prompt: 'x', sliceType: 'AFK', autonomy: 'AFK' }),
-        createTask({ id: 'c', order: 3, title: 'C', prompt: 'x', dependencies: ['a'], sliceType: 'AFK', autonomy: 'AFK' }),
-      ]);
-
-      const vis = orchestrator.storeInstance.getPlanVisualization();
-
-      expect(vis.tasks).toHaveLength(3);
-      // First batch: tasks a and b (no deps) run in parallel
-      // Second batch: task c (depends on a)
-      expect(vis.parallelGroups.length).toBe(2);
-    });
-
-    it('handles empty plan', () => {
-      const orchestrator = makeOrchestrator();
-      orchestrator.loadPlan([]);
-      const vis = orchestrator.storeInstance.getPlanVisualization();
-      expect(vis.tasks).toEqual([]);
-      expect(vis.parallelGroups).toEqual([]);
     });
   });
 

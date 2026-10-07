@@ -284,15 +284,6 @@ describe('chat plan flow', () => {
     expect(screen.getByText('build a login page').closest('.chat-msg')?.classList.contains('chat-msg-user')).toBe(true);
   });
 
-  it('keeps the conversation visible when the goal label updates after a plan lands (regression: setGoal used to wipe the timeline)', () => {
-    host.session(reply('Here is the outline. Confirm?', undefined));
-    send({ type: 'planUpdated', plan });
-    send({ type: 'setGoal', goal: '' });
-
-    expect(screen.getByText('Here is the outline. Confirm?')).toBeTruthy();
-    expect(document.querySelector('.plan-card-group')).toBeTruthy();
-  });
-
   it('keeps the conversation when the host clears the plan — only the host resets the conversation', () => {
     host.session(reply('Still here.', undefined));
     send({ type: 'setState', state: 'empty' });

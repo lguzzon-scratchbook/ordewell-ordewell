@@ -80,7 +80,6 @@ function applyLoadedSession(
   // restoreChat first — it resets any stuck stop/busy state in the webview
   // before the plan and goal messages land.
   deps.chatProvider.restoreChat(loaded.plan);
-  deps.chatProvider.setGoal(loaded.meta.goal);
   if (loaded.plan.tasks.length > 0) deps.chatProvider.planGenerated(loaded.plan);
   replayIsolation(deps.session, deps.chatProvider);
   saveState(loaded.plan, deps.fsAdapter.getWorkspaceRoot());

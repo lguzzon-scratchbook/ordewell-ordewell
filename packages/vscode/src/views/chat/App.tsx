@@ -42,22 +42,19 @@ export default function App() {
     runnerTransport, skills, checkpoint, taskOutput, taskIdle, taskApprovals, taskIsolation, handoff,
     mergeResult, mergeGate, taskGates, dockExpanded, dockHeight,
   } = host;
-  const patch = useCallback(<K extends keyof HostState>(key: K, value: HostState[K] | ((prev: HostState[K]) => HostState[K])) => {
-    dispatch({ type: 'patch', patch: { [key]: value } });
-  }, []);
-  const setPlan = useCallback((v: Updatable<HostState['plan']>) => patch('plan', v), [patch]);
-  const setIsResearchActive = useCallback((v: boolean) => patch('isResearchActive', v), [patch]);
-  const setIsExecuting = useCallback((v: boolean) => patch('isExecuting', v), [patch]);
-  const setError = useCallback((v: string) => patch('error', v), [patch]);
-  const setIsReady = useCallback((v: boolean) => patch('isReady', v), [patch]);
-  const setRunners = useCallback((v: Updatable<RunnerId[]>) => patch('runners', v), [patch]);
-  const setPendingEdits = useCallback((v: Updatable<PendingPlanEdit[]>) => patch('pendingEdits', v), [patch]);
-  const setTddEnabled = useCallback((v: boolean) => patch('tddEnabled', v), [patch]);
-  const setVerifyEnabled = useCallback((v: boolean) => patch('verifyEnabled', v), [patch]);
-  const setRunnerTransport = useCallback((v: RunnerTransport) => patch('runnerTransport', v), [patch]);
-  const setCheckpoint = useCallback((v: HostState['checkpoint']) => patch('checkpoint', v), [patch]);
-  const setDockHeight = useCallback((v: number | undefined) => patch('dockHeight', v), [patch]);
-  const setDockExpanded = useCallback((v: Updatable<boolean>) => patch('dockExpanded', v), [patch]);
+  const setPlan = useCallback((v: Updatable<HostState['plan']>) => dispatch({ type: 'patchPlan', plan: v }), []);
+  const setIsResearchActive = useCallback((v: boolean) => dispatch({ type: 'patchResearchActive', active: v }), []);
+  const setIsExecuting = useCallback((v: boolean) => dispatch({ type: 'patchExecuting', executing: v }), []);
+  const setError = useCallback((v: string) => dispatch({ type: 'patchError', error: v }), []);
+  const setIsReady = useCallback((v: boolean) => dispatch({ type: 'patchReady', ready: v }), []);
+  const setRunners = useCallback((v: Updatable<RunnerId[]>) => dispatch({ type: 'patchRunners', runners: v }), []);
+  const setPendingEdits = useCallback((v: Updatable<PendingPlanEdit[]>) => dispatch({ type: 'patchPendingEdits', edits: v }), []);
+  const setTddEnabled = useCallback((v: boolean) => dispatch({ type: 'patchTddEnabled', enabled: v }), []);
+  const setVerifyEnabled = useCallback((v: boolean) => dispatch({ type: 'patchVerifyEnabled', enabled: v }), []);
+  const setRunnerTransport = useCallback((v: RunnerTransport) => dispatch({ type: 'patchRunnerTransport', transport: v }), []);
+  const setCheckpoint = useCallback((v: HostState['checkpoint']) => dispatch({ type: 'patchCheckpoint', checkpoint: v }), []);
+  const setDockHeight = useCallback((v: number | undefined) => dispatch({ type: 'patchDockHeight', height: v }), []);
+  const setDockExpanded = useCallback((v: Updatable<boolean>) => dispatch({ type: 'patchDockExpanded', expanded: v }), []);
   const blocks = useMemo(() => patchedBlocks(conversation), [conversation]);
   const [detailAll, setDetailAll] = useState(false);
   const detail = useMemo(() => ({ detailAll, setDetailAll }), [detailAll]);

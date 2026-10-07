@@ -6,6 +6,7 @@ import {
   ResearchLogEntry,
   ResearchProgress,
   RunnerId,
+  DEFAULT_RUNNERS,
 } from '../models/Task';
 import { IConfig } from '../interfaces/IConfig';
 import { IFileSystem } from '../interfaces/IFileSystem';
@@ -390,7 +391,7 @@ export class OpenAiService extends BaseAiService implements IAiService {
 
   async generatePlanDirect(
     userDescription: string,
-    runners: RunnerId[] = ['claude-code'],
+    runners: RunnerId[] = [...DEFAULT_RUNNERS],
     modelsByRunner: Partial<Record<RunnerId, DiscoveredModel[]>> = {},
     onToken?: (token: string) => void,
     fs?: IFileSystem,

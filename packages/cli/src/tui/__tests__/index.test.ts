@@ -30,7 +30,10 @@ const fakeTerminal = vi.hoisted(() => {
 });
 
 vi.mock('../../daemon', () => daemon);
-vi.mock('../../apiClient', () => apiClient);
+vi.mock('../../apiClient', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../apiClient')>();
+  return { ...actual, ApiClient: apiClient.ApiClient };
+});
 vi.mock('../../utils/env', () => ({ findEnvFile: vi.fn(() => '/ws/.env'), writeEnvVar: vi.fn() }));
 vi.mock('../terminalLauncher', () => ({ openTaskTerminal: vi.fn() }));
 vi.mock('../terminal', () => ({

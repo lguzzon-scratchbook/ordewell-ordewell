@@ -106,16 +106,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   // Legacy pass-throughs forwarding to new protocol types
   planGenerated(plan: LegacyPlanState): void { this.sendPlanUpdated(plan); }
   planApproved(): void { this.setState('approved'); }
-  /**
-   * Only updates the goal label. Deliberately NOT coupled to setState: a
-   * falsy goal used to send setState('empty'), which wipes the whole webview
-   * timeline — so any planner turn finishing while the host had lost its goal
-   * (e.g. after a window reload) erased the conversation. Callers that mean
-   * "reset the chat" call setState('empty') explicitly.
-   */
-  setGoal(goal: string): void {
-    this.postMessage({ type: 'setGoal', goal });
-  }
   showCheckpoint(taskId: string, taskTitle: string, summary: string): void {
     this.postMessage({ type: 'checkpoint', taskId, taskTitle, summary });
   }
@@ -174,10 +164,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this._configuredProviders = providers;
     this.postMessage({ type: 'setConfiguredProviders', providers });
   }
-  setModelApiMapping(mapping: Record<string, ApiProvider[]>): void {
-    this._modelApiMapping = mapping;
-    this.postMessage({ type: 'setModelApiMapping', modelApiMapping: mapping });
-  }
   setModelDiscoveryErrors(errors: Record<string, string>): void {
     this._modelDiscoveryErrors = errors;
     this.postMessage({ type: 'setModelDiscoveryErrors', errors });
@@ -195,7 +181,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _modelConfig: { orchestrator: string; orchestratorProvider?: string } | null = null;
   private _modelOptions: ModelOption[] = [];
   private _configuredProviders: ApiProvider[] = [];
-  private _modelApiMapping: Record<string, ApiProvider[]> = {};
   private _modelDiscoveryErrors: Record<string, string> = {};
   private _plannerState: { backends: PlannerBackend[]; provider: string; runner?: string; effort?: string } | null = null;
   private _cachedPlan: LegacyPlanState | null = null;
@@ -229,9 +214,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     if (this._configuredProviders.length > 0) {
       this.postMessage({ type: 'setConfiguredProviders', providers: this._configuredProviders });
-    }
-    if (Object.keys(this._modelApiMapping).length > 0) {
-      this.postMessage({ type: 'setModelApiMapping', modelApiMapping: this._modelApiMapping });
     }
     if (Object.keys(this._modelDiscoveryErrors).length > 0) {
       this.postMessage({ type: 'setModelDiscoveryErrors', errors: this._modelDiscoveryErrors });

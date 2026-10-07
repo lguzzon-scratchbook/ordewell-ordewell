@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTaskOrchestrator, TaskControlError } from '../TaskOrchestrator';
+import { TaskOrchestrator, TaskControlError } from '../TaskOrchestrator';
 import { createTask, type Task } from '../../models/Task';
 import type { ITerminalRunner } from '../../interfaces/ITerminalRunner';
 import type { IsolationHandoff } from '../../interfaces/IWorktreeIsolation';
@@ -16,7 +16,7 @@ function setup(isolation = new FakeWorktreeIsolation()) {
   });
   const runner: ITerminalRunner = { spawn, stop: vi.fn(), stopAll: vi.fn(), activeCount: 0 };
   const notifications = fakeNotification();
-  const orchestrator = createTaskOrchestrator({
+  const orchestrator = TaskOrchestrator.compose({
     config: fakeConfig(),
     notifications,
     terminalRunner: runner,

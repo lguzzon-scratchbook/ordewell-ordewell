@@ -1,4 +1,4 @@
-import { DEFAULT_MAX_PARALLEL, EMPTY_CONVERSATION, EMPTY_HOLD, NO_TURN, isTaskRunning, type ApprovalBlock, type AwaitingReason, type ConversationView, type PromptHold, type RunnerTransport, type TaskLogEvent, type TaskLogView, type TaskTransport, type TurnGate } from '@ordewell/core';
+import { DEFAULT_MAX_PARALLEL, EMPTY_CONVERSATION, EMPTY_HOLD, NO_TURN, isTaskRunning, type AiProvider, type ApprovalBlock, type AwaitingReason, type ConversationView, type PromptHold, type RunnerTransport, type TaskLogEvent, type TaskLogView, type TaskTransport, type TurnGate } from '@ordewell/core';
 import { emptyEditor, type EditorState } from './editor';
 
 export type RunStatus = 'idle' | 'planning' | 'researching' | 'executing';
@@ -384,7 +384,7 @@ export interface TuiState {
   plannerEffort: string;
   /** How many AI tasks run at once, as the daemon reports it. */
   maxParallel: number;
-  configuredProviders: string[];
+  configuredProviders: AiProvider[];
   allowlist: Record<string, string[]>;
   autonomous: boolean;
   /** The `runnerTransport` setting (ADR-0018), as the daemon reports it. */

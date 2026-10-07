@@ -1,4 +1,4 @@
-import type { ModelsResponse } from '@ordewell/core';
+import type { AiProvider, ModelsResponse } from '@ordewell/core';
 import type { ModeView, ModelView } from './tui/state';
 
 /** The raw `/api/models` body, before any surface has looked at it: the daemon's contract with every field optional, as a surface must tolerate an older or partial daemon. */
@@ -10,7 +10,7 @@ export interface Catalog {
   /** The planner catalog: one entry per vendor model, no runner scoping. */
   orchestratorModels: ModelView[];
   /** Providers with a working API key — the `key` command's checkmarks. */
-  providers: string[];
+  providers: AiProvider[];
   providerErrors: Record<string, string>;
   modesByRunner: Record<string, ModeView[]>;
 }

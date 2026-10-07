@@ -434,11 +434,11 @@ class GitWorktreeIsolation implements IWorktreeIsolation {
           const inRepo = await this.inWorkspacePlace(repo, entry.worktree);
           if (repo.path === SELF_REPO) cwd = inRepo;
           const boot = await bootstrap(repo, inRepo, {
-          setupCommand: this.deps.config.worktreeSetupCommand,
-          links: this.deps.config.worktreeLinks,
-          platform: this.platform,
-          resolvePath: this.resolvePath,
-        });
+            setupCommand: this.deps.config.worktreeSetupCommand,
+            links: this.deps.config.worktreeLinks,
+            platform: this.platform,
+            resolvePath: this.resolvePath,
+          });
           entry.linked = boot.linked;
           copied.push(...boot.copied.map((name) => path.posix.join(repo.path, name)));
         }

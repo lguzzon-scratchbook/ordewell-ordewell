@@ -142,9 +142,9 @@ export interface TaskAttemptSnapshot {
 
 /**
  * The wiring a {@link TaskOrchestrator} runs on, every collaborator resolved.
- * {@link createTaskOrchestrator} is the only production caller; tests build one
- * through that factory too. The constructor makes nothing itself, so there is
- * exactly one place defaults live.
+ * {@link TaskOrchestrator.compose} is the only production caller; tests build
+ * one through it too. The constructor makes nothing itself, so there is exactly
+ * one place defaults live.
  */
 export interface TaskOrchestratorDeps {
   config: IConfig;
@@ -170,9 +170,9 @@ export interface TaskOrchestratorDeps {
 }
 
 /**
- * What a caller supplies to {@link createTaskOrchestrator}; every optional one
- * gets its default there. This is what a host or test chooses, not the resolved
- * wiring the orchestrator itself runs on.
+ * What a caller supplies to {@link TaskOrchestrator.compose}; every optional
+ * one gets its default there. This is what a host or test chooses, not the
+ * resolved wiring the orchestrator itself runs on.
  */
 export interface TaskOrchestratorOptions {
   config: IConfig;
@@ -1667,13 +1667,4 @@ const OPS_RETRY_TAIL_LINES = 60;
 
 function unresumedMessage(task: Task, why: string): string {
   return `Could not continue task "${task.title}": ${why}. Retry starts it afresh.`;
-}
-
-/**
- * Build a {@link TaskOrchestrator}, filling in every collaborator a caller did
- * not inject. The one entry point for hosts, bench harnesses and tests alike;
- * {@link TaskOrchestrator} itself constructs nothing.
- */
-export function createTaskOrchestrator(options: TaskOrchestratorOptions): TaskOrchestrator {
-  return TaskOrchestrator.compose(options);
 }

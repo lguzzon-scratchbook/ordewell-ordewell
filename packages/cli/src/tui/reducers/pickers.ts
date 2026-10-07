@@ -213,7 +213,7 @@ export function plannerItems(state: TuiState): PickerItem[] {
       : { usable: false, reason: 'CLI not installed or not on PATH' };
   }
 
-  const entries = plannerBackendEntries(usability, state.configuredProviders as AiProvider[]);
+  const entries = plannerBackendEntries(usability, state.configuredProviders);
   const items: PickerItem[] = entries.map((entry) => ({
     id: entry.id,
     label: entry.label,
