@@ -221,25 +221,6 @@ describe('TaskOrchestrator', () => {
     });
   });
 
-  describe('markAiTaskComplete', () => {
-    it('delegates to markTaskComplete', async () => {
-      const { spawn, stop } = sessionRunner();
-      const orchestrator = makeOrchestrator({ terminalRunner: { spawn, stop } });
-      orchestrator.loadPlan([
-        createTask({ id: 't1', order: 1, title: 'AI Task', prompt: 'do' }),
-      ]);
-      await orchestrator.forceStartTask('t1');
-
-      await orchestrator.markAiTaskComplete('t1');
-
-      const log = orchestrator.storeInstance.getExecutionLog();
-      expect(log).toHaveLength(1);
-      expect(log[0].verdict!.outcome).toBe('pass');
-      expect(log[0].verdict!.checks[0].name).toBe('manual');
-      expect(stop).toHaveBeenCalledWith('s1');
-    });
-  });
-
   describe('markTaskComplete', () => {
     it('marks a pending AI task as completed with a manual verdict and archives it', async () => {
       const orchestrator = makeOrchestrator();
@@ -1239,12 +1220,11 @@ describe('task attempts', () => {
     const attempt = orchestrator.getAttempt('t1');
     expect(attempt).toMatchObject({ taskId: 't1', attempt: 1, phase: 'running', runner: 'claude-code', cwd: '/repo', sessionId: 's1' });
     expect(Number.isNaN(Date.parse(attempt!.startedAt))).toBe(false);
-    expect(orchestrator.getAttemptSession('t1')).toBe(sessions[0]);
+    expect(orchestrator.getAttempt('t1')?.sessionId).toBe(sessions[0].id);
   });
 
   function expectNoAttemptState(orchestrator: TaskOrchestrator) {
     expect(orchestrator.getAttempt('t1')).toBeUndefined();
-    expect(orchestrator.getAttemptSession('t1')).toBeUndefined();
     expect(orchestrator.activeSessionMap.size).toBe(0);
     expect(orchestrator.hasLiveWork).toBe(false);
   }
@@ -1309,7 +1289,7 @@ describe('task attempts', () => {
     void orchestrator.forceStartTask('t1');
     await vi.waitFor(() => expect(spawned()).toBe(1));
     expect(orchestrator.getAttempt('t1')?.phase).toBe('starting');
-    expect(orchestrator.getAttemptSession('t1')).toBeUndefined();
+    expect(orchestrator.getAttempt('t1')?.sessionId).toBeNull();
 
     orchestrator.stop();
     const late = new FakeTerminalSession('late', 't1');
@@ -1340,7 +1320,7 @@ describe('task attempts', () => {
 
     expect(stale.killed).toBe(true);
     expect(fresh.killed).toBe(false);
-    expect(orchestrator.getAttemptSession('t1')).toBe(fresh);
+    expect(orchestrator.getAttempt('t1')?.sessionId).toBe(fresh.id);
     expect(orchestrator.getAttempt('t1')?.attempt).toBe(2);
     expect(orchestrator.storeInstance.get('t1')!.status).toBe('in_progress');
   });

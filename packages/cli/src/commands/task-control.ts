@@ -1,6 +1,7 @@
 import { flag, hasFlag, positionals, readLastSession, resolveTaskId } from '../utils';
 import { askYesNo, fail } from './shared';
-import { ensureDaemon, ApiClient, resolvePort } from '../daemonClient';
+import { ensureDaemon, resolvePort } from '../daemon';
+import { ApiClient } from '../apiClient';
 import { pastGateConfirmation, titledTaskRef, type SerializedPlan } from '@ordewell/core';
 
 type Action = 'run' | 'force-start' | 'retry' | 'cancel';

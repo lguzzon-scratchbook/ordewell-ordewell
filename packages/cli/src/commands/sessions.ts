@@ -1,5 +1,6 @@
 import { flag, hasFlag, positionals, saveLastSession, readLastSession } from '../utils';
-import { ensureDaemon, ApiClient, resolvePort } from '../daemonClient';
+import { ensureDaemon, resolvePort } from '../daemon';
+import { ApiClient } from '../apiClient';
 
 const USAGE = 'Usage: ordewell sessions list|load <id>|delete <id> [--workspace /path] [--json]';
 

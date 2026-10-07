@@ -1,5 +1,5 @@
 import { flag, positionals, saveLastSession } from '../utils';
-import type { ApiClient } from '../daemonClient';
+import type { ApiClient } from '../apiClient';
 import { connect, fail } from './shared';
 import { resolveSessionId } from './run';
 

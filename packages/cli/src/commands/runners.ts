@@ -1,6 +1,6 @@
 import { autonomyLevelLabel, parseAutonomyLevel } from '@ordewell/core';
 import { findEnvFile, writeEnvVar } from '../utils/env';
-import type { ApiClient } from '../daemonClient';
+import type { ApiClient } from '../apiClient';
 import { positionals } from '../utils';
 import { connect, fail, fetchCatalog } from './shared';
 

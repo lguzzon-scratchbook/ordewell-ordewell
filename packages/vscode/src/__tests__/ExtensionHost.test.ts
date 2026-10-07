@@ -144,7 +144,6 @@ function fakeSession() {
     reschedule: vi.fn(async () => {}),
     isExecuting: false,
     isConversationActive: false,
-    hasLiveWork: false,
     status: 'draft',
     planState: null,
     planTasks: [],

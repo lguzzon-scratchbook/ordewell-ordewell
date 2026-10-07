@@ -1,4 +1,5 @@
-import { ensureDaemon, ApiClient, resolvePort } from '../daemonClient';
+import { ensureDaemon, resolvePort } from '../daemon';
+import { ApiClient } from '../apiClient';
 
 const describe = (transport: unknown): string =>
   `Runner transport: ${transport === 'terminal' ? 'terminal' : 'structured'} — applies from the next run`;

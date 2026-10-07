@@ -1,5 +1,6 @@
 import { assertWorkspaceExists, createSkillsService, mintSessionId } from '@ordewell/core';
-import { ApiClient, ensureDaemonOwned, findFreePort, resolvePort, stopDaemon } from '../daemonClient';
+import { ensureDaemonOwned, findFreePort, resolvePort, stopDaemon } from '../daemon';
+import { ApiClient } from '../apiClient';
 import { flag, saveLastSession } from '../utils';
 import { findEnvFile, writeEnvVar } from '../utils/env';
 import { createApp } from './app';

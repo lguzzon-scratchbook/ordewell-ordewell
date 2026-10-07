@@ -1,5 +1,5 @@
 import { hasFlag, positionals } from '../utils';
-import type { ApiClient } from '../daemonClient';
+import type { ApiClient } from '../apiClient';
 import { handoffBase, handoffBranch, isolationOfPlan, isRepoGroup, mergeOutcome, repairedLanded, repairedNotice, repoResultLines, reposWithWork } from '../isolation';
 import { HANDOFF_ACTIONS } from '../tui/handoff';
 import { adopted } from './conversation';

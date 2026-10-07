@@ -20,6 +20,7 @@ import type {
   TreeSnapshot,
 } from '../interfaces/IWorktreeIsolation';
 import { describeMergeResult } from './mergeResultNotice';
+import { quotedList } from '../utils/quotedList';
 import { handoffOf, integrationBranchNameOf, layoutOf, SELF_REPO, taskIsolationOf } from './isolationRecord';
 import type { IsolatedExecution } from './plannerModes';
 import { PlanEditError } from './PlanEditError';
@@ -88,10 +89,7 @@ function sharedRootNotice(reason: SharedRootReason, repos: string[]): string {
   }
 }
 
-const quoted = (tasks: readonly IsolationTaskRef[]): string => {
-  const titles = tasks.map((t) => `"${t.title}"`);
-  return titles.length > 1 ? `${titles.slice(0, -1).join(', ')} and ${titles.at(-1)}` : titles.join('');
-};
+const quoted = (tasks: readonly IsolationTaskRef[]): string => quotedList(tasks.map((t) => t.title));
 
 /** Tasks as the subject of a sentence: `Task "A"`, `Tasks "A" and "B"`. */
 const tasksNamed = (tasks: readonly IsolationTaskRef[]): string => `${tasks.length === 1 ? 'Task' : 'Tasks'} ${quoted(tasks)}`;

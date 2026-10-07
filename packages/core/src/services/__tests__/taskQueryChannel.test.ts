@@ -300,7 +300,7 @@ describe('the task-query read channel', () => {
     });
     session.loadPlan(planWithBodies(), 'build it', testWorkspace, { persist: false });
     await session.executePlan(); // spawns #2 and leaves it running
-    expect(session.hasLiveWork).toBe(true);
+    expect(session.isExecuting).toBe(true);
 
     const plan = await session.continueConversation('rename task 2');
 

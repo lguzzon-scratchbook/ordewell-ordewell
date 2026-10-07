@@ -1,4 +1,4 @@
-import type { ApiClient } from '../daemonClient';
+import type { ApiClient } from '../apiClient';
 import { connect } from './shared';
 import { followExecution, resolveSessionId } from './run';
 

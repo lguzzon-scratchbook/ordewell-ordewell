@@ -46,7 +46,7 @@ function fakeHost(ai: IAiService, plan: LegacyPlanState | null = dialoguePlan())
     catalog: () => ({ runners: ['claude-code'], models: {}, modes: {}, autonomousDefault: true }),
     tasks: () => [],
     liveOutput: () => null,
-    hasLiveWork: () => false,
+    isExecuting: () => false,
     mutate: (op, notify) => {
       if (!state.plan || !op()) return null;
       state.persists++;

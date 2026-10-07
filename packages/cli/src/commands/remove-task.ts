@@ -1,4 +1,4 @@
-import { ApiClient } from '../daemonClient';
+import { ApiClient } from '../apiClient';
 import { withResolvedTask } from './task-control';
 
 export async function handleRemoveTask(subArgs: string[], api?: ApiClient): Promise<void> {

@@ -1,5 +1,6 @@
 import { flag, readLastSession } from '../utils';
-import { ensureDaemon, ApiClient, stopDaemon, resolvePort } from '../daemonClient';
+import { ensureDaemon, stopDaemon, resolvePort } from '../daemon';
+import { ApiClient } from '../apiClient';
 
 export async function handleStop(subArgs: string[]): Promise<void> {
   if (subArgs.includes('--server') || subArgs[0] === 'server') {

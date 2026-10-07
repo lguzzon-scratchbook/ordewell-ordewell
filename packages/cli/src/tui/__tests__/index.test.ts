@@ -1,11 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach, type MockInstance } from 'vitest';
 import type { Key } from '../keys';
 
-const daemonClient = vi.hoisted(() => ({
+const daemon = vi.hoisted(() => ({
   ensureDaemonOwned: vi.fn(async () => ({ port: 4000, owned: true })),
   resolvePort: vi.fn(() => 4000),
   findFreePort: vi.fn(async () => 4000),
   stopDaemon: vi.fn(async () => {}),
+}));
+
+const apiClient = vi.hoisted(() => ({
   ApiClient: vi.fn(function stub() {
     return {
       getRunners: async () => ({ runners: [], orchestratorModel: '' }),
@@ -26,7 +29,8 @@ const fakeTerminal = vi.hoisted(() => {
   return state;
 });
 
-vi.mock('../../daemonClient', () => daemonClient);
+vi.mock('../../daemon', () => daemon);
+vi.mock('../../apiClient', () => apiClient);
 vi.mock('../../utils/env', () => ({ findEnvFile: vi.fn(() => '/ws/.env'), writeEnvVar: vi.fn() }));
 vi.mock('../terminalLauncher', () => ({ openTaskTerminal: vi.fn() }));
 vi.mock('../terminal', () => ({
@@ -101,7 +105,7 @@ describe('handleTui', () => {
     expect(error).toHaveBeenCalledWith(expect.stringContaining(missing));
     expect(error).toHaveBeenCalledWith(expect.stringContaining('--workspace'));
     expect(exitSpy).toHaveBeenCalledWith(1);
-    expect(daemonClient.ensureDaemonOwned).not.toHaveBeenCalled();
+    expect(daemon.ensureDaemonOwned).not.toHaveBeenCalled();
     error.mockRestore();
   });
 
@@ -109,9 +113,9 @@ describe('handleTui', () => {
     void handleTui([]);
 
     await vi.waitFor(() => expect(fakeTerminal.draw).toHaveBeenCalled());
-    expect(daemonClient.ensureDaemonOwned).toHaveBeenCalledWith(4000, { detached: false });
+    expect(daemon.ensureDaemonOwned).toHaveBeenCalledWith(4000, { detached: false });
     // With its workspace, so a session a restarted daemon dropped is re-adopted from there.
-    expect(daemonClient.ApiClient).toHaveBeenCalledWith(4000, process.cwd());
+    expect(apiClient.ApiClient).toHaveBeenCalledWith(4000, process.cwd());
     const frame = fakeTerminal.draw.mock.calls[0][0] as string[];
     expect(frame).toHaveLength(24);
     expect(frame.join('\n')).toContain('Ordewell');
@@ -138,18 +142,18 @@ describe('handleTui', () => {
     void handleTui([]);
 
     await vi.waitFor(() => expect(fakeTerminal.draw).toHaveBeenCalled());
-    expect(daemonClient.findFreePort).toHaveBeenCalled();
-    expect(daemonClient.resolvePort).not.toHaveBeenCalled();
+    expect(daemon.findFreePort).toHaveBeenCalled();
+    expect(daemon.resolvePort).not.toHaveBeenCalled();
   });
 
   it('drives the well-known daemon instead when --port is passed explicitly', async () => {
-    daemonClient.resolvePort.mockReturnValueOnce(3742);
+    daemon.resolvePort.mockReturnValueOnce(3742);
     void handleTui(['--port', '3742']);
 
     await vi.waitFor(() => expect(fakeTerminal.draw).toHaveBeenCalled());
-    expect(daemonClient.resolvePort).toHaveBeenCalledWith(['--port', '3742']);
-    expect(daemonClient.findFreePort).not.toHaveBeenCalled();
-    expect(daemonClient.ensureDaemonOwned).toHaveBeenCalledWith(3742, { detached: false });
+    expect(daemon.resolvePort).toHaveBeenCalledWith(['--port', '3742']);
+    expect(daemon.findFreePort).not.toHaveBeenCalled();
+    expect(daemon.ensureDaemonOwned).toHaveBeenCalledWith(3742, { detached: false });
   });
 
   it('honours ORDEWELL_AUTONOMOUS_MODE=false from the environment', async () => {
@@ -199,17 +203,17 @@ describe('handleTui', () => {
 
     await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(0));
     expect(fakeTerminal.close).toHaveBeenCalled();
-    expect(daemonClient.stopDaemon).toHaveBeenCalledWith(4000);
+    expect(daemon.stopDaemon).toHaveBeenCalledWith(4000);
   });
 
   it('leaves a daemon it did not spawn running on exit', async () => {
-    daemonClient.ensureDaemonOwned.mockResolvedValueOnce({ port: 4000, owned: false });
+    daemon.ensureDaemonOwned.mockResolvedValueOnce({ port: 4000, owned: false });
     void handleTui([]);
     await vi.waitFor(() => expect(fakeTerminal.onKey).toBeDefined());
 
     fakeTerminal.onKey!({ name: 'ctrl-c' });
 
     await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(0));
-    expect(daemonClient.stopDaemon).not.toHaveBeenCalled();
+    expect(daemon.stopDaemon).not.toHaveBeenCalled();
   });
 });

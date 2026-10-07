@@ -289,7 +289,7 @@ describe('task_ops conversation turns', () => {
 
     expect(spawned).toEqual(['b']);
     await session.cancelTask('b');
-    expect(session.hasLiveWork).toBe(false);
+    expect(session.isExecuting).toBe(false);
 
     await expect(session.executePlan()).resolves.toBeUndefined();
     expect(spawned).toEqual(['b', 'b']);
@@ -392,7 +392,7 @@ describe('task_ops conversation turns', () => {
     expect(taskOf(session, 'b')!.title).toBe('Build');
     expect(taskOf(session, 'c')!.title).toBe('Sign off with the team');
     expect(taskOf(session, 'b')!.status).toBe('in_progress');
-    expect(session.hasLiveWork).toBe(true);
+    expect(session.isExecuting).toBe(true);
     expect(session.status).toBe('running'); // the run stays armed
     expect(spawned).toEqual(['b']); // the live runner, not a second copy of it
   });

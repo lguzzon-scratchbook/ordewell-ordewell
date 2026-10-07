@@ -203,7 +203,6 @@ export class VerdictEngine {
     session.onOutput((text: string) => {
       if (this.generations.get(task.id) !== gen) return;
       this.touchIdle(task.id, gen);
-      if (this.markerSeen.has(task.id)) return;
       const tail = ((this.markerTails.get(task.id) ?? '') + text).slice(-MARKER_SCAN_TAIL);
       this.markerTails.set(task.id, tail);
       if (markerVisible(tail, doneToken)) {
@@ -380,9 +379,7 @@ export class VerdictEngine {
 
   /** Manual "Mark complete" override: a pass verdict that bypasses evidence. */
   markComplete(task: Task): Verdict {
-    this.markerSeen.delete(task.id);
-    this.forget(task.id);
-    this.bumpGeneration(task.id);
+    this.ceaseTracking(task.id);
     return {
       outcome: 'pass',
       reason: 'Manually marked complete by user.',
@@ -400,9 +397,14 @@ export class VerdictEngine {
 
   /** Clear verification state for a task (used on retry). */
   clear(task: Task): void {
-    this.markerSeen.delete(task.id);
-    this.forget(task.id);
-    this.bumpGeneration(task.id);
+    this.ceaseTracking(task.id);
+  }
+
+  /** Drop a task's verification state and invalidate any callbacks still holding its generation. */
+  private ceaseTracking(taskId: string): void {
+    this.markerSeen.delete(taskId);
+    this.forget(taskId);
+    this.bumpGeneration(taskId);
   }
 
   /** Drop all tracking state (used on stop / loadPlan). */

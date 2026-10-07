@@ -12,6 +12,9 @@ const COMMANDS: CommandDescriptor[] = [
   { name: 'transport', description: 'Drive tasks through each runner\'s protocol (structured) or a terminal, from the next run (terminal|structured|status)' },
 ];
 
+/** Commands whose on/off writes a single boolean settings block, keyed by the command name. */
+const BOOLEAN_TOGGLES: Record<string, 'tdd' | 'verification'> = { tdd: 'tdd', verify: 'verification' };
+
 export function commandsRoute(pool: OrchestratorPool) {
   const router = new Hono();
 
@@ -29,22 +32,13 @@ export function commandsRoute(pool: OrchestratorPool) {
       return c.json({ error: `Unknown command: ${name}` }, 404);
     }
 
-    if (name === 'tdd') {
+    const toggle = BOOLEAN_TOGGLES[name];
+    if (toggle) {
       const action = args.action || 'status';
       if (action === 'on') {
-        pool.updateSettings({ tdd: { enabled: true } });
+        pool.updateSettings({ [toggle]: { enabled: true } });
       } else if (action === 'off') {
-        pool.updateSettings({ tdd: { enabled: false } });
-      }
-      return c.json({ ok: true, settings: pool.getSettings() });
-    }
-
-    if (name === 'verify') {
-      const action = args.action || 'status';
-      if (action === 'on') {
-        pool.updateSettings({ verification: { enabled: true } });
-      } else if (action === 'off') {
-        pool.updateSettings({ verification: { enabled: false } });
+        pool.updateSettings({ [toggle]: { enabled: false } });
       }
       return c.json({ ok: true, settings: pool.getSettings() });
     }
