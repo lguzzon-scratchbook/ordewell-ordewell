@@ -1,6 +1,25 @@
 # Change Log
 
-## [Unreleased]
+## [0.7.2] — 2026-10-07
+
+### Security
+
+- **Planner research refuses more command-policy bypasses.** A `!`-prefixed
+  command, more than 32 substitutions on a line, an interpreter fed through
+  stdin, combined or glued inline-code flags and versioned interpreter names,
+  quoting or escaping that hid a command inside `$( )`, `${…}` or `$'…'`, a
+  `<<` inside a comment or expansion that hid the lines after it, re-cased
+  command names, `NAME+=` prefixes and several Windows `cmd` forms used to ask
+  for approval or run, and are now refused. In the cmd dialect, a program path
+  written with forward slashes is refused too; use backslashes.
+
+### Changed
+
+- **Stopping a planner turn is not reported as an error.** Whatever the
+  planner's backend names the error it throws on the way out, a stop stays
+  quiet; a real failure whose message mentions "aborted" is still shown.
+- **A runner starts in its own process group without a controlling terminal.**
+  A prompt that reads `/dev/tty` fails instead of waiting on the host terminal.
 
 ### Fixed
 
@@ -13,6 +32,21 @@
   process the agent deliberately detached can outlive Stop.
 - **A runner that fails to start no longer stays running**, and non-ASCII
   output split across two reads no longer turns into `�`.
+- **Task badges no longer outlive their session.** Restoring a session kept
+  the previous plan's stalled and approval badges, which are keyed by task id.
+- **A closed chat view is no longer posted to**, and the `/help` text clears
+  on its own timer without a stale one wiping a later message.
+- **A failed reschedule or model refresh after a settings change is logged**
+  instead of surfacing as an unhandled rejection.
+- **A plan replaced mid-turn is not written to by the old turn**, and a task
+  the scheduler should not start (after Stop, no longer ready, or past the
+  parallel limit) is not started.
+- **Changes are saved before they are shown**, and a queued plan edit is
+  applied once, to the plan it was queued for; a queued message you removed
+  stays removed.
+- **A git command stuck on a hook is stopped after ten minutes**, and a task
+  whose verdict could not be settled fails with the reason instead of staying
+  stuck integrating.
 
 ## [0.7.1] — 2026-10-06
 
