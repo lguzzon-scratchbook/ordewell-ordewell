@@ -1656,7 +1656,7 @@ make every workspace path name a different file than the one confinement checks.
 *Avoid:* treating the shell choice as an adapter detail. `BaseFileSystem` owns it
 because `classifyCommand` has to be told the same answer.
 
-**Dialect** (`commandPolicy.Dialect`) — what the interpreter that will run a
+**Dialect** (`shellLexer.Dialect`) — what the interpreter that will run a
 command treats as syntax: escape character, whether that escape survives inside
 quotes, quote characters, expansion syntax, stripped executable extensions.
 `escapeInQuotes` is load-bearing — cmd.exe reads `^` inside a quoted run as an
