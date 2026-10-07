@@ -134,9 +134,14 @@ The fix in every case fails closed:
   left open refuses the line.
 - **A here-document body is data.** Lexed as commands, a quote in the body hid
   the lines after the delimiter. The body is skipped to its delimiter line
-  (`<<-` strips tabs); an unquoted delimiter still expands the body, so its
-  substitutions are classified. A here-document never closed, or a delimiter
-  holding `$` or a backtick, refuses the line.
+  (`<<-` strips tabs) only when the `<<` is provably a here-document operator:
+  an unquoted top-level word position, not inside a comment, a `${…}` or `$[…]`
+  expansion, or `(( ))` arithmetic — where a `<<` is a shift the top-level lexer
+  does not otherwise model. Where it is not provable, the following lines are
+  lexed as commands instead; `(( ))` and an unreadable `${…}` refuse. An
+  unquoted delimiter still expands the body, so its substitutions are
+  classified. A here-document never closed, or a delimiter holding `$` or a
+  backtick, refuses the line.
 - **Stdin is a pipe for an interpreter.** `bash <<< '…'`, a here-document, and
   `sh < x.sh` hand the interpreter code exactly as `… | sh` does.
 - **Inline-code flags are read in every spelling.** Clusters and glued code
@@ -144,8 +149,10 @@ The fix in every case fails closed:
   PowerShell's `-EncodedCommand` and any prefix of its code parameters, and
   `cmd /q/c`.
 - **Inline code has more spellings than flags.** Interpreters are matched by
-  family, so a versioned name (`python3.12`, `node22`, `php8.2`) or alias
-  (`nodejs`) is one too. `deno eval`, a `data:` URL handed to `node`, `deno` or
+  family, so a versioned or suffixed name (`python3.12`, `node22`, `php8.2`,
+  `python3.12m`, `python3.12-dbg`, `pwsh-preview`) or alias (`nodejs`) is one
+  too; the suffix must start with a digit or `-`, so `nodemon` is not `node`.
+  `deno eval`, a `data:` URL handed to `node`, `deno` or
   `bun` (`--import`, `--require`, `--loader`, a script operand), and
   PowerShell's positional command (`powershell Remove-Item x`) are refused.
   PowerShell's first argument passes only as a plain `.ps1` path — under
@@ -153,7 +160,13 @@ The fix in every case fails closed:
   and a parameter it cannot place refuses.
 - **cmd.exe ends a command name where it reads one.** `cmd/c del x` is `cmd
   /c`, `,del x` is `del`, and a command word starting with `/` (`cmd;/c del x`,
-  where `;` is a space to cmd.exe) refuses.
+  where `;` is a space to cmd.exe) refuses. A command word that still holds a
+  `/` or `=` is refused rather than read wrong: a drive-absolute path
+  (`C:/Git/usr/bin/rm.exe`) or a quoted switch (`cmd"/c"`) would otherwise
+  basename to the wrong name or collapse to the bare drive `C:`, and `del=x` is
+  not a `NAME=value` assignment cmd.exe has no syntax for. `call` is unwrapped
+  to the command it runs; `start` is refused, since its optional title and
+  switches cannot be reliably told from the command.
 - **Refusal reads names case-insensitively.** `DEL`, `Rd`, `CMD /c` and `RM`
   run on cmd.exe and on case-insensitive filesystems. The permitted tier stays
   exact-case, so a re-cased name never gains `auto`.
@@ -325,3 +338,4 @@ resolves rather than as written.
 - 2026-10-04 — `builtin` unwrapped; `enable -f` refused.
 - 2026-10-07 — `!`, quote-aware substitution matching, stdin-fed interpreters, inline-code spellings, case-insensitive refusal, `+=` assignments.
 - 2026-10-07 — `${…}` in substitutions, `$'…'` escapes, here-document bodies, interpreter families, `deno eval`, `data:` URLs, PowerShell's positional command, cmd.exe command names.
+- 2026-10-07 — here-document skipping fails closed outside a provable `<<` (comment, `${…}`/`$[…]`, `(( ))`); cmd.exe command words holding `/` or `=` refuse and never scope to a bare drive, `call` unwrapped and `start` refused; interpreter families match a version or suffix.
