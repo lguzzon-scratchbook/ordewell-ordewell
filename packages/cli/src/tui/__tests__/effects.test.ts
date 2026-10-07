@@ -504,7 +504,8 @@ describe('execution', () => {
     });
     await runEffect({ type: 'execute', sessionId: 's1' }, h.deps);
 
-    expect(h.api.closeExecutionStream).toHaveBeenCalledWith(expect.any(Promise));
+    const opened = vi.mocked(h.api.streamExecution).mock.results[0].value;
+    expect(h.api.closeExecutionStream).toHaveBeenCalledWith(opened);
     expect(types(h.actions)).not.toContain('executionLost');
   });
 

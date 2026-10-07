@@ -12,7 +12,7 @@ import { positionals } from '../utils';
 import { connect, fail, fetchCatalog, persistEnv, writeEnv } from './shared';
 import { plannerSwitchRecall } from '../plannerModelSwitch';
 
-const KNOWN_PROVIDERS = Object.keys(ALL_PROVIDERS);
+const isAiProvider = (id: string): id is AiProvider => Object.hasOwn(ALL_PROVIDERS, id);
 
 /**
  * Everything that can plan, in one list (ADR-0009) — the `/planner` picker's
@@ -30,7 +30,7 @@ export async function handlePlanner(subArgs: string[], injectedApi?: ApiClient):
   }
 
   const provider = wanted.toLowerCase();
-  if (!KNOWN_PROVIDERS.includes(provider)) {
+  if (!isAiProvider(provider)) {
     fail(`Unknown planner: ${provider}`, 'Run `ordewell planner` with no arguments to see the list.');
   }
 
@@ -41,15 +41,15 @@ export async function handlePlanner(subArgs: string[], injectedApi?: ApiClient):
   const recall = plannerSwitchRecall(settings);
   writeEnv({ ORCHESTRATOR_MODEL: recall.model, ORDEWELL_PLANNER_EFFORT: recall.effort });
 
-  const meta = ALL_PROVIDERS[provider as AiProvider];
+  const meta = ALL_PROVIDERS[provider];
   const catalog = await fetchCatalog(api);
   console.log(
-    isCliProvider(provider as AiProvider)
+    isCliProvider(provider)
       ? `Planning with ${meta.label} — no API key needed, it uses that agent's own subscription.`
       : `Planner set to ${meta.label}.`,
   );
   console.log(plannerModelLine(recall));
-  if (!isCliProvider(provider as AiProvider) && !catalog.providers.includes(provider as AiProvider)) {
+  if (!isCliProvider(provider) && !catalog.providers.includes(provider)) {
     console.log(`  No ${meta.apiKeyEnvVar} configured yet — set one with \`ordewell key set ${provider} <key>\`.`);
   }
 }
@@ -103,11 +103,11 @@ export async function handlePlannerEffort(subArgs: string[], injectedApi?: ApiCl
   const [wanted] = positionals(subArgs);
 
   const [settings, catalog] = await Promise.all([api.getSettings(), fetchCatalog(api)]);
-  const provider = (typeof settings.aiProvider === 'string' ? settings.aiProvider : '') as AiProvider;
+  const provider = typeof settings.aiProvider === 'string' ? settings.aiProvider : '';
   const modelId = typeof settings.orchestratorModel === 'string' ? settings.orchestratorModel : '';
   const currentEffort = typeof settings.plannerThinkingEffort === 'string' ? settings.plannerThinkingEffort : '';
 
-  const runner = runnerForProvider(provider);
+  const runner = isAiProvider(provider) ? runnerForProvider(provider) : null;
   if (!runner) {
     fail(
       'Thinking effort applies to a coding-agent planner.',

@@ -6,6 +6,8 @@ import {
   ConversationEditError,
   NoPlanError,
   PlanEditError,
+  PlannerTurnDiscardedError,
+  PlannerTurnStoppedError,
   SessionNotFoundError,
   TaskControlError,
   WorkspaceNotAProjectError,
@@ -31,6 +33,8 @@ describe('failure', () => {
     [new ConversationEditError('no such message'), 400, 'refused'],
     [new PlanEditError('invalid edit'), 400, 'refused'],
     [new TaskControlError('not running'), 400, 'refused'],
+    [new PlannerTurnStoppedError({ cause: new Error('Request was aborted.') }), 409, 'planner_turn_stopped'],
+    [new PlannerTurnDiscardedError(), 409, 'planner_turn_discarded'],
   ])('maps %s to %i %s', async (err, status, code) => {
     const res = await answer(err);
 
@@ -43,6 +47,16 @@ describe('failure', () => {
 
     expect(res.status).toBe(400);
     expect(res.body).toMatchObject({ code: 'workspace_not_a_project', workspace: '/bare' });
+  });
+
+  it('does not log a stack for a stopped or discarded planner turn', async () => {
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    log.mockClear();
+
+    await answer(new PlannerTurnStoppedError());
+    await answer(new PlannerTurnDiscardedError());
+
+    expect(log).not.toHaveBeenCalled();
   });
 
   it('never classifies by message: a plain Error with a known wording is a fault', async () => {

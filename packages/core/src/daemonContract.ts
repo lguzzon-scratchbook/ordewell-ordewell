@@ -39,6 +39,10 @@ export type DaemonErrorCode =
   | 'workspace_not_found'
   | 'workspace_not_a_project'
   | 'conversation_busy'
+  /** The user stopped the planner turn: the turn ended as asked, so a client stays quiet. */
+  | 'planner_turn_stopped'
+  /** The planner turn settled after its plan was dropped; nothing it produced was kept. */
+  | 'planner_turn_discarded'
   /** The request asked for something the plan, task or conversation does not allow. */
   | 'refused'
   | 'checkpoint_not_waiting'

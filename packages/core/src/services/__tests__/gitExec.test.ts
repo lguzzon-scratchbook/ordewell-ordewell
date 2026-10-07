@@ -33,8 +33,12 @@ describe('gitExec', () => {
       const exec = execFileWithTimeout(300);
       const err = await exec(process.execPath, hang, { env: process.env }).catch((e: unknown) => e);
 
-      expect(err).toMatchObject({ code: 'ETIMEDOUT', killed: true, signal: 'SIGTERM' });
-      expect((err as { stderr: string }).stderr).toMatch(/^timed out after 0\.3 seconds/);
+      expect(err).toMatchObject({
+        code: 'ETIMEDOUT',
+        killed: true,
+        signal: 'SIGTERM',
+        stderr: expect.stringMatching(/^timed out after 0\.3 seconds/),
+      });
     });
   });
 });

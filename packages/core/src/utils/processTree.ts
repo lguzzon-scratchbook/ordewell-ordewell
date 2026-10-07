@@ -22,6 +22,10 @@ import type { ChildProcess } from 'child_process';
 /** Grace period between the polite stop and the forced one. */
 const HARD_KILL_DELAY_MS = 5000;
 
+function isNoSuchProcess(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && 'code' in err && err.code === 'ESRCH';
+}
+
 export interface KillTreeDeps {
   platform?: NodeJS.Platform;
   /** Runs `taskkill`. Injected so the Windows path is testable off Windows. */
@@ -157,15 +161,17 @@ export function killTree(proc: ChildProcess | null, deps: KillTreeDeps = {}): vo
     // Survives the leader's exit: what it started can outlive it, and a
     // process ignoring SIGTERM is exactly the one that does. A pgid is never
     // reused while a member lives, so the group is only at risk of being a
-    // stranger's once it is empty — which the probe below detects, cancelling
-    // the follow-up rather than signalling an id that may have been recycled.
+    // stranger's once it is empty. The probe below catches a group that is
+    // already empty when the leader exits and cancels the follow-up; one that
+    // empties during the grace period is still signalled, a recycled id inside
+    // that window being the residual risk.
     const hardKill = setTimeoutImpl(() => signalGroup('SIGKILL'), HARD_KILL_DELAY_MS);
     hardKill.unref?.();
     proc.once('exit', () => {
       try {
         killImpl(-pgid, 0);
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'ESRCH') clearTimeoutImpl(hardKill);
+        if (isNoSuchProcess(err)) clearTimeoutImpl(hardKill);
       }
     });
     return;

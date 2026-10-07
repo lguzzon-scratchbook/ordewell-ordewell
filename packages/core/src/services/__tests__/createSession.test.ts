@@ -5,6 +5,7 @@ import { scriptedAdapter } from './harnessTestKit';
 import { CliAgentAiService } from '../harness/CliAgentAiService';
 import type { ITerminalRunner } from '../../interfaces/ITerminalRunner';
 import { parsePlanJson } from '../PlanValidator';
+import { PlannerTurnStoppedError } from '../PlannerConversation';
 import type { Session } from '../createSession';
 import type { SessionMessage } from '../SessionMessage';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
@@ -35,6 +36,21 @@ describe('model allowlist wiring', () => {
     expect(planner.generate).toHaveBeenCalledWith(
       expect.objectContaining({ perRunnerAllowlist: { 'claude-code': ['kimi-2.6'] } }),
     );
+  });
+
+  it('generatePlan stopped mid-call settles as PlannerTurnStoppedError, not the backend\'s plain abort', async () => {
+    const planner = {
+      generate: vi.fn((opts: { signal?: AbortSignal }) => new Promise<never>((_resolve, reject) => {
+        opts.signal?.addEventListener('abort', () => reject(new Error('Request was aborted.')));
+      })),
+    };
+    const session = makeSession({ planner });
+
+    const generation = session.generatePlan('test goal', ['claude-code']);
+    await vi.waitFor(() => expect(planner.generate).toHaveBeenCalled());
+    session.abortPlannerTurn();
+
+    await expect(generation).rejects.toThrow(PlannerTurnStoppedError);
   });
 
   it('generatePlan carries every mode toggle the one-shot path honours', async () => {

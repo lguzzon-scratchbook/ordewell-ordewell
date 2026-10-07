@@ -174,6 +174,12 @@ stopped, the conversation freed at once, and whatever it settles is discarded
 (`PlannerTurnDiscardedError`) instead of committed. So is a reply cut off by
 something other than its own stop (an `IAiService.reset`), since what such a
 call hands back is a fragment.
+A turn that throws while stopped or abandoned surfaces as a typed error whatever
+the backend named its own — `PlannerTurnStoppedError` or
+`PlannerTurnDiscardedError`, the original kept as `cause` — one-shot generation
+included, so a surface checks the type, never an SDK's abort error. The daemon
+answers both as 409 (`planner_turn_stopped`, `planner_turn_discarded`) without
+logging a fault.
 *Avoid:* "planning abort" or "generating" for it — both named a surface's copy
 of this state, and the copies drifted; *Avoid:* confusing it with **Turn**, the
 streamed span a surface draws under one `turnId`: every user turn is a planner
@@ -1655,7 +1661,7 @@ catalog's `RawCatalog` derive from it, so a field changed on one side fails to
 compile on the other. It lives in core because both packages already depend on
 it; the CLI must never import the daemon's runtime. A refusal travels as a stable
 `code`, mapped from core's typed errors (`SessionNotFoundError`, `NoPlanError`,
-`AlreadyExecutingError`, `ConversationBusyError`, …) in one table
+`AlreadyExecutingError`, `ConversationBusyError`, `PlannerTurnStoppedError`, …) in one table
 (`routes/errors.ts`) and surfaced to callers as `DaemonError.code`. The REST plan
 is the session's own plan state, not the `SerializedPlan` a socket carries.
 `PATCH /api/settings` also answers `switchRecall` — which model a planner switch
