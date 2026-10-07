@@ -1313,6 +1313,53 @@ describe.skipIf(!hasGit)('WorktreeIsolation end-of-run handoff', () => {
     expect(branches(root)).toContain(run.repos[0].integrationBranch);
   });
 
+  it('waits for a landing in flight instead of rolling its merge back', async () => {
+    const root = repo();
+    let reachMerge = () => {};
+    const mergeReached = new Promise<void>((resolve) => { reachMerge = resolve; });
+    let releaseMerge = () => {};
+    const mergeReleased = new Promise<void>((resolve) => { releaseMerge = resolve; });
+    // While the landing's merge is held, any other git call can only be the handoff's.
+    let holding = false;
+    const intruders: Array<() => void> = [];
+    let handing: Promise<unknown> = Promise.resolve();
+    const exec: GitExecFn = async (file, args, opts) => {
+      const isMerge = args[0] === 'merge' && args.includes('--no-ff');
+      if (isMerge) {
+        reachMerge();
+        await mergeReleased;
+      } else if (holding) {
+        await new Promise<void>((resolve) => intruders.push(resolve));
+      }
+      const { stdout, stderr } = await execFileAsync(file, args, { cwd: opts.cwd, env: opts.env });
+      if (isMerge) {
+        holding = false;
+        // A handoff that slipped in runs to the end while the landing sits just past its merge.
+        if (intruders.length > 0) {
+          intruders.splice(0).forEach((go) => go());
+          await handing.catch(() => undefined);
+        }
+      }
+      return { stdout: String(stdout), stderr: String(stderr) };
+    };
+    const iso = create({ config: fakeConfig({ worktreeIsolation: true }), execFileImpl: exec });
+    const run = await iso.startRun(root);
+    const t1 = task(1, 'Add alpha');
+    const { cwd } = await iso.prepare(t1, run);
+    writeFileSync(join(cwd, 'alpha.txt'), 'alpha\n');
+
+    const landing = iso.integrate(t1, run);
+    await mergeReached;
+    holding = true;
+    handing = iso.handoff(run);
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseMerge();
+
+    expect(await landing).toBe('merged');
+    await handing;
+    expect(git(root, 'show', `${run.repos[0].integrationBranch}:alpha.txt`)).toBe('alpha');
+  });
+
   it('a task retried after handoff still integrates', async () => {
     const { root, iso, run } = await finishedRun();
     await iso.handoff(run);
