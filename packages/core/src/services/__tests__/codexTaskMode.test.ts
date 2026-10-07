@@ -320,6 +320,22 @@ describe('CodexAdapter task interrupt', () => {
     adapter.dispose();
   });
 
+  it('sends every interrupt asked for before Codex names the turn, not only the last', async () => {
+    const { adapter, proc } = await startedTask();
+    void adapter.send('go', () => {});
+    const first = adapter.interrupt(1000);
+    const second = adapter.interrupt(1000);
+    await tick();
+    expect(sentNamed(proc.written, 'turn/interrupt')).toHaveLength(0);
+
+    const [turnStart] = sentNamed(proc.written, 'turn/start');
+    proc.emitStdout(line({ id: turnStart.id, result: { turn: { id: 'turn-a', status: 'inProgress', items: [] } } }));
+    await until(() => sentNamed(proc.written, 'turn/interrupt').length > 1);
+    for (const request of sentNamed(proc.written, 'turn/interrupt')) proc.emitStdout(line({ id: request.id, result: {} }));
+    expect(await Promise.all([first, second])).toEqual([true, true]);
+    adapter.dispose();
+  });
+
   it('reports an unanswered or refused interrupt as false, so the caller can kill and resume', async () => {
     const { adapter, proc } = await startedTask();
     void adapter.send('go', () => {});

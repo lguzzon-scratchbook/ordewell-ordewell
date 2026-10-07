@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { isAbsolute, relative, sep } from 'path';
-import type { AgentEvent, AgentStartOptions, TaskModeAgentAdapter } from './AgentAdapter';
+import type { AgentEvent, AgentProcessDeps, AgentStartOptions, TaskModeAgentAdapter } from './AgentAdapter';
 import type { SubagentOutcome } from '../../models/Task';
 import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { UsageRecord } from '../../models/Usage';
@@ -9,19 +9,13 @@ import { markedLines } from './fileDiff';
 import { probeCodexSandbox, codexSandboxUnavailableMessage, type CodexSandboxDecision } from './codexSandbox';
 import { ORDEWELL_MCP_SERVER_NAME } from '../mcp';
 import { CODEX_ORDEWELL } from './codexOrdewell';
-import { awaitAttach } from './ordewellBinding';
+import { awaitAttach, type AttachState } from './ordewellBinding';
+import { CodexRpc, type RpcMessage, type RpcResponse } from './codexRpc';
+import { settleWithin } from './settleWithin';
 
 const HANDSHAKE_TIMEOUT_MS = 30000;
 /** Codex starts a thread's MCP servers as the thread opens; one that is not up by now is not coming. */
 const MCP_ATTACH_TIMEOUT_MS = 10_000;
-
-interface RpcMessage {
-  id?: number | string;
-  method?: string;
-  params?: Record<string, unknown>;
-  result?: Record<string, unknown>;
-  error?: { message?: string };
-}
 
 /**
  * One entry of a Codex turn. Field names are the app-server protocol's, taken
@@ -273,16 +267,12 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   private threadId: string | null = null;
   /** The model Codex opened the thread with — usage records name it. */
   private threadModel: string | null = null;
-  private nextRequestId = 100;
-  private settleHandshake: ((ok: boolean) => void) | null = null;
-  private handshakeError: string | null = null;
+  private readonly rpc = new CodexRpc((payload) => this.writeLine(payload));
   private startOpts: AgentStartOptions | null = null;
   /** Whether this turn has already emitted prose — see the `agentMessage` case. */
   private turnHasText = false;
   /** The turn in flight. `turn/interrupt` and `turn/steer` cannot be sent before it has an id. */
   private turn: CodexTurn | null = null;
-  /** The JSON-RPC id of the `turn/start` that opened {@link turn}. */
-  private turnRequestId: number | null = null;
   /** The last turn this adapter ended — so its second end signal, landing late, ends nothing. */
   private endedTurnId: string | null = null;
   /** An interrupt was asked for during this turn, so however it ends, it was cut short. */
@@ -293,8 +283,6 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
    * that belongs to no turn of the agent's any more (ADR-0023, F4).
    */
   private readonly interruptedTurnIds = new Set<string>();
-  /** An interrupt asked for before Codex named the turn, sent once it does. */
-  private interruptOnStart: (() => void) | null = null;
   /** A task's approval requests still waiting for an answer, by the request id as a string. */
   private readonly openPermissions = new Map<string, { requestId: number | string; method: string; params: Record<string, unknown> }>();
   /**
@@ -304,10 +292,6 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   private readonly fileChangePaths = new Map<string, string[]>();
   /** The row each announced file of an in-flight `fileChange` item is shown under, by the file's shown path. */
   private readonly fileChangeRows = new Map<string, Map<string, string>>();
-  /** Requests this adapter sent and awaits an answer to, by JSON-RPC id. */
-  private readonly pendingRequests = new Map<number, (ok: boolean) => void>();
-  private resumeAttempted = false;
-  private resumeFallbackSent = false;
   private sandbox: CodexSandboxDecision = 'default';
   /** The Ordewell server's startup state, as Codex last reported it for this thread. */
   private mcpStartup: string | null = null;
@@ -318,6 +302,11 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
    * one stream; the thread id is what tells them apart (see {@link subagentOf}).
    */
   private readonly subagents = new Map<string, { model?: string }>();
+
+  constructor(deps: AgentProcessDeps) {
+    super(deps);
+    void this.processEnded.then(() => this.rpc.close('The Codex app-server process ended.'));
+  }
 
   protected spawnSpec(opts: AgentStartOptions): SpawnSpec {
     this.startOpts = opts;
@@ -339,46 +328,53 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
     const needsSandbox = opts.kind === 'planner' || opts.flags.permissionMode !== 'danger-full-access';
     if (this.sandbox === 'unavailable' && needsSandbox) throw new Error(codexSandboxUnavailableMessage(opts.kind));
 
-    const ready = new Promise<boolean>((resolve) => { this.settleHandshake = resolve; });
-    this.writeLine({
-      jsonrpc: '2.0', id: 1, method: 'initialize',
-      params: { clientInfo: { name: 'ordewell', title: 'Ordewell', version: '0.1.0' } },
-    });
+    // A binary that rejects `app-server` outright dies immediately; waiting
+    // out the timeout would turn a one-line diagnostic into a 30s stall.
+    const incomplete = () => { throw this.handshakeIncomplete(); };
+    await settleWithin(this.openThread(opts), { timeoutMs: HANDSHAKE_TIMEOUT_MS, ended: this.processEnded, onTimeout: incomplete, onEnded: incomplete });
+  }
 
-    const ok = await Promise.race([
-      ready,
-      // A binary that rejects `app-server` outright dies immediately; waiting
-      // out the timeout would turn a one-line diagnostic into a 30s stall.
-      this.processEnded.then(() => false),
-      new Promise<boolean>((resolve) => { const t = setTimeout(() => resolve(false), HANDSHAKE_TIMEOUT_MS); t.unref?.(); }),
-    ]);
-    this.settleHandshake = null;
-    if (!ok) {
-      throw new Error(this.handshakeError ?? `The Codex app-server did not complete its handshake.\n\n${this.exitMessage()}`);
-    }
-    void opts;
+  private handshakeIncomplete(): Error {
+    return new Error(`The Codex app-server did not complete its handshake.\n\n${this.exitMessage()}`);
   }
 
   /**
    * Open this session's thread. A resume id means the previous
    * process died mid-session: `thread/resume` puts the agent back in front of
    * the context it already paid to read. A planner's failed resume is not an
-   * error — the response handler falls back to a fresh thread, which is the
-   * same degradation `restoreChat` performs on every surface (T4). A task's
-   * is: Continue (K1) offers the session that did the work, and a fresh thread
-   * in its place would pretend it was resumed.
+   * error — it falls back to a fresh thread, which is the same degradation
+   * `restoreChat` performs on every surface (T4). A task's is: Continue (K1)
+   * offers the session that did the work, and a fresh thread in its place
+   * would pretend it was resumed.
    */
-  private startThread(resumeSessionId?: string): void {
-    this.resumeAttempted = this.resumeAttempted || !!resumeSessionId;
-    this.writeLine({
-      jsonrpc: '2.0',
-      id: 2,
-      method: resumeSessionId ? 'thread/resume' : 'thread/start',
-      params: {
-        ...(resumeSessionId ? { threadId: resumeSessionId } : {}),
-        ...this.threadParams(),
-      },
+  private async openThread(opts: AgentStartOptions): Promise<void> {
+    const initialized = await this.rpc.call('initialize', { clientInfo: { name: 'ordewell', title: 'Ordewell', version: '0.1.0' } });
+    if (!initialized.ok) {
+      throw initialized.closed ? this.handshakeIncomplete() : new Error(`The Codex app-server rejected initialize: ${initialized.message ?? 'unknown error'}`);
+    }
+
+    const resumeId = opts.resumeSessionId;
+    let opened = await this.requestThread(resumeId);
+    if ('reason' in opened && resumeId) {
+      if (opts.kind === 'task') throw new Error(`Codex could not resume thread ${resumeId}: ${opened.reason}`);
+      opened = await this.requestThread();
+    }
+    if ('reason' in opened) throw new Error(`The Codex app-server could not start a thread: ${opened.reason}`);
+    this.threadId = opened.id;
+    this.sessionId = opened.id;
+    this.threadModel = opened.model;
+  }
+
+  private async requestThread(resumeSessionId?: string): Promise<{ id: string; model: string | null } | { reason: string }> {
+    const response = await this.rpc.call(resumeSessionId ? 'thread/resume' : 'thread/start', {
+      ...(resumeSessionId ? { threadId: resumeSessionId } : {}),
+      ...this.threadParams(),
     });
+    if (!response.ok && response.closed) throw this.handshakeIncomplete();
+    const thread = response.ok ? response.result.thread as { id?: string } | undefined : undefined;
+    if (!thread?.id) return { reason: (!response.ok && response.message) || 'no thread id returned' };
+    const model = response.ok ? response.result.model : undefined;
+    return { id: thread.id, model: typeof model === 'string' ? model : null };
   }
 
   private threadParams(): Record<string, unknown> {
@@ -428,15 +424,17 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   async mcpAttached(): Promise<boolean> {
     if (!this.startOpts?.mcp || !this.process) return false;
     return awaitAttach(async (left) => {
-      const reported = CODEX_ORDEWELL.attachState(this.mcpStartup);
-      if (reported !== 'pending') return reported;
-      const ended = await Promise.race([
-        new Promise<false>((resolve) => { this.mcpStartupSettled = () => resolve(false); }),
-        this.processEnded.then(() => true),
-        new Promise<false>((resolve) => { const t = setTimeout(() => resolve(false), left); t.unref?.(); }),
-      ]);
+      const known = CODEX_ORDEWELL.attachState(this.mcpStartup);
+      if (known !== 'pending') return known;
+      const reported = new Promise<AttachState>((resolve) => { this.mcpStartupSettled = () => resolve(CODEX_ORDEWELL.attachState(this.mcpStartup)); });
+      const state = await settleWithin(reported, {
+        timeoutMs: left,
+        ended: this.processEnded,
+        onTimeout: () => CODEX_ORDEWELL.attachState(this.mcpStartup),
+        onEnded: (): AttachState => 'failed',
+      });
       this.mcpStartupSettled = null;
-      return ended ? 'failed' : CODEX_ORDEWELL.attachState(this.mcpStartup);
+      return state;
     }, MCP_ATTACH_TIMEOUT_MS, 0);
   }
 
@@ -447,35 +445,23 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
 
   /**
    * `turn/interrupt` names the turn as well as the thread, so an interrupt
-   * asked for before Codex has named the turn waits for it. Codex acknowledges
-   * with an empty result, then ends the turn as `interrupted`.
+   * asked for before Codex has named the turn waits for it, as a steer does.
+   * Codex acknowledges with an empty result, then ends the turn as `interrupted`.
    */
   interrupt(timeoutMs: number): Promise<boolean> {
     const turn = this.turn;
     if (!this.process || !turn) return Promise.resolve(false);
     this.interruptRequested = true;
-    return new Promise<boolean>((resolve) => {
-      let settled = false;
-      let requestId: number | null = null;
-      const settle = (ok: boolean) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (requestId !== null) this.pendingRequests.delete(requestId);
-        if (this.interruptOnStart === send) this.interruptOnStart = null;
-        resolve(ok);
-      };
-      const send = () => {
-        requestId = this.nextRequestId++;
-        this.pendingRequests.set(requestId, settle);
-        this.writeLine({ jsonrpc: '2.0', id: requestId, method: 'turn/interrupt', params: { threadId: this.threadId, turnId: turn.id } });
-      };
-      const timer = setTimeout(() => settle(false), timeoutMs);
-      timer.unref?.();
-      void this.processEnded.then(() => settle(false));
-      if (turn.id) send();
-      else this.interruptOnStart = send;
+    const acknowledged = new Promise<boolean>((resolve) => {
+      this.whenNamed(turn, () => this.rpc.send('turn/interrupt', { threadId: this.threadId, turnId: turn.id }, (response) => resolve(response.ok)));
     });
+    return settleWithin(acknowledged, { timeoutMs, ended: this.processEnded, onTimeout: () => false, onEnded: () => false });
+  }
+
+  /** Run `send` now if Codex has named the turn, and once it does if not. */
+  private whenNamed(turn: CodexTurn, send: () => void): void {
+    if (turn.id) send();
+    else turn.onNamed.push(send);
   }
 
   /**
@@ -513,24 +499,17 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
         steer.settle(true);
       });
       void this.processEnded.then(() => steer.settle(false));
-      if (turn.id) send();
-      else turn.onNamed.push(send);
+      this.whenNamed(turn, send);
     });
   }
 
   /** The one way input reaches a running turn: a task message, or a deny note. */
   private requestSteer(turnId: string, text: string, clientUserMessageId?: string, answered?: (ok: boolean) => void): void {
-    const requestId = this.nextRequestId++;
-    if (answered) {
-      this.pendingRequests.set(requestId, (ok) => {
-        this.pendingRequests.delete(requestId);
-        answered(ok);
-      });
-    }
-    this.writeLine({
-      jsonrpc: '2.0', id: requestId, method: 'turn/steer',
-      params: { threadId: this.threadId, expectedTurnId: turnId, input: [{ type: 'text', text }], ...(clientUserMessageId ? { clientUserMessageId } : {}) },
-    });
+    this.rpc.send(
+      'turn/steer',
+      { threadId: this.threadId, expectedTurnId: turnId, input: [{ type: 'text', text }], ...(clientUserMessageId ? { clientUserMessageId } : {}) },
+      (response) => answered?.(response.ok),
+    );
   }
 
   /**
@@ -542,82 +521,39 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
     const open = this.openPermissions.get(id);
     if (!open || !this.process) return false;
     this.openPermissions.delete(id);
-    this.writeLine({ jsonrpc: '2.0', id: open.requestId, result: TASK_APPROVALS[open.method].answer(decision.decision, open.params) });
+    this.rpc.respond(open.requestId, TASK_APPROVALS[open.method].answer(decision.decision, open.params));
     const note = decision.decision === 'deny' ? decision.note?.trim() : undefined;
     if (note && this.turn?.id) this.requestSteer(this.turn.id, note);
     return true;
   }
 
   protected turnPayload(message: string): string {
-    this.turn = { id: null, steers: new Map(), onNamed: [] };
+    const turn: CodexTurn = { id: null, steers: new Map(), onNamed: [] };
+    this.turn = turn;
     this.interruptRequested = false;
-    this.turnRequestId = this.nextRequestId++;
-    return `${JSON.stringify({
-      jsonrpc: '2.0',
-      id: this.turnRequestId,
-      method: 'turn/start',
-      params: {
-        threadId: this.threadId,
-        input: [{ type: 'text', text: message }],
-        ...(this.effort() ? { effort: this.effort() } : {}),
-      },
-    })}\n`;
+    return this.rpc.frame('turn/start', {
+      threadId: this.threadId,
+      input: [{ type: 'text', text: message }],
+      ...(this.effort() ? { effort: this.effort() } : {}),
+    }, (response, emit) => this.turnAnswered(turn, response, emit));
+  }
+
+  /** `turn/start`'s answer. One for a turn that has since closed or been replaced names and closes nothing. */
+  private turnAnswered(turn: CodexTurn, response: RpcResponse, emit: (event: AgentEvent) => void): void {
+    if (this.turn !== turn) return;
+    if (response.ok) {
+      this.turnStarted((response.result.turn as { id?: unknown } | undefined)?.id);
+    } else if (!response.closed) {
+      this.closeTurn(emit);
+      emit({ type: 'error', message: `Codex refused the turn: ${response.message ?? 'unknown error'}` });
+    }
   }
 
   protected handleLine(line: string, emit: (event: AgentEvent) => void): void {
     const msg = StdioAgentAdapter.parse<RpcMessage>(line);
     if (!msg) return;
 
-    if (msg.id === 1 && !msg.method) {
-      if (msg.error) {
-        this.handshakeError = `The Codex app-server rejected initialize: ${msg.error.message ?? 'unknown error'}`;
-        this.settleHandshake?.(false);
-        return;
-      }
-      this.startThread(this.startOpts?.resumeSessionId);
-      return;
-    }
-
-    if (msg.id === 2 && !msg.method) {
-      const thread = msg.result?.thread as { id?: string } | undefined;
-      if (msg.error || !thread?.id) {
-        const reason = msg.error?.message ?? 'no thread id returned';
-        if (this.startOpts?.kind === 'task' && this.resumeAttempted) {
-          this.handshakeError = `Codex could not resume thread ${this.startOpts.resumeSessionId}: ${reason}`;
-          this.settleHandshake?.(false);
-          return;
-        }
-        if (this.resumeAttempted && !this.resumeFallbackSent) {
-          this.resumeFallbackSent = true;
-          this.startThread();
-          return;
-        }
-        this.handshakeError = `The Codex app-server could not start a thread: ${reason}`;
-        this.settleHandshake?.(false);
-        return;
-      }
-      this.threadId = thread.id;
-      this.sessionId = thread.id;
-      const model = msg.result?.model;
-      this.threadModel = typeof model === 'string' ? model : null;
-      this.settleHandshake?.(true);
-      return;
-    }
-
-    if (!msg.method && typeof msg.id === 'number' && this.pendingRequests.has(msg.id)) {
-      this.pendingRequests.get(msg.id)?.(!msg.error);
-      return;
-    }
-
-    if (msg.id === this.turnRequestId && !msg.method) {
-      if (msg.error) {
-        this.closeTurn(emit);
-        emit({ type: 'error', message: `Codex refused the turn: ${msg.error.message ?? 'unknown error'}` });
-        return;
-      }
-      this.turnStarted((msg.result?.turn as { id?: unknown } | undefined)?.id);
-      return;
-    }
+    if (this.rpc.dispatch(msg, emit)) return;
 
     // Every server→client request — one that carries both a method and an id —
     // gets an answer, because an unanswered one stalls the turn forever. That
@@ -628,7 +564,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
       if (msg.method === 'currentTime/read') {
         // Answered rather than refused: it is not a capability request, and
         // failing it would break a tool for no reason.
-        this.writeLine({ jsonrpc: '2.0', id: msg.id, result: { currentTimeAt: Math.floor(Date.now() / 1000) } });
+        this.rpc.respond(msg.id, { currentTimeAt: Math.floor(Date.now() / 1000) });
       } else if (this.startOpts?.kind === 'task') {
         this.openTaskRequest(msg, emit);
       } else {
@@ -769,9 +705,6 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
     const turn = this.turn;
     if (!turn || turn.id || typeof id !== 'string') return;
     turn.id = id;
-    const interrupt = this.interruptOnStart;
-    this.interruptOnStart = null;
-    interrupt?.();
     for (const send of turn.onNamed.splice(0)) send();
   }
 
@@ -785,7 +718,6 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
     this.endedTurnId = turn?.id ?? null;
     if (turn?.id && this.interruptRequested) this.interruptedTurnIds.add(turn.id);
     this.turn = null;
-    this.interruptOnStart = null;
     if (!turn) return;
     for (const steer of [...turn.steers.values()]) {
       if (steer.accepted) emit({ type: 'message_dropped', id: steer.id });
@@ -865,7 +797,7 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
     const params = msg.params ?? {};
     const approval = TASK_APPROVALS[method];
     if (CODEX_ORDEWELL.isOrdewellAsk({ method, params })) {
-      this.writeLine({ jsonrpc: '2.0', id: msg.id, result: { action: 'accept', content: {} } });
+      this.rpc.respond(msg.id!, { action: 'accept', content: {} });
       return;
     }
     if (approval && (method !== 'mcpServer/elicitation/request' || isYesNoElicitation(params))) {
@@ -882,13 +814,9 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
         ...(typeof params.itemId === 'string' ? { toolUseId: params.itemId } : {}),
       });
     } else if (method === 'mcpServer/elicitation/request') {
-      this.writeLine({ jsonrpc: '2.0', id: msg.id, result: { action: 'decline', content: null } });
+      this.rpc.respond(msg.id!, { action: 'decline', content: null });
     } else {
-      this.writeLine({
-        jsonrpc: '2.0',
-        id: msg.id,
-        error: { code: -32601, message: method === 'item/tool/requestUserInput' ? ASK_IN_PLAIN_TEXT : `Ordewell does not handle ${method}.` },
-      });
+      this.rpc.respondError(msg.id!, -32601, method === 'item/tool/requestUserInput' ? ASK_IN_PLAIN_TEXT : `Ordewell does not handle ${method}.`);
     }
   }
 
@@ -911,18 +839,14 @@ export class CodexAdapter extends StdioAgentAdapter implements TaskModeAgentAdap
   private answerServerRequest(msg: RpcMessage, emit: (e: AgentEvent) => void): void {
     const method = msg.method!;
     if (CODEX_ORDEWELL.isOrdewellAsk({ method, params: msg.params ?? {} })) {
-      this.writeLine({ jsonrpc: '2.0', id: msg.id, result: { action: 'accept', content: {} } });
+      this.rpc.respond(msg.id!, { action: 'accept', content: {} });
       return;
     }
     const result = DECLINE_RESULTS[method];
     if (result) {
-      this.writeLine({ jsonrpc: '2.0', id: msg.id, result });
+      this.rpc.respond(msg.id!, result);
     } else {
-      this.writeLine({
-        jsonrpc: '2.0',
-        id: msg.id,
-        error: { code: -32601, message: 'The Ordewell planner is read-only and has no user to consult. Mutation belongs to the runners that execute the plan.' },
-      });
+      this.rpc.respondError(msg.id!, -32601, 'The Ordewell planner is read-only and has no user to consult. Mutation belongs to the runners that execute the plan.');
     }
     if (!ANNOUNCED_REQUESTS.has(method)) return;
     emit({
