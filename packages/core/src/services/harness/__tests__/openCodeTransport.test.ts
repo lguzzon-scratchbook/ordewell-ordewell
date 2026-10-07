@@ -1,10 +1,11 @@
 import { describe, it, expect } from 'vitest';
+import { getEventListeners } from 'events';
 import type { ApprovalDecision } from '../../../interfaces/IApproval';
 import type { AgentEvent, TaskStartOptions } from '../AgentAdapter';
 import { mcpClientConfig } from '../../mcp';
 import { sseResponse } from '../../__tests__/harnessTestKit';
 import {
-  ChildSessions, OpenCodePermissions, PendingSteers, ReplyText, autoApproves, interruptAcknowledged, newUserMessageId, openEventStream, permissionReply, settleTurn,
+  ChildSessions, OpenCodePermissions, PendingSteers, ReplyText, autoApproves, delay, interruptAcknowledged, newUserMessageId, openEventStream, permissionReply, settleTurn,
   splitModelId, turnLatch, usageRecord, type PermissionRequest,
 } from '../openCodeTransport';
 
@@ -23,6 +24,23 @@ describe('splitModelId', () => {
 
   it.each(['sonnet', '/sonnet', 'anthropic/'])('takes %s for no model id', (id) => {
     expect(splitModelId(id)).toBeNull();
+  });
+});
+
+describe('delay', () => {
+  // Every status poll waits on the turn's signal once a second; a listener
+  // left behind per wait grew without bound over a long turn.
+  it('leaves no listener on the signal once it has waited', async () => {
+    const abort = new AbortController();
+    for (let i = 0; i < 3; i++) await delay(1, abort.signal);
+    expect(getEventListeners(abort.signal, 'abort')).toHaveLength(0);
+  });
+
+  it('ends early when the signal aborts', async () => {
+    const abort = new AbortController();
+    const waited = delay(60_000, abort.signal);
+    abort.abort();
+    await expect(waited).resolves.toBeUndefined();
   });
 });
 

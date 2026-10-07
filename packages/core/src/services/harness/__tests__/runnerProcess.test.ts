@@ -1,7 +1,8 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { ClaudeCodeAdapter } from '../ClaudeCodeAdapter';
 import { OpenCodeAdapter } from '../OpenCodeAdapter';
-import type { AgentAdapter, AgentProcessDeps, TaskStartOptions } from '../AgentAdapter';
+import { CodexAdapter } from '../CodexAdapter';
+import type { AgentAdapter, AgentEvent, AgentProcessDeps, TaskStartOptions } from '../AgentAdapter';
 import { fakeSpawn } from '../../__tests__/harnessTestKit';
 
 /**
@@ -92,6 +93,15 @@ describe('the environment a runner starts under', () => {
     adapter.dispose();
   });
 
+  it.each(adapters)('%s starts its runner as the leader of a process group, so Stop reaches what it starts', async (_label, start) => {
+    const spawned = fakeSpawn([]);
+    const detached: Array<boolean | undefined> = [];
+    const processDeps = deps(spawned);
+    const adapter = await start(spawned, { ...processDeps, spawn: (command, args, options) => { detached.push(options.detached); return processDeps.spawn(command, args, options); } });
+    expect(detached).toEqual([true]);
+    adapter.dispose();
+  });
+
   it.each(adapters)('%s still passes one the workspace sets on purpose (ADR-0016)', async (_label, start) => {
     hostLaunchedFromClaudeCode();
     const spawned = fakeSpawn([]);
@@ -100,5 +110,130 @@ describe('the environment a runner starts under', () => {
     expect(envs[0].NODE_OPTIONS).toBe('--max-old-space-size=8192');
     expect(envs[0]).not.toHaveProperty('CLAUDECODE');
     adapter.dispose();
+  });
+});
+
+describe('a runner that fails to start', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  const until = async (condition: () => boolean) => {
+    for (let i = 0; i < 200 && !condition(); i++) await Promise.resolve();
+    if (!condition()) throw new Error('condition never held');
+  };
+
+  // Nobody holds an adapter whose start threw — neither caller assigns it —
+  // so a process it left running would be orphaned for the host's lifetime.
+  it('takes the Codex app-server down with a rejected initialize, reporting the rejection unchanged', async () => {
+    const spawned = fakeSpawn([`${JSON.stringify({ jsonrpc: '2.0', id: 1, error: { message: 'unsupported client' } })}\n`]);
+    const adapter = new CodexAdapter(deps(spawned));
+
+    await expect(adapter.start({ kind: 'planner', cwd: '/repo', systemPrompt: 'plan read-only' }))
+      .rejects.toThrow(/^The Codex app-server rejected initialize: unsupported client$/);
+    expect(spawned.processes[0].killed).toBe(true);
+  });
+
+  it('takes the Codex app-server down when its handshake times out, with its stderr in the message', async () => {
+    vi.useFakeTimers();
+    const spawned = fakeSpawn([]);
+    const adapter = new CodexAdapter(deps(spawned));
+    const started = adapter.start({ kind: 'planner', cwd: '/repo', systemPrompt: 'plan read-only' });
+    const rejected = expect(started).rejects.toThrow(/did not complete its handshake[\s\S]*exited with code unknown\.\n\nstill loading/);
+    await until(() => (spawned.processes[0]?.written.length ?? 0) > 0);
+    spawned.processes[0].emitStderr('still loading');
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    expect(spawned.processes[0].killed).toBe(true);
+  });
+
+  it('takes the OpenCode server down when it never prints where it listens', async () => {
+    vi.useFakeTimers();
+    const spawned = fakeSpawn([]);
+    const adapter = new OpenCodeAdapter(deps(spawned));
+    const started = adapter.start({ kind: 'planner', cwd: '/repo', systemPrompt: 'plan read-only' });
+    const rejected = expect(started).rejects.toThrow(/^The OpenCode planner server did not start\.$/);
+    await until(() => spawned.processes.length > 0);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    await rejected;
+    expect(spawned.processes[0].killed).toBe(true);
+    // Given up on, the scanner is detached rather than buffering the server's output for good.
+    expect(spawned.processes[0].stdout!.listenerCount('data')).toBe(0);
+  });
+
+  it('takes the OpenCode server down when it hands back no session', async () => {
+    const spawned = fakeSpawn([]);
+    const processDeps = { ...deps(spawned), fetch: (async () => ({ ok: true, status: 200, json: async () => ({}) })) as unknown as typeof fetch };
+
+    await expect(startOpenCode(spawned, processDeps)).rejects.toThrow('The OpenCode planner server did not return a session id.');
+    expect(spawned.processes[0].killed).toBe(true);
+  });
+});
+
+describe('the OpenCode server banner', () => {
+  it('takes the address from stdout, not from a URL in a stderr warning', async () => {
+    const spawned = fakeSpawn([]);
+    const urls: string[] = [];
+    const processDeps = { ...deps(spawned), fetch: ((input: unknown, init?: RequestInit) => { urls.push(String(input)); return serveFetch(input as string, init); }) as unknown as typeof fetch };
+    const adapter = new OpenCodeAdapter(processDeps);
+    const started = adapter.start({ kind: 'planner', cwd: '/repo', systemPrompt: 'plan read-only' });
+    for (let i = 0; i < 50 && spawned.processes.length === 0; i++) await Promise.resolve();
+
+    spawned.processes[0].emitStderr('Warning: could not reach https://models.dev/api.json\n');
+    spawned.processes[0].emitStdout('opencode server listening on http://127.0.0.1:4096\n');
+    await started;
+
+    expect(urls[0]).toMatch(/^http:\/\/127\.0\.0\.1:4096\//);
+    adapter.dispose();
+  });
+
+  it('stops scanning once the address is known', async () => {
+    const spawned = fakeSpawn([]);
+    const adapter = await startOpenCode(spawned);
+    expect(spawned.processes[0].stdout!.listenerCount('data')).toBe(0);
+    adapter.dispose();
+  });
+});
+
+describe('a runner\'s output split mid-character', () => {
+  /** `text` as bytes, cut inside its first multibyte character after `after`. */
+  function splitInside(text: string, after: string): [Buffer, Buffer] {
+    const bytes = Buffer.from(text);
+    const cut = Buffer.byteLength(text.slice(0, text.indexOf(after) + after.length)) + 1;
+    return [bytes.subarray(0, cut), bytes.subarray(cut)];
+  }
+
+  it('reaches the stdio adapter\'s protocol whole', async () => {
+    const spawned = fakeSpawn([]);
+    const adapter = new ClaudeCodeAdapter(deps(spawned));
+    await adapter.start(taskStart);
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (event) => events.push(event));
+    await Promise.resolve();
+
+    const assistant = `${JSON.stringify({ type: 'assistant', session_id: 's1', message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'déjà 日本' }] } })}\n`;
+    for (const part of splitInside(assistant, 'déjà ')) spawned.processes[0].stdout!.emit('data', part);
+    spawned.processes[0].emitStdout(`${JSON.stringify({ type: 'result', subtype: 'success', session_id: 's1', is_error: false, result: 'déjà 日本' })}\n`);
+    await turn;
+
+    const text = events.filter((e) => e.type === 'assistant_text').map((e) => (e as { text: string }).text).join('');
+    expect(text).toContain('déjà 日本');
+    expect(text).not.toContain('�');
+    adapter.dispose();
+  });
+
+  it('reaches the stdio adapter\'s failure message whole', async () => {
+    const spawned = fakeSpawn([]);
+    const adapter = new ClaudeCodeAdapter(deps(spawned));
+    await adapter.start(taskStart);
+    const events: AgentEvent[] = [];
+    const turn = adapter.send('go', (event) => events.push(event));
+    await Promise.resolve();
+
+    for (const part of splitInside('Fehler: Schlüssel ungültig\n', 'Schl')) spawned.processes[0].stderr!.emit('data', part);
+    spawned.processes[0].exit(1);
+    await turn;
+
+    expect(events).toContainEqual({ type: 'error', message: expect.stringContaining('Fehler: Schlüssel ungültig') });
   });
 });

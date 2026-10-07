@@ -1,7 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'events';
-import type { ChildProcess } from 'child_process';
-import { killTree, type KillTreeDeps } from '../processTree';
+import { spawn, type ChildProcess } from 'child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { killTree, spawnInOwnGroup, type KillTreeDeps } from '../processTree';
 
 class FakeChild extends EventEmitter {
   killed = false;
@@ -121,5 +124,138 @@ describe('killTree guards', () => {
     killTree(h.child as unknown as ChildProcess, h.deps);
     killTree(h.child as unknown as ChildProcess, h.deps);
     expect(h.child.kill).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** A pid no real process group can have, so a stray signal reaches nothing. */
+const UNUSED_PID = 2 ** 31 - 2;
+
+describe('killTree on a runner that leads its own process group', () => {
+  function leader() {
+    const child = new FakeChild();
+    child.pid = UNUSED_PID;
+    const spawn = vi.fn((_detached: boolean) => child as unknown as ChildProcess);
+    spawnInOwnGroup(spawn, 'linux');
+    const signals: Array<[number, NodeJS.Signals | 0]> = [];
+    const h = harness({ platform: 'linux', killImpl: (pid, signal) => { signals.push([pid, signal]); } });
+    return { child, spawn, signals, h };
+  }
+
+  it('is spawned detached, which on POSIX makes it the leader of a new group', () => {
+    const { spawn, child } = leader();
+    expect(spawn).toHaveBeenCalledWith(true);
+    child.emit('exit', 0);
+  });
+
+  it('is not detached on Windows, where that opens a console and taskkill /T already walks the tree', () => {
+    const spawn = vi.fn((_detached: boolean) => new FakeChild() as unknown as ChildProcess);
+    spawnInOwnGroup(spawn, 'win32');
+    expect(spawn).toHaveBeenCalledWith(false);
+  });
+
+  // The direct child is a CLI; the shells, MCP servers, test runs and dev
+  // servers it started are what kept running after Stop.
+  it('signals the whole group, not just the direct child', () => {
+    const { child, signals, h } = leader();
+    killTree(child as unknown as ChildProcess, h.deps);
+
+    expect(signals).toEqual([[-UNUSED_PID, 'SIGTERM']]);
+    expect(child.kill).not.toHaveBeenCalled();
+    child.emit('exit', null, 'SIGTERM');
+  });
+
+  it('still escalates to SIGKILL after the leader exits, since what it started can outlive it', () => {
+    const { child, signals, h } = leader();
+    killTree(child as unknown as ChildProcess, h.deps);
+    child.emit('exit', null, 'SIGTERM');
+
+    expect(h.isScheduled()).toBe(true);
+    h.fireHardKill();
+    expect(signals).toEqual([[-UNUSED_PID, 'SIGTERM'], [-UNUSED_PID, 'SIGKILL']]);
+  });
+
+  it('falls back to the direct child when the group cannot be signalled', () => {
+    const { child } = leader();
+    const h = harness({ platform: 'linux', killImpl: () => { throw Object.assign(new Error('kill EPERM'), { code: 'EPERM' }); } });
+    killTree(child as unknown as ChildProcess, h.deps);
+
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    child.emit('exit', null, 'SIGTERM');
+  });
+
+  it('is idempotent — a second stop sends nothing more', () => {
+    const { child, signals, h } = leader();
+    killTree(child as unknown as ChildProcess, h.deps);
+    killTree(child as unknown as ChildProcess, h.deps);
+
+    expect(signals).toHaveLength(1);
+    child.emit('exit', null, 'SIGTERM');
+  });
+});
+
+const posixIt = it.skipIf(process.platform === 'win32');
+
+/** Polls until `pid` no longer exists. */
+async function gone(pid: number, withinMs = 3000): Promise<boolean> {
+  const deadline = Date.now() + withinMs;
+  while (Date.now() < deadline) {
+    try { process.kill(pid, 0); } catch { return true; }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}
+
+/** The first line `proc` prints, as a pid. */
+function firstPid(proc: ChildProcess): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let out = '';
+    proc.stdout!.on('data', (chunk: Buffer) => {
+      out += chunk.toString();
+      const newline = out.indexOf('\n');
+      if (newline >= 0) resolve(Number(out.slice(0, newline)));
+    });
+    proc.once('exit', () => reject(new Error(`exited before printing a pid: ${out}`)));
+  });
+}
+
+/** A shell that backgrounds a long sleep — the grandchild Stop used to miss — and prints its pid. */
+const SHELL_WITH_GRANDCHILD = ['-c', 'sleep 30 & echo $!; wait'];
+
+describe('process groups, for real', () => {
+  posixIt('Stop reaches a grandchild the runner started, and stdout still pipes', async () => {
+    const proc = spawnInOwnGroup((detached) => spawn('sh', SHELL_WITH_GRANDCHILD, { detached, stdio: ['pipe', 'pipe', 'pipe'] }));
+    const grandchild = await firstPid(proc);
+    try {
+      killTree(proc);
+      expect(await gone(grandchild)).toBe(true);
+    } finally {
+      try { process.kill(grandchild, 'SIGKILL'); } catch { /* gone, as it should be */ }
+    }
+  });
+
+  // Ctrl-C reaches the terminal's foreground group, which a detached runner
+  // has left — so the host has to pass the signal on to the groups it leads.
+  posixIt.each(['SIGINT', 'SIGTERM', 'SIGHUP'] as const)('a host killed by %s takes its runners\' groups with it', async (signal) => {
+    const dir = mkdtempSync(join(tmpdir(), 'ordewell-host-'));
+    const host = join(dir, 'host.mts');
+    writeFileSync(host, [
+      `import { spawn } from 'node:child_process';`,
+      `import { spawnInOwnGroup } from ${JSON.stringify(join(__dirname, '..', 'processTree.ts'))};`,
+      `const proc = spawnInOwnGroup((detached) => spawn('sh', ${JSON.stringify(SHELL_WITH_GRANDCHILD)}, { detached, stdio: ['ignore', 'pipe', 'inherit'] }));`,
+      `proc.stdout.pipe(process.stdout);`,
+    ].join('\n'));
+    const hostProc = spawn(process.execPath, ['--experimental-strip-types', '--no-warnings', host], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let grandchild = 0;
+    try {
+      grandchild = await firstPid(hostProc);
+      const exited = new Promise<NodeJS.Signals | null>((resolve) => hostProc.once('exit', (_code, sig) => resolve(sig)));
+      hostProc.kill(signal);
+      expect(await exited).toBe(signal);
+      expect(await gone(grandchild)).toBe(true);
+    } finally {
+      hostProc.kill('SIGKILL');
+      if (grandchild) try { process.kill(grandchild, 'SIGKILL'); } catch { /* gone, as it should be */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

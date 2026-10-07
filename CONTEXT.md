@@ -1666,10 +1666,15 @@ escape in `sh` and a separator in cmd, so `rg pattern C:\repo\src` tokenized to
 Windows box can answer POSIX.
 
 **Kill tree** (`utils/processTree.ts`) — the one way an agent process is stopped.
-POSIX keeps SIGTERM → SIGKILL. Windows has no signals and the direct child may be
-a cmd.exe shim rather than the agent, so `taskkill /T` walks the tree; without it
-"stop" terminated the shim and left the agent running, still holding the
-workspace and the subscription.
+On POSIX a runner is spawned as the leader of its own process group
+(`spawnInOwnGroup`), and SIGTERM → SIGKILL goes to the whole group: signalling
+only the direct child left the shells, MCP servers, test runs and dev servers it
+started running after Stop. Having left the terminal's foreground group, a
+runner no longer hears Ctrl-C, so the host passes SIGINT/SIGTERM/SIGHUP and its
+own exit on to the groups it leads. Windows has no signals and the direct child
+may be a cmd.exe shim rather than the agent, so `taskkill /T` walks the tree;
+without it "stop" terminated the shim and left the agent running, still holding
+the workspace and the subscription.
 *Avoid:* `proc.kill('SIGTERM')` at a dispose site — or a bare `proc.kill()`,
 which was the last one left, in `ModelDiscovery`'s Codex app-server probe.
 

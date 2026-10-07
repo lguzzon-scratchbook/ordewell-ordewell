@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
 import { HeadlessRunner, type SpawnFn } from '../HeadlessRunner';
 import type { RunnerRegistry } from '../../plugins/RunnerRegistry';
@@ -24,7 +24,8 @@ function fakeRegistry(m: RunnerPluginManifest): RunnerRegistry {
 class FakeChildProcess extends EventEmitter {
   stdout = new EventEmitter();
   stderr = new EventEmitter();
-  stdin = { write: vi.fn(), end: vi.fn() };
+  // An emitter, as a real pipe is: an `error` on it with no listener throws.
+  stdin = Object.assign(new EventEmitter(), { write: vi.fn(), end: vi.fn() });
   killed = false;
   kill = vi.fn((_signal?: string) => { this.killed = true; this.emit('close', 0); return true; });
 }
@@ -293,6 +294,57 @@ describe('HeadlessRunner', () => {
   });
 });
 
+describe('HeadlessRunner — the runner process', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  // The run's own exit (a PTY run's submit Enter, a user reply) can race the
+  // child's death; the asynchronous EPIPE that follows used to crash the host.
+  it('survives a write to a runner that already exited', async () => {
+    const { runner, child } = makeRunner();
+    const session = await runner.spawn(baseOpts(manifest()));
+    session.write('a reply\r');
+    expect(() => child.stdin.emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))).not.toThrow();
+  });
+
+  it("leaves the host's nesting and debugging variables behind, keeping one the workspace sets", async () => {
+    vi.stubEnv('CLAUDECODE', '1');
+    vi.stubEnv('NODE_INSPECT', '1');
+    vi.stubEnv('NODE_DEBUG', 'net');
+    vi.stubEnv('NODE_OPTIONS', '--inspect');
+    vi.stubEnv('ORDEWELL_TEST_KEPT', 'yes');
+    const { runner, spawnImpl } = makeRunner();
+
+    await runner.spawn({ ...baseOpts(manifest()), env: { NODE_OPTIONS: '--max-old-space-size=8192' } });
+
+    const { env } = spawnImpl.mock.calls[0][2];
+    for (const name of ['CLAUDECODE', 'NODE_INSPECT', 'NODE_DEBUG']) expect(env).not.toHaveProperty(name);
+    expect(env.NODE_OPTIONS).toBe('--max-old-space-size=8192');
+    expect(env.ORDEWELL_TEST_KEPT).toBe('yes');
+  });
+
+  it('keeps a multibyte character whole when a read splits it', async () => {
+    const { runner, child } = makeRunner();
+    const session = await runner.spawn(baseOpts(manifest()));
+    const seen: string[] = [];
+    session.onOutput((text) => seen.push(text));
+
+    const bytes = Buffer.from('déjà 日本\n');
+    child.stdout.emit('data', bytes.subarray(0, 2));
+    child.stdout.emit('data', bytes.subarray(2, 9));
+    child.stdout.emit('data', bytes.subarray(9));
+
+    expect(seen.join('')).toBe('déjà 日本\n');
+    expect(session.getOutput()).toBe('déjà 日本\n');
+  });
+
+  it('starts the runner as the leader of its own process group, so Stop reaches what it starts', async () => {
+    const spawnImpl = vi.fn().mockReturnValue(new FakeChildProcess());
+    const runner = new HeadlessRunner({ spawnImpl: spawnImpl as unknown as SpawnFn, hasScriptCmd: () => false, resolvePath: async () => '', launchDeps: { platform: 'linux' } });
+    await runner.spawn(baseOpts(manifest()));
+    expect(spawnImpl.mock.calls[0][2].detached).toBe(true);
+  });
+});
+
 /**
  * The Windows launch route. `spawn` with `shell: false` is CreateProcess, which
  * performs no PATHEXT lookup — so the bare `test-cli` the invocation names was
@@ -326,6 +378,8 @@ describe('HeadlessRunner on Windows', () => {
     const [command, , options] = spawnImpl.mock.calls[0];
     expect(command).toBe('C:\\tools\\test-cli.exe');
     expect(options.windowsVerbatimArguments).toBeUndefined();
+    // A detached process on Windows gets a console of its own; taskkill /T already reaches the tree.
+    expect(options.detached).toBeFalsy();
   });
 
   it('routes a batch shim through cmd.exe with verbatim arguments', async () => {

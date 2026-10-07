@@ -1,8 +1,9 @@
 import type { ChildProcess } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import { augmentedPath } from '../../utils/shellPath';
 import { planDirectLaunch, isExecutableResolved, ExecutableNotFoundError } from '../../utils/launch';
 import { assertWorkspaceExists } from '../../utils/workspace';
-import { killTree } from '../../utils/processTree';
+import { killTree, spawnInOwnGroup } from '../../utils/processTree';
 import { workspaceEnvOf } from '../workspaceEnv';
 import { runnerEnv } from './runnerEnv';
 import { LineBuffer, type AgentAdapter, type AgentEvent, type AgentProcessDeps, type AgentStartOptions } from './AgentAdapter';
@@ -95,6 +96,17 @@ export abstract class StdioAgentAdapter implements AgentAdapter {
   protected async handshake(_opts: AgentStartOptions): Promise<void> {}
 
   async start(opts: AgentStartOptions): Promise<void> {
+    try {
+      await this.launch(opts);
+    } catch (err) {
+      // Neither caller keeps an adapter whose start threw, so a process left
+      // running here — a refused handshake, one that timed out — has no owner.
+      this.dispose();
+      throw err;
+    }
+  }
+
+  private async launch(opts: AgentStartOptions): Promise<void> {
     this.role = opts.kind;
     // Checked before anything else: a workspace deleted out from under a
     // stale `process.cwd()` otherwise surfaces as `spawn`'s ENOENT, which
@@ -120,19 +132,24 @@ export abstract class StdioAgentAdapter implements AgentAdapter {
     if (!isExecutableResolved(spec.command, launch, PATH, { platform: this.deps.platform, exists: this.deps.exists })) {
       throw new ExecutableNotFoundError(spec.command, PATH);
     }
-    this.process = this.deps.spawn(launch.file, launch.args, {
+    this.process = spawnInOwnGroup((detached) => this.deps.spawn(launch.file, launch.args, {
       env: this.spawnEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: opts.cwd,
       windowsVerbatimArguments: launch.verbatim,
-    });
+      detached,
+    }), this.deps.platform);
 
     // Every protocol line goes to `handleLine`, turn or no turn: an agent's
     // handshake and its session-id announcement both arrive before the first
     // message is sent, and dropping them left the handshake waiting on a reply
     // that had already come and gone.
+    // A read can end inside a multibyte character; decoding each chunk alone
+    // turns both halves into U+FFFD.
+    const stdoutText = new StringDecoder('utf8');
+    const stderrText = new StringDecoder('utf8');
     this.process.stdout?.on('data', (chunk: Buffer) => {
-      this.stdout.push(chunk.toString(), (line) => {
+      this.stdout.push(stdoutText.write(chunk), (line) => {
         // Ahead of `handleLine`, which some agents (Claude Code's subagent
         // transcript) deliberately parse into nothing at all — the process is
         // still working even on a line that yields no event.
@@ -147,7 +164,7 @@ export abstract class StdioAgentAdapter implements AgentAdapter {
       });
     });
     this.process.stderr?.on('data', (chunk: Buffer) => {
-      this.stderrTail = (this.stderrTail + chunk.toString()).slice(-STDERR_TAIL_CHARS);
+      this.stderrTail = (this.stderrTail + stderrText.write(chunk)).slice(-STDERR_TAIL_CHARS);
     });
     // A write racing the process's death (a turn, an interrupt, a permission
     // answer) fails with EPIPE asynchronously; unheard, it crashes the host.

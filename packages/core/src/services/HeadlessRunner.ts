@@ -1,13 +1,15 @@
 import { spawn as nodeSpawn, execSync, ChildProcess } from 'child_process';
+import { StringDecoder } from 'string_decoder';
 import { probeRunnerVersion, type RunnerVersionProbe } from './runnerVersion';
 import type { Writable } from 'stream';
 import { ITerminalSession } from '../interfaces/ITerminalRunner';
 import { buildRunnerInvocation } from './buildRunnerArgs';
 import { AbstractTerminalSession, AbstractRunner, type RunnerSpawnOptions } from './AbstractRunner';
-import { augmentedPath, withPath } from '../utils/shellPath';
+import { augmentedPath } from '../utils/shellPath';
 import { stripAnsi, wrapWithPty, type PtyWrapOptions } from '../utils/shell';
 import { planDirectLaunch, type LaunchDeps, type LaunchPlan } from '../utils/launch';
-import { killTree } from '../utils/processTree';
+import { killTree, spawnInOwnGroup } from '../utils/processTree';
+import { runnerEnv } from './harness/runnerEnv';
 
 export type SpawnFn = (
   command: string,
@@ -18,6 +20,8 @@ export type SpawnFn = (
     cwd: string;
     /** Set by the Windows batch route, where `args` is already a quoted command line. */
     windowsVerbatimArguments?: boolean;
+    /** Set on POSIX so the runner leads its own process group (see `spawnInOwnGroup`). */
+    detached?: boolean;
   },
 ) => ChildProcess;
 
@@ -51,7 +55,7 @@ export class HeadlessSession extends AbstractTerminalSession {
   private outputBuffer = '';
   private controlStream: Writable | null = null;
 
-  constructor(id: string, taskId: string, private spawnImpl: SpawnFn, readonly interactive: boolean = false) {
+  constructor(id: string, taskId: string, private spawnImpl: SpawnFn, readonly interactive: boolean = false, private platform: NodeJS.Platform = process.platform) {
     super(id, taskId);
   }
 
@@ -65,12 +69,17 @@ export class HeadlessSession extends AbstractTerminalSession {
     const stdio: Array<'pipe' | 'ignore'> = ['pipe', 'pipe', 'pipe'];
     if (options?.controlChannel) stdio.push('pipe');
 
-    this.process = this.spawnImpl(launch.file, launch.args, {
-      env: withPath(process.env, resolvedPath, env),
+    this.process = spawnInOwnGroup((detached) => this.spawnImpl(launch.file, launch.args, {
+      env: runnerEnv(resolvedPath, env),
       stdio,
       cwd,
       windowsVerbatimArguments: launch.verbatim,
-    });
+      detached,
+    }), this.platform);
+    // A reply or the submit Enter can race the runner's exit; the EPIPE that
+    // follows is asynchronous and, unheard, crashes the host. The exit itself
+    // is what reports the death.
+    this.process.stdin?.on('error', () => {});
 
     // A surface that opened the wrapper's control channel (PTY resizes) writes
     // into this pipe. EPIPE after the child dies is not worth surfacing — the
@@ -81,13 +90,16 @@ export class HeadlessSession extends AbstractTerminalSession {
       this.controlStream?.on('error', () => {});
     }
 
-    const onData = (data: Buffer) => {
-      const raw = data.toString();
+    // One decoder per stream: a read can end inside a multibyte character,
+    // and decoding each chunk alone turns both halves into U+FFFD.
+    const onData = (decoder: StringDecoder) => (data: Buffer) => {
+      const raw = decoder.write(data);
+      if (!raw) return;
       this.outputBuffer += stripAnsi(raw);
       this.outputEmitter.emit('output', raw);
     };
-    this.process.stdout?.on('data', onData);
-    this.process.stderr?.on('data', onData);
+    this.process.stdout?.on('data', onData(new StringDecoder('utf8')));
+    this.process.stderr?.on('data', onData(new StringDecoder('utf8')));
 
     this.process.on('close', (code) => { this.baseHandleExit(code ?? -1); });
     this.process.on('error', (err) => {
@@ -183,7 +195,7 @@ export class HeadlessRunner extends AbstractRunner<HeadlessSession> {
   }
 
   protected createSession(id: string, taskId: string): HeadlessSession {
-    return new HeadlessSession(id, taskId, this.spawnImpl, this.defaultInteractive);
+    return new HeadlessSession(id, taskId, this.spawnImpl, this.defaultInteractive, this.launchDeps.platform);
   }
 
   /** Everything up to, but not including, spawning — so a surface that owns its own child reaches the same decisions. */

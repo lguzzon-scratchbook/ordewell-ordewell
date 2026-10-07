@@ -10,6 +10,7 @@ import { AbstractTerminalSession, AbstractRunner } from './AbstractRunner';
 import { augmentedPath } from '../utils/shellPath';
 import { posixShellQuote, stripAnsi } from '../utils/shell';
 import { clipboardCopyCommand, tmuxSessionName, tmuxSocketName, tmuxWindowName } from '../utils/tmux';
+import { HOST_ONLY_VARIABLES } from './harness/runnerEnv';
 
 const EXIT_RE = /<<<ORDEWELL_TMUX_EXIT:(\d+)>>>/;
 
@@ -82,11 +83,15 @@ class TmuxSession extends AbstractTerminalSession {
   async start(command: string, args: string[], cwd: string, env?: Record<string, string>): Promise<void> {
     writeFileSync(this.logPath, '');
 
+    // The window inherits the tmux server's environment — the daemon's — so
+    // the host-only variables `runnerEnv` keeps from every other runner are
+    // unset here, ahead of the assignments that may set one on purpose.
+    const unsets = HOST_ONLY_VARIABLES.map((name) => `-u ${name}`).join(' ');
     const envAssignments = Object.entries(env ?? {})
       .map(([k, v]) => `${k}=${posixShellQuote(v)}`)
       .join(' ');
     const inner = [command, ...args].map(posixShellQuote).join(' ');
-    const prefix = envAssignments ? `env ${envAssignments} ` : '';
+    const prefix = `env ${unsets} ${envAssignments ? `${envAssignments} ` : ''}`;
     const loginShell = process.env.SHELL || '/bin/bash';
     const shellCmd = `${prefix}${inner}; printf '\\n<<<ORDEWELL_TMUX_EXIT:%s>>>\\n' "$?"; exec ${posixShellQuote(loginShell)} -l`;
 
