@@ -1,7 +1,7 @@
 import type { ITerminalRunner, ITerminalSession, RunnerTransport } from '../interfaces/ITerminalRunner';
 import type { RunnerRegistry } from '../plugins/RunnerRegistry';
 import type { RunnerSpawnOptions } from './AbstractRunner';
-import { supportsTaskMode, takesOrdewellTools } from './harness/taskAdapters';
+import { supportsTaskMode, takesOrdewellTools } from './harness/connectors';
 
 export interface TransportRoute {
   transport: RunnerTransport;

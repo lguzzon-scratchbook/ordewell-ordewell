@@ -1,15 +1,7 @@
 import type { ChildProcess } from 'child_process';
-import { StringDecoder } from 'string_decoder';
-import { augmentedPath } from '../../utils/shellPath';
-import { planDirectLaunch, isExecutableResolved, ExecutableNotFoundError } from '../../utils/launch';
-import { assertWorkspaceExists } from '../../utils/workspace';
-import { killTree, spawnInOwnGroup } from '../../utils/processTree';
-import { workspaceEnvOf } from '../workspaceEnv';
-import { runnerEnv } from './runnerEnv';
+import { RunnerProcess } from './runnerProcess';
 import { LineBuffer, type AgentAdapter, type AgentEvent, type AgentProcessDeps, type AgentStartOptions } from './AgentAdapter';
 
-/** Stderr kept for the failure message; a dying CLI's last words are the only useful diagnostic. */
-const STDERR_TAIL_CHARS = 4000;
 /** An idle agent that chatters must not grow the between-turn buffer without bound. */
 const BETWEEN_TURN_EVENT_CAP = 50;
 
@@ -38,8 +30,8 @@ export interface SpawnSpec {
  *
  * Subclasses own their agent's protocol: what to spawn, how to phrase a user
  * turn, and how to read one protocol line. Everything below — line framing,
- * turn lifecycle, abort, stderr capture, premature-exit detection — is the
- * same for all of them.
+ * turn lifecycle, abort — is the same for all of them, and the process itself
+ * is a {@link RunnerProcess}.
  */
 export abstract class StdioAgentAdapter implements AgentAdapter {
   abstract readonly agentId: string;
@@ -47,8 +39,7 @@ export abstract class StdioAgentAdapter implements AgentAdapter {
   protected process: ChildProcess | null = null;
   protected sessionId: string | null = null;
   private readonly stdout = new LineBuffer();
-  private stderrTail = '';
-  private exited: { code: number | null; signal: string | null } | null = null;
+  private readonly runner: RunnerProcess;
   /** Set for the duration of a turn. Outside one, events are buffered rather than dropped. */
   private turnEmit: ((event: AgentEvent) => void) | null = null;
   /** Set for the duration of a turn. Pinged on every raw line, whether or not `handleLine` turns it into an event. */
@@ -70,15 +61,12 @@ export abstract class StdioAgentAdapter implements AgentAdapter {
   /** A task's session, which wants what the agent says on its own after a turn closed; a planner registers none and drops it. */
   private outOfTurnListener: ((event: AgentEvent) => void) | null = null;
   private disposed = false;
-  /** Resolves when the process ends, so a handshake can lose the race instead of waiting out its timeout. */
-  protected processEnded!: Promise<void>;
-  /** The environment the agent was spawned under, for any side process a handshake needs. */
-  protected spawnEnv: NodeJS.ProcessEnv = {};
-  private markEnded: (() => void) | null = null;
   /** What this process is to the user — a planner or a task's runner — for the words a failure is reported in. */
   protected role: 'planner' | 'task' = 'planner';
 
-  constructor(protected deps: AgentProcessDeps) {}
+  constructor(protected deps: AgentProcessDeps) {
+    this.runner = new RunnerProcess(deps);
+  }
 
   /** The command line that starts this agent in its read-only mode. */
   protected abstract spawnSpec(opts: AgentStartOptions): SpawnSpec;
@@ -96,93 +84,55 @@ export abstract class StdioAgentAdapter implements AgentAdapter {
   protected async handshake(_opts: AgentStartOptions): Promise<void> {}
 
   async start(opts: AgentStartOptions): Promise<void> {
+    this.role = opts.kind;
     try {
-      await this.launch(opts);
+      await this.runner.start(opts.cwd, () => {
+        const spec = this.spawnSpec(opts);
+        return { command: spec.command, args: spec.args, env: () => spec.env ?? {} };
+      }, (child) => {
+        this.process = child;
+        this.readProtocol();
+        return this.handshake(opts);
+      });
     } catch (err) {
-      // Neither caller keeps an adapter whose start threw, so a process left
-      // running here — a refused handshake, one that timed out — has no owner.
+      // The runner is already down; what goes here is the adapter's own — a
+      // subclass's per-process files among it.
       this.dispose();
       throw err;
     }
   }
 
-  private async launch(opts: AgentStartOptions): Promise<void> {
-    this.role = opts.kind;
-    // Checked before anything else: a workspace deleted out from under a
-    // stale `process.cwd()` otherwise surfaces as `spawn`'s ENOENT, which
-    // reads as a missing agent binary rather than a missing directory.
-    assertWorkspaceExists(opts.cwd, { isDirectory: this.deps.isDirectory });
-    this.processEnded = new Promise<void>((resolve) => { this.markEnded = resolve; });
-    const spec = this.spawnSpec(opts);
-    const resolvePath = this.deps.resolvePath ?? augmentedPath;
-    // Same PATH treatment as model discovery and the headless runner: the
-    // agent binary must resolve wherever the user installed it, even under the
-    // minimal PATH a GUI-launched host inherits.
-    const PATH = await resolvePath();
-
-    const workspace = await (this.deps.workspaceEnv ?? workspaceEnvOf)(opts.cwd);
-    this.spawnEnv = runnerEnv(PATH, { ...workspace, ...spec.env });
-    // On POSIX this hands back `spec` untouched; on Windows it resolves the
-    // agent's `.exe` (or routes its `.cmd` shim through cmd.exe), because
-    // CreateProcess performs no PATHEXT lookup of its own.
-    const launch = await planDirectLaunch(spec.command, spec.args, {
-      platform: this.deps.platform,
-      resolvePath,
-    });
-    if (!isExecutableResolved(spec.command, launch, PATH, { platform: this.deps.platform, exists: this.deps.exists })) {
-      throw new ExecutableNotFoundError(spec.command, PATH);
-    }
-    this.process = spawnInOwnGroup((detached) => this.deps.spawn(launch.file, launch.args, {
-      env: this.spawnEnv,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: opts.cwd,
-      windowsVerbatimArguments: launch.verbatim,
-      detached,
-    }), this.deps.platform);
-
-    // Every protocol line goes to `handleLine`, turn or no turn: an agent's
-    // handshake and its session-id announcement both arrive before the first
-    // message is sent, and dropping them left the handshake waiting on a reply
-    // that had already come and gone.
-    // A read can end inside a multibyte character; decoding each chunk alone
-    // turns both halves into U+FFFD.
-    const stdoutText = new StringDecoder('utf8');
-    const stderrText = new StringDecoder('utf8');
-    this.process.stdout?.on('data', (chunk: Buffer) => {
-      this.stdout.push(stdoutText.write(chunk), (line) => {
-        // Ahead of `handleLine`, which some agents (Claude Code's subagent
-        // transcript) deliberately parse into nothing at all — the process is
-        // still working even on a line that yields no event.
-        this.turnActivity?.();
-        this.handleLine(line, (event) => {
-          if (this.turnEmit) this.turnEmit(event);
-          else if (this.hadTurn && this.outOfTurnListener) this.outOfTurnListener(event);
-          else if (!this.hadTurn && !TURN_SCOPED_EVENTS.has(event.type) && this.betweenTurns.length < BETWEEN_TURN_EVENT_CAP) {
-            this.betweenTurns.push(event);
-          }
-        });
+  /**
+   * Every protocol line goes to `handleLine`, turn or no turn: an agent's
+   * handshake and its session-id announcement both arrive before the first
+   * message is sent, and dropping them left the handshake waiting on a reply
+   * that had already come and gone.
+   */
+  private readProtocol(): void {
+    this.runner.readStdout((text) => this.stdout.push(text, (line) => {
+      // Ahead of `handleLine`, which some agents (Claude Code's subagent
+      // transcript) deliberately parse into nothing at all — the process is
+      // still working even on a line that yields no event.
+      this.turnActivity?.();
+      this.handleLine(line, (event) => {
+        if (this.turnEmit) this.turnEmit(event);
+        else if (this.hadTurn && this.outOfTurnListener) this.outOfTurnListener(event);
+        else if (!this.hadTurn && !TURN_SCOPED_EVENTS.has(event.type) && this.betweenTurns.length < BETWEEN_TURN_EVENT_CAP) {
+          this.betweenTurns.push(event);
+        }
       });
-    });
-    this.process.stderr?.on('data', (chunk: Buffer) => {
-      this.stderrTail = (this.stderrTail + stderrText.write(chunk)).slice(-STDERR_TAIL_CHARS);
-    });
-    // A write racing the process's death (a turn, an interrupt, a permission
-    // answer) fails with EPIPE asynchronously; unheard, it crashes the host.
-    // The exit path already reports the death, with its stderr tail.
-    this.process.stdin?.on('error', () => {});
-    this.process.on('exit', (code, signal) => { this.exited = { code, signal }; this.markEnded?.(); });
-    this.process.on('error', (err) => {
-      this.stderrTail = (this.stderrTail + `\n${err.message}`).slice(-STDERR_TAIL_CHARS);
-      this.exited = { code: -1, signal: null };
-      this.markEnded?.();
-    });
-
-    await this.handshake(opts);
+    }));
   }
+
+  /** Resolves when the process ends, so a handshake can lose the race instead of waiting out its timeout. */
+  protected get processEnded(): Promise<void> { return this.runner.ended; }
+
+  /** The environment the agent was spawned under, for any side process a handshake needs. */
+  protected get spawnEnv(): NodeJS.ProcessEnv { return this.runner.env; }
 
   async send(message: string, onEvent: (event: AgentEvent) => void, signal?: AbortSignal, onActivity?: () => void): Promise<void> {
     if (!this.process) throw new Error(`${this.agentId} ${this.role} session is not started`);
-    if (this.exited) {
+    if (this.runner.exit) {
       onEvent({ type: 'error', message: this.exitMessage() });
       return;
     }
@@ -251,9 +201,9 @@ export abstract class StdioAgentAdapter implements AgentAdapter {
   nativeSessionId(): string | null { return this.sessionId; }
 
   onProcessExit(listener: (code: number) => void): void {
-    const fire = () => listener(this.exited?.code ?? -1);
-    if (this.exited) queueMicrotask(fire);
-    else void this.processEnded.then(fire);
+    const fire = () => listener(this.runner.exitCode);
+    if (this.runner.exit) queueMicrotask(fire);
+    else void this.runner.ended.then(fire);
   }
 
   dispose(): void {
@@ -261,12 +211,8 @@ export abstract class StdioAgentAdapter implements AgentAdapter {
     this.disposed = true;
     this.turnEmit = null;
     this.outOfTurnListener = null;
-    const proc = this.process;
     this.process = null;
-    // Tree-wide, because on Windows the direct child may be the cmd.exe shim
-    // rather than the agent. The forced follow-up is scheduled and unref'd, so
-    // a disposed planner is never the reason the host refuses to exit.
-    killTree(proc, { platform: this.deps.platform });
+    this.runner.dispose();
   }
 
   /** Write one raw protocol line to the agent. */
@@ -276,11 +222,7 @@ export abstract class StdioAgentAdapter implements AgentAdapter {
 
   /** Fail-safe contract: a dead agent reports its own last words, never an empty bubble. */
   protected exitMessage(): string {
-    const how = this.exited?.signal
-      ? `was killed (${this.exited.signal})`
-      : `exited with code ${this.exited?.code ?? 'unknown'}`;
-    const tail = this.stderrTail.trim();
-    return `The ${this.agentId} ${this.role === 'task' ? 'task runner' : 'planner'} ${how}.${tail ? `\n\n${tail}` : ''}`;
+    return this.runner.withStderrTail(`The ${this.agentId} ${this.role === 'task' ? 'task runner' : 'planner'} ${this.runner.describeExit()}.`);
   }
 
   /** Parse a protocol line, ignoring the non-JSON banners some CLIs print. */

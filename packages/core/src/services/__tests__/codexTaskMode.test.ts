@@ -7,7 +7,7 @@ import { RunnerRegistry } from '../../plugins/RunnerRegistry';
 import { StructuredRunner } from '../StructuredRunner';
 import { isStructuredSession, type StructuredEvent } from '../../interfaces/ITerminalRunner';
 import { mcpClientConfig } from '../mcp';
-import { takesOrdewellTools } from '../harness/taskAdapters';
+import { takesOrdewellTools } from '../harness/connectors';
 import { modeIds, fakeSpawn, fixture, type FakeSpawnOptions, type ScriptedReply } from './harnessTestKit';
 
 /**

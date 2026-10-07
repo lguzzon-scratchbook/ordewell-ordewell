@@ -362,6 +362,16 @@ declared, so none of the three can drift apart.
 *Avoid:* conflating it with `RunnerRegistry`, which holds *manifests* (identity
 and invocation, and exists for every runner, plugin included); "adapter table".
 
+**Runner process** (`RunnerProcess`, `harness/runnerProcess.ts`) — the one OS
+process a connector's adapter drives, whatever its protocol: launched under the
+cleaned runner environment in its own process group, its output decoded as
+UTF-8, its stderr tail kept for the failure message, its end observable, and
+its whole tree killed on dispose (**Kill tree**). Its `start` runs the
+adapter's handshake and takes the process down if that throws. The stdio
+adapters and OpenCode's server both build on it, so a lifecycle fix lands once;
+the protocol stays in the adapter.
+*Avoid:* spawning or killing a runner in an adapter directly.
+
 **Ordewell tool binding** (`OrdewellToolBinding`) — how one connector hands its
 runner the Ordewell MCP server (ADR-0022). It covers the runner's names for the
 server's tools (`toolName`/`toolNames`), which of the runner's permission

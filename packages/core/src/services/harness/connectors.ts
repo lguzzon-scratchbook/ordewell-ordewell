@@ -1,4 +1,4 @@
-import type { AgentAdapter, AgentProcessDeps, TaskModeAgentAdapter } from './AgentAdapter';
+import { TaskModeUnsupportedError, type AgentAdapter, type AgentProcessDeps, type TaskModeAgentAdapter } from './AgentAdapter';
 import { ClaudeCodeAdapter } from './ClaudeCodeAdapter';
 import { CodexAdapter } from './CodexAdapter';
 import { OpenCodeAdapter } from './OpenCodeAdapter';
@@ -40,4 +40,21 @@ export function connectorFor(runner: string): RunnerConnector | undefined {
 /** A harness planner for a runner, or null when the runner cannot plan. */
 export function createPlannerAdapter(runner: string, deps: AgentProcessDeps): AgentAdapter | null {
   return connectorFor(runner)?.create(deps) ?? null;
+}
+
+/** Whether a runner's tasks can run on the structured transport (ADR-0018, S3). */
+export function supportsTaskMode(runner: string): boolean {
+  return connectorFor(runner) !== undefined;
+}
+
+/** Whether a structured task on this runner is given the Ordewell task tools (ADR-0022). */
+export function takesOrdewellTools(runner: string): boolean {
+  return connectorFor(runner)?.ordewellTools !== undefined;
+}
+
+/** The adapter that drives one task. Throws {@link TaskModeUnsupportedError} for a runner without a connector. */
+export function createTaskAdapter(runner: string, deps: AgentProcessDeps): TaskModeAgentAdapter {
+  const connector = connectorFor(runner);
+  if (!connector) throw new TaskModeUnsupportedError(runner);
+  return connector.create(deps);
 }
