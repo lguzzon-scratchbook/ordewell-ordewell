@@ -1,27 +1,25 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useReducer, useRef } from 'react';
 import EmptyState from './components/EmptyState';
 import GetStarted from './components/GetStarted';
 import ChatInput from './components/ChatInput';
 import DockResizeHandle from './components/DockResizeHandle';
 import { ConversationBlocks } from './components/ChatMessage';
-import { appendTaskOutput, type TaskOutputMap } from './taskOutput';
+import { reduceHost, INITIAL_HOST_STATE, type HostState } from './hostState';
 import ModelSelector, { API_PROVIDER_LABELS } from './components/ModelSelector';
 import PlanCardGroup from './components/PlanCardGroup';
 import UsageLine from './components/UsageLine';
 import QueuedPrompts from './components/QueuedPrompts';
 import HandoffCard from './components/HandoffCard';
 import CheckpointPanel from './components/CheckpointPanel';
-import type { RunnerMode } from './components/TaskCard';
 import type { TaskDraft } from './components/NewTaskCard';
-import type { LegacyPlanState, DiscoveredModel, Task, TaskModelAssignment, RunnerId, RunnerTransport, IsolationHandoff, IsolationMergeResult, MergeGateView, TaskIsolation } from '@ordewell/core';
-import type { AiProvider } from '@ordewell/core';
-import { isPlanRevision, planSummaryLabel, nextDock } from './planDock';
+import type { Task, TaskModelAssignment, RunnerId, RunnerTransport } from '@ordewell/core';
+import { planSummaryLabel, nextDock } from './planDock';
 import { DetailContext } from './detail';
 import { useFollowOutput } from './followOutput';
 import { slashHelp } from '../../commands/slashCommands';
-import type { HostToWebview, PendingPlanEdit, PlannerBackend, RunnerMeta, WebviewToHost } from '../../shared/protocol';
-import { EMPTY_HOLD, hasHiddenDetail, type PromptHold } from '@ordewell/core/plan-utils';
-import { applyConversationPatch, EMPTY_PATCHED_VIEW, patchedBlocks, type PatchedView } from '../../shared/conversationPatch';
+import type { HostToWebview, PendingPlanEdit, WebviewToHost } from '../../shared/protocol';
+import { hasHiddenDetail } from '@ordewell/core/plan-utils';
+import { patchedBlocks } from '../../shared/conversationPatch';
 
 declare function acquireVsCodeApi(): {
   postMessage(message: WebviewToHost): void;
@@ -33,84 +31,47 @@ const vscode = acquireVsCodeApi();
 
 const STOP_ARM_MS = 2_000;
 
-interface RunnerInfo {
-  id: string;
-  displayName: string;
-}
+type Updatable<T> = T | ((prev: T) => T);
 
 export default function App() {
-  /** The planner conversation, held by the host and patched in here (#53). */
-  const [conversation, setConversation] = useState<PatchedView>(EMPTY_PATCHED_VIEW);
+  const [host, dispatch] = useReducer(reduceHost, INITIAL_HOST_STATE);
+  const {
+    conversation, plan, isExecuting, isResearchActive, conversationBusy, error, models, modelsByRunner,
+    runnerList, enabledRunnerIds, runners, pendingEdits, held, unsent, modesByRunner, modelConfig,
+    modelOptions, configuredProviders, planner, isReady, modelDiscoveryErrors, tddEnabled, verifyEnabled,
+    runnerTransport, skills, checkpoint, taskOutput, taskIdle, taskApprovals, taskIsolation, handoff,
+    mergeResult, mergeGate, taskGates, dockExpanded, dockHeight,
+  } = host;
+  const patch = useCallback(<K extends keyof HostState>(key: K, value: HostState[K] | ((prev: HostState[K]) => HostState[K])) => {
+    dispatch({ type: 'patch', patch: { [key]: value } });
+  }, []);
+  const setPlan = useCallback((v: Updatable<HostState['plan']>) => patch('plan', v), [patch]);
+  const setIsResearchActive = useCallback((v: boolean) => patch('isResearchActive', v), [patch]);
+  const setIsExecuting = useCallback((v: boolean) => patch('isExecuting', v), [patch]);
+  const setError = useCallback((v: string) => patch('error', v), [patch]);
+  const setIsReady = useCallback((v: boolean) => patch('isReady', v), [patch]);
+  const setRunners = useCallback((v: Updatable<RunnerId[]>) => patch('runners', v), [patch]);
+  const setPendingEdits = useCallback((v: Updatable<PendingPlanEdit[]>) => patch('pendingEdits', v), [patch]);
+  const setTddEnabled = useCallback((v: boolean) => patch('tddEnabled', v), [patch]);
+  const setVerifyEnabled = useCallback((v: boolean) => patch('verifyEnabled', v), [patch]);
+  const setRunnerTransport = useCallback((v: RunnerTransport) => patch('runnerTransport', v), [patch]);
+  const setCheckpoint = useCallback((v: HostState['checkpoint']) => patch('checkpoint', v), [patch]);
+  const setDockHeight = useCallback((v: number | undefined) => patch('dockHeight', v), [patch]);
+  const setDockExpanded = useCallback((v: Updatable<boolean>) => patch('dockExpanded', v), [patch]);
   const blocks = useMemo(() => patchedBlocks(conversation), [conversation]);
   const [detailAll, setDetailAll] = useState(false);
   const detail = useMemo(() => ({ detailAll, setDetailAll }), [detailAll]);
-  const [plan, setPlan] = useState<LegacyPlanState | null>(null);
-  const [isExecuting, setIsExecuting] = useState(false);
-  const [isResearchActive, setIsResearchActive] = useState(false);
-  const [conversationBusy, setConversationBusy] = useState(false);
-  const [error, setError] = useState<string>('');
-  const [models, setModels] = useState<DiscoveredModel[]>([]);
-  const [modelsByRunner, setModelsByRunner] = useState<Partial<Record<string, DiscoveredModel[]>>>({});
-  const [runnerList, setRunnerList] = useState<RunnerInfo[]>([]);
-  const [enabledRunnerIds, setEnabledRunnerIds] = useState<string[]>(['claude-code']);
-  const [runners, setRunners] = useState<RunnerId[]>(['claude-code']);
-  const [pendingEdits, setPendingEdits] = useState<PendingPlanEdit[]>([]);
-  /** Queued prompts: what the host is holding for the next planner turn. */
-  const [held, setHeld] = useState<PromptHold>(EMPTY_HOLD);
-  /** The last queued text the host gave back, for the input to take in. `seq` makes a repeat of the same words land again. */
   /** A first Esc during a planner turn: one more within `STOP_ARM_MS` stops it. */
   const [stopArmed, setStopArmed] = useState(false);
-  const [unsent, setUnsent] = useState<{ text: string; seq: number } | null>(null);
-  const [, setCurrentGoal] = useState<string>('');
   const [showModelInfo, setShowModelInfo] = useState(false);
   const [slashOutput, setSlashOutput] = useState('');
-  const [modesByRunner, setModesByRunner] = useState<Record<string, RunnerMode[]>>({});
-  const [modelConfig, setModelConfig] = useState<{ orchestrator: string; orchestratorProvider?: string } | null>(null);
-  const [modelOptions, setModelOptions] = useState<{ id: string; label: string; provider: string; apiProvider?: AiProvider; description?: string; pricing?: string }[]>([]);
-  const [configuredProviders, setConfiguredProviders] = useState<AiProvider[]>([]);
-  /** Who plans (ADR-0009): the backends offered, the one in use, and its runner + effort. */
-  const [planner, setPlanner] = useState<{
-    backends: PlannerBackend[];
-    provider: string;
-    runner?: string;
-    effort?: string;
-  }>({ backends: [], provider: '' });
-  const [isReady, setIsReady] = useState(false);
-  const [, setModelApiMapping] = useState<Record<string, AiProvider[]>>({});
-  const [modelDiscoveryErrors, setModelDiscoveryErrors] = useState<Record<string, string>>({});
   const [showNewSessionConfirm, setShowNewSessionConfirm] = useState(false);
   const [setupCollapsed, setSetupCollapsed] = useState(false);
-  const [tddEnabled, setTddEnabled] = useState(true);
-  const [verifyEnabled, setVerifyEnabled] = useState(false);
-  const [runnerTransport, setRunnerTransport] = useState<RunnerTransport>('structured');
-  /** Discovered skills (~/.ordewell/skills/ + .ordewell/skills/) for the /skill-name suggestion dropdown. */
-  const [skills, setSkills] = useState<{ name: string; description: string }[]>([]);
-  const [checkpoint, setCheckpoint] = useState<{ taskId: string; taskTitle: string; summary: string; pausedAt: number } | null>(null);
-  const [taskOutput, setTaskOutput] = useState<TaskOutputMap>({});
-  /** Advisory silence timestamp per task id, keyed like taskOutput; null/absent means not stalled. */
-  const [taskIdle, setTaskIdle] = useState<Record<string, string | null>>({});
-  const [taskApprovals, setTaskApprovals] = useState<Record<string, number>>({});
-  /** Per-task isolation state (ADR-0013); only tasks an isolated run has touched appear. */
-  const [taskIsolation, setTaskIsolation] = useState<Record<string, TaskIsolation>>({});
-  /** The end-of-run handoff card, present until the run is merged, discarded or restarted. */
-  const [handoff, setHandoff] = useState<IsolationHandoff | null>(null);
-  /** What the last Merge all did; a blocked or part-landed group stays visible until the run clears. */
-  const [mergeResult, setMergeResult] = useState<IsolationMergeResult | null>(null);
-  /** While tasks wait at a merge gate (ADR-0020): what Merge all would merge now. */
-  const [mergeGate, setMergeGate] = useState<MergeGateView | null>(null);
-  /** Per task id, the dependencies it waits on at its merge gate. */
-  const [taskGates, setTaskGates] = useState<Record<string, string[]>>({});
-  /** Is the plan dock open? See planDock.ts for when this flips. */
-  const [dockExpanded, setDockExpanded] = useState(false);
-  /** The dock's dragged cap in px, remembered by the host; undefined keeps the stylesheet's default. */
-  const [dockHeight, setDockHeight] = useState<number | undefined>(undefined);
 
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const dockBodyRef = useRef<HTMLDivElement>(null);
   const helpTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const processingRef = useRef(false);
-  const stoppedRef = useRef(false);
-  const sessionClearedRef = useRef(false);
   const lastActivityRef = useRef(Date.now());
   const planRef = useRef(plan);
   planRef.current = plan;
@@ -134,247 +95,8 @@ export default function App() {
 
   useEffect(() => {
     const handler = (event: MessageEvent<HostToWebview>) => {
-      const msg = event.data;
       lastActivityRef.current = Date.now();
-      switch (msg.type) {
-        case 'setState':
-          // The conversation is not cleared here: the host owns it and resets
-          // it itself when the session really is new.
-          if (msg.state === 'empty') {
-            setError('');
-            setPlan(null);
-            setCheckpoint(null);
-            setTaskOutput({});
-            setTaskIdle({});
-            setTaskApprovals({});
-            setTaskIsolation({});
-            setHandoff(null);
-            setMergeResult(null);
-            setMergeGate(null);
-            setTaskGates({});
-            setPendingEdits([]);
-            setDockExpanded((v) => nextDock(v, 'session-reset'));
-          }
-          setIsResearchActive(msg.state === 'researching');
-          setIsExecuting(msg.state === 'approved');
-          break;
-
-        case 'planUpdated': {
-          if (stoppedRef.current) break;
-          const incoming: LegacyPlanState | null = msg.plan ?? null;
-          setPlan(incoming);
-          // Not a turn's end: a run's status tick arrives mid-turn too, and
-          // the host's `plannerTurn` is what says a turn is over.
-          if (incoming) {
-            setIsExecuting(incoming.status === 'running');
-          }
-          if (incoming && incoming.tasks && incoming.tasks.length > 0) {
-            // One `planUpdated` carries two different events. A revision opens
-            // the dock; a status tick during execution must not, or a running
-            // plan would fight a user who collapsed it. The conversation's plan
-            // marker comes from the host with the view.
-            const previous = planRef.current?.tasks ?? [];
-            if (isPlanRevision(previous, incoming.tasks)) {
-              setDockExpanded((v) => nextDock(v, 'plan-revised'));
-            } else {
-              setDockExpanded((v) => nextDock(v, 'plan-progressed'));
-            }
-          }
-          break;
-        }
-
-        case 'restoreChat': {
-          // A session was (re)loaded (session load, webview reload, window
-          // restore); its conversation follows as a patch. Also clears stuck
-          // state: a restore always leaves the chat usable. The plan is cleared
-          // here so a session with no tasks does not keep the previously-loaded
-          // session's plan cards — a follow-up planUpdated repopulates it when
-          // the restored session has tasks.
-          stoppedRef.current = false;
-          sessionClearedRef.current = false;
-          setIsResearchActive(false);
-          setIsExecuting(false);
-          setError('');
-          setCheckpoint(null);
-          setPlan(null);
-          setTaskOutput({});
-          setTaskIsolation({});
-          setHandoff(null);
-          setMergeResult(null);
-          setMergeGate(null);
-          setTaskGates({});
-          // A restore is followed by the host's own pendingPlanEdits; clearing
-          // here keeps a stale session's edits from flashing until they land.
-          setPendingEdits([]);
-          setHeld(EMPTY_HOLD);
-          setDockExpanded((v) => nextDock(v, 'session-reset'));
-          break;
-        }
-
-        case 'conversationPatch':
-          setConversation((prev) => applyConversationPatch(prev, msg));
-          break;
-
-        // The stop gate lasts until the host has closed the stopped turn; a
-        // new turn is never gated.
-        case 'plannerTurn':
-          stoppedRef.current = false;
-          setIsResearchActive(msg.active);
-          break;
-
-        // Nothing to draw: arriving at all is what keeps the watchdog quiet.
-        case 'plannerLiveness':
-          break;
-
-        case 'conversationBusy':
-          setConversationBusy(!!msg.busy);
-          break;
-
-        case 'showError':
-          if (sessionClearedRef.current) break;
-          setError(msg.error);
-          setIsResearchActive(false);
-          break;
-
-        case 'taskOutput':
-          setTaskOutput((prev) => appendTaskOutput(prev, msg.taskId, msg.text ?? ''));
-          break;
-
-        case 'taskIdle':
-          setTaskIdle((prev) => ({ ...prev, [msg.taskId]: msg.idleSince }));
-          break;
-
-        case 'taskApprovals':
-          setTaskApprovals((prev) => ((prev[msg.taskId] ?? 0) === msg.count ? prev : { ...prev, [msg.taskId]: msg.count }));
-          break;
-
-        case 'taskIsolation':
-          setTaskIsolation((prev) => ({ ...prev, [msg.taskId]: msg.isolation }));
-          break;
-
-        case 'isolationHandoff':
-          setHandoff({
-            repos: msg.repos ?? [],
-            landed: msg.landed ?? [],
-          });
-          break;
-
-        case 'isolationMergeResult':
-          setMergeResult(msg.result ?? null);
-          break;
-
-        case 'isolationCleared':
-          setTaskIsolation({});
-          setHandoff(null);
-          setMergeResult(null);
-          setMergeGate(null);
-          setTaskGates({});
-          break;
-
-        case 'mergeGate':
-          setMergeGate(msg.gate ?? null);
-          setTaskGates(msg.tasks ?? {});
-          break;
-
-        case 'setModels':
-          setModels(msg.models ?? []);
-          break;
-
-        case 'setModelsByRunner':
-          setModelsByRunner(msg.modelsByRunner ?? {});
-          break;
-
-        case 'setModesByRunner':
-          setModesByRunner(msg.modesByRunner ?? {});
-          break;
-
-        case 'setModelConfig':
-          setModelConfig(msg.modelConfig ?? null);
-          break;
-
-        case 'setModelOptions':
-          setModelOptions(msg.modelOptions ?? []);
-          break;
-
-        case 'setConfiguredProviders':
-          setConfiguredProviders(msg.providers ?? []);
-          setIsReady(true);
-          break;
-
-        case 'setPlannerBackends':
-          setPlanner({
-            backends: msg.backends ?? [],
-            provider: msg.provider ?? '',
-            runner: msg.runner,
-            effort: msg.effort || undefined,
-          });
-          break;
-
-        case 'setModelDiscoveryErrors':
-          setModelDiscoveryErrors(msg.errors ?? {});
-          break;
-        case 'setModelApiMapping':
-          setModelApiMapping(msg.modelApiMapping ?? {});
-          break;
-
-        case 'setRunners': {
-          const list = msg.runners ?? [];
-          const ids = list.filter((r: RunnerMeta) => r.enabled).map((r: RunnerMeta) => r.id);
-          setRunnerList(list.map((r: RunnerMeta) => ({ id: r.id, displayName: r.displayName })));
-          setEnabledRunnerIds(ids);
-          setRunners((prev) => {
-            if (ids.length === 1) return ids;
-            if (ids.length === 0) return ['claude-code'];
-            const valid = prev.filter((r) => ids.includes(r));
-            return valid.length > 0 ? valid : ids;
-          });
-          break;
-        }
-
-        case 'pendingPlanEdits':
-          setPendingEdits(msg.edits ?? []);
-          break;
-
-        case 'heldPrompts':
-          setHeld(msg.prompts);
-          break;
-
-        case 'promptUnsent':
-          setUnsent((prev) => ({ text: msg.text, seq: (prev?.seq ?? 0) + 1 }));
-          break;
-
-        case 'setGoal':
-          setCurrentGoal(msg.goal ?? '');
-          break;
-
-        case 'setSkillToggles':
-          if (msg.toggles) {
-            setTddEnabled(msg.toggles.tdd ?? true);
-            setVerifyEnabled(msg.toggles.verify ?? false);
-          }
-          break;
-
-        case 'setSkills':
-          setSkills(msg.skills ?? []);
-          break;
-
-        case 'runnerTransport':
-          setRunnerTransport(msg.transport);
-          break;
-
-        case 'planDockHeight':
-          setDockHeight(msg.height);
-          break;
-
-        case 'checkpoint':
-          setCheckpoint({
-            taskId: msg.taskId ?? '',
-            taskTitle: msg.taskTitle ?? '',
-            summary: msg.summary ?? '',
-            pausedAt: Date.now(),
-          });
-          break;
-      }
+      dispatch({ ...event.data, now: Date.now() });
     };
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
@@ -409,22 +131,7 @@ export default function App() {
   }, [isResearchActive, pushSystem]);
 
   const handleNewSession = useCallback(() => {
-    stoppedRef.current = true;
-    sessionClearedRef.current = true;
-    setPlan(null);
-    setIsResearchActive(false);
-    setIsExecuting(false);
-    setError('');
-    setCheckpoint(null);
-    setTaskOutput({});
-    setTaskIsolation({});
-    setHandoff(null);
-    setMergeResult(null);
-    setMergeGate(null);
-    setTaskGates({});
-    setPendingEdits([]);
-    setHeld(EMPTY_HOLD);
-    setDockExpanded((v) => nextDock(v, 'session-reset'));
+    dispatch({ type: 'resetSession', kind: 'new' });
     // A distinct message from stopResearch: /new resets the whole session,
     // while Stop only aborts the current planner turn.
     vscode.postMessage({ type: 'newSession' });
@@ -466,12 +173,9 @@ export default function App() {
     setSlashOutput('');
     clearTimeout(helpTimerRef.current);
     setShowNewSessionConfirm(false);
-    stoppedRef.current = false;
-    sessionClearedRef.current = false;
-    setError('');
     // Locked at once rather than when the turn opens: the host may take a
     // moment to start it, and a second send in between would race the first.
-    setIsResearchActive(true);
+    dispatch({ type: 'turnRequested' });
     vscode.postMessage({ type: 'sendMessage', text, runners, typed: true });
   }, [runners, handleNewSession, showNewSessionConfirm, isResearchActive]);
 
@@ -630,8 +334,7 @@ export default function App() {
   }, []);
 
   const stopTurn = useCallback(() => {
-    stoppedRef.current = true;
-    setIsResearchActive(false);
+    dispatch({ type: 'turnStopped' });
     vscode.postMessage({ type: 'stopResearch' });
   }, []);
 
