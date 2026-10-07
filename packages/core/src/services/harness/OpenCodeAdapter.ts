@@ -1,12 +1,6 @@
 import type { ChildProcess } from 'child_process';
 import { randomBytes } from 'crypto';
-import { StringDecoder } from 'string_decoder';
-import { augmentedPath } from '../../utils/shellPath';
-import { planDirectLaunch, isExecutableResolved, ExecutableNotFoundError } from '../../utils/launch';
-import { assertWorkspaceExists } from '../../utils/workspace';
-import { killTree, spawnInOwnGroup } from '../../utils/processTree';
-import { workspaceEnvOf } from '../workspaceEnv';
-import { runnerEnv } from './runnerEnv';
+import { RunnerProcess } from './runnerProcess';
 import { OpenCodeV2 } from './OpenCodeV2';
 import { OPENCODE_ORDEWELL } from './openCodeOrdewell';
 import { awaitAttach } from './ordewellBinding';
@@ -20,7 +14,6 @@ import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { AgentEvent, AgentProcessDeps, AgentStartOptions, PlannerStartOptions, TaskModeAgentAdapter, TaskStartOptions } from './AgentAdapter';
 
 const SERVER_READY_TIMEOUT_MS = 30000;
-const STDERR_TAIL_CHARS = 4000;
 /** The banner is one short line; a longer unterminated one is not it, and is not kept growing. */
 const BANNER_LINE_CHARS = 4000;
 /** See {@link OpenCodeAdapter.recoverReply}. */
@@ -241,8 +234,8 @@ function newTurnState(): TurnState {
  * (ADR-0009, ADR-0018).
  *
  * The odd one out: `opencode serve` is a real server rather than a stdio
- * protocol, so this adapter owns both halves of the boundary — it spawns the
- * process through the same injected `spawn` every other adapter uses, then
+ * protocol, so this adapter owns both halves of the boundary — it starts the
+ * process as the same {@link RunnerProcess} every other adapter uses, then
  * talks to it through the injected `fetch`. Both are part of the one seam the
  * tests drive.
  *
@@ -262,12 +255,8 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   /** Sent on every request to a task's server, which a per-task password secures. */
   private authorization: string | null = null;
   private sessionId: string | null = null;
-  private stderrTail = '';
-  private exited = false;
-  private exitCode = -1;
+  private readonly runner: RunnerProcess;
   private disposed = false;
-  private markEnded: () => void = () => {};
-  private readonly processEnded = new Promise<void>((resolve) => { this.markEnded = resolve; });
   private planner: PlannerStartOptions | null = null;
   private task: TaskStartOptions | null = null;
   /** The last assistant message already settled — the baseline {@link recoverReply} measures a new reply against. */
@@ -286,15 +275,18 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   /** The Ordewell server this process was configured with; null when none was given or its config could not be merged. */
   private ordewell: McpClientConfig | null = null;
 
-  constructor(private deps: AgentProcessDeps) {}
+  constructor(private deps: AgentProcessDeps) {
+    this.runner = new RunnerProcess(deps);
+  }
+
+  private get processEnded(): Promise<void> { return this.runner.ended; }
+  private get exited(): boolean { return this.runner.exit !== null; }
 
   async start(opts: AgentStartOptions): Promise<void> {
     try {
       await this.launch(opts);
     } catch (err) {
-      // Neither caller keeps an adapter whose start threw, so a server left
-      // running here — one that never announced itself, or would not open a
-      // session — has no owner.
+      // The server is already down; this clears what the adapter held for it.
       this.dispose();
       throw err;
     }
@@ -303,23 +295,6 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   private async launch(opts: AgentStartOptions): Promise<void> {
     if (opts.kind === 'task') this.task = opts;
     else this.planner = opts;
-    // Checked before anything else: a workspace deleted out from under a
-    // stale `process.cwd()` otherwise surfaces as `spawn`'s ENOENT, which
-    // reads as a missing `opencode` binary rather than a missing directory.
-    assertWorkspaceExists(opts.cwd, { isDirectory: this.deps.isDirectory });
-    const resolvePath = this.deps.resolvePath ?? augmentedPath;
-    const PATH = await resolvePath();
-
-    // On POSIX this is `opencode` unchanged; on Windows it resolves the real
-    // executable, because CreateProcess performs no PATHEXT lookup.
-    const launch = await planDirectLaunch('opencode', ['serve', '--hostname', '127.0.0.1', '--port', '0'], {
-      platform: this.deps.platform,
-      resolvePath,
-    });
-    if (!isExecutableResolved('opencode', launch, PATH, { platform: this.deps.platform, exists: this.deps.exists })) {
-      throw new ExecutableNotFoundError('opencode', PATH);
-    }
-    const workspaceEnv = await (this.deps.workspaceEnv ?? workspaceEnvOf)(opts.cwd);
     // A task's server edits the worktree, and `serve` without a password
     // takes orders from any local process. The password exists only in this
     // adapter and the server's environment, after the workspace's own
@@ -327,73 +302,63 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     // 2.x answers every `/api` request without credentials with a 401, so a
     // server with no password cannot be spoken to at all.
     const password = randomBytes(24).toString('base64url');
-    // The token rides in the server's environment, not its argv (ADR-0022, A5).
-    const ordewellConfig = opts.mcp ? OPENCODE_ORDEWELL.configContent(workspaceEnv.OPENCODE_CONFIG_CONTENT ?? process.env.OPENCODE_CONFIG_CONTENT, opts.mcp) : null;
-    if (opts.mcp && ordewellConfig === null) {
-      console.error('[opencode] OPENCODE_CONFIG_CONTENT is not a JSON object, so the Ordewell tools were not injected.');
-    }
-    this.ordewell = ordewellConfig === null ? null : opts.mcp ?? null;
-    this.process = spawnInOwnGroup((detached) => this.deps.spawn(launch.file, launch.args, {
-      env: runnerEnv(PATH, {
-        ...workspaceEnv,
-        ...(ordewellConfig === null ? {} : { OPENCODE_CONFIG_CONTENT: ordewellConfig }),
-        OPENCODE_SERVER_USERNAME: SERVER_USERNAME,
-        OPENCODE_SERVER_PASSWORD: password,
-      }),
-      stdio: ['pipe', 'pipe', 'pipe'],
-      cwd: opts.cwd,
-      windowsVerbatimArguments: launch.verbatim,
-      detached,
-    }), this.deps.platform);
-    this.authorization = `Basic ${Buffer.from(`${SERVER_USERNAME}:${password}`).toString('base64')}`;
-    // Nothing is written here today, but an EPIPE on an unheard pipe crashes
-    // the host, and the exit path already reports a dead server.
-    this.process.stdin?.on('error', () => {});
+    const command = () => ({
+      command: 'opencode',
+      args: ['serve', '--hostname', '127.0.0.1', '--port', '0'],
+      env: (workspaceEnv: Record<string, string>) => {
+        // The token rides in the server's environment, not its argv (ADR-0022, A5).
+        const ordewellConfig = opts.mcp ? OPENCODE_ORDEWELL.configContent(workspaceEnv.OPENCODE_CONFIG_CONTENT ?? process.env.OPENCODE_CONFIG_CONTENT, opts.mcp) : null;
+        if (opts.mcp && ordewellConfig === null) {
+          console.error('[opencode] OPENCODE_CONFIG_CONTENT is not a JSON object, so the Ordewell tools were not injected.');
+        }
+        this.ordewell = ordewellConfig === null ? null : opts.mcp ?? null;
+        return {
+          ...(ordewellConfig === null ? {} : { OPENCODE_CONFIG_CONTENT: ordewellConfig }),
+          OPENCODE_SERVER_USERNAME: SERVER_USERNAME,
+          OPENCODE_SERVER_PASSWORD: password,
+        };
+      },
+    });
+    await this.runner.start(opts.cwd, command, (child) => {
+      this.process = child;
+      this.authorization = `Basic ${Buffer.from(`${SERVER_USERNAME}:${password}`).toString('base64')}`;
+      return this.connect(opts, this.serverAddress());
+    });
+  }
 
-    const proc = this.process;
-    const banner = new Promise<string | null>((resolve) => {
-      // Stdout only: that is where `serve` prints its address, and stderr can
-      // carry another URL — a warning about a provider it could not reach.
-      // Read a line at a time, and only until the address is known.
-      const stdoutText = new StringDecoder('utf8');
+  /**
+   * Where `serve` listens, or null once it ends or gives up. Stdout only: that
+   * is where `serve` prints its address, and stderr can carry another URL — a
+   * warning about a provider it could not reach. Read a line at a time, and
+   * only until the address is known.
+   */
+  private serverAddress(): Promise<string | null> {
+    return new Promise<string | null>((resolve) => {
       let partial = '';
-      const settle = (url: string | null) => {
-        proc.stdout?.removeListener('data', scan);
-        clearTimeout(timer);
-        resolve(url);
-      };
-      const scan = (chunk: Buffer) => {
-        const lines = (partial + stdoutText.write(chunk)).split('\n');
+      const stopReading = this.runner.readStdout((text) => {
+        const lines = (partial + text).split('\n');
         partial = lines.pop()!.slice(-BANNER_LINE_CHARS);
         for (const line of lines) {
           const match = line.match(/https?:\/\/[^\s]+/);
           if (match) return settle(match[0].replace(/[.,)]$/, ''));
         }
-      };
-      const ended = (code: number) => {
-        if (this.exited) return;
-        this.exited = true;
-        this.exitCode = code;
-        this.markEnded();
-        settle(null);
-      };
-      const stderrText = new StringDecoder('utf8');
-      proc.stdout?.on('data', scan);
-      proc.stderr?.on('data', (chunk: Buffer) => {
-        this.stderrTail = (this.stderrTail + stderrText.write(chunk)).slice(-STDERR_TAIL_CHARS);
-      });
-      proc.on('exit', (code) => ended(code ?? -1));
-      proc.on('error', (err) => {
-        this.stderrTail = (this.stderrTail + `\n${err.message}`).slice(-STDERR_TAIL_CHARS);
-        ended(-1);
       });
       const timer = setTimeout(() => settle(null), SERVER_READY_TIMEOUT_MS);
       timer.unref?.();
+      const settle = (url: string | null) => {
+        stopReading();
+        clearTimeout(timer);
+        resolve(url);
+      };
+      void this.processEnded.then(() => settle(null));
     });
+  }
 
-    this.baseUrl = await banner;
+  /** From the server's address to an open session — the 2.x API's, or a 1.x one created or resumed. */
+  private async connect(opts: AgentStartOptions, address: Promise<string | null>): Promise<void> {
+    this.baseUrl = await address;
     if (!this.baseUrl) {
-      throw new Error(`The OpenCode ${this.role()} server did not start.${this.stderrTail.trim() ? `\n\n${this.stderrTail.trim()}` : ''}`);
+      throw new Error(this.runner.withStderrTail(`The OpenCode ${this.role()} server did not start.`));
     }
 
     if (await this.speaksV2()) {
@@ -695,7 +660,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   }
 
   onProcessExit(listener: (code: number) => void): void {
-    void this.processEnded.then(() => listener(this.exitCode));
+    void this.processEnded.then(() => listener(this.runner.exitCode));
   }
 
   answerPermission(id: string, decision: ApprovalDecision): boolean {
@@ -1011,16 +976,13 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
     this.disposed = true;
     // The server is gone with its session; its stored messages are unreachable.
     this.steers.drain();
-    const proc = this.process;
     this.process = null;
     this.baseUrl = null;
-    // Tree-wide: `opencode serve` is a server, and on Windows it may sit behind
-    // a cmd.exe shim. A surviving server keeps the port and the session.
-    killTree(proc, { platform: this.deps.platform });
+    // A surviving server keeps the port and the session.
+    this.runner.dispose();
   }
 
   private exitMessage(): string {
-    const tail = this.stderrTail.trim();
-    return `The OpenCode ${this.role()} server exited.${tail ? `\n\n${tail}` : ''}`;
+    return this.runner.withStderrTail(`The OpenCode ${this.role()} server exited.`);
   }
 }

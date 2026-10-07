@@ -5,7 +5,7 @@ import type { ChildProcess } from 'child_process';
 import type { SpawnFn } from '../HeadlessRunner';
 import type { AgentAdapterFactory, AgentEvent, AgentProcessDeps, TaskModeAgentAdapter } from '../harness/AgentAdapter';
 import { ClaudeCodeAdapter } from '../harness/ClaudeCodeAdapter';
-import { createTaskAdapter } from '../harness/taskAdapters';
+import { createTaskAdapter } from '../harness/connectors';
 import type { RunnerPluginManifest } from '../../plugins/types';
 
 /**

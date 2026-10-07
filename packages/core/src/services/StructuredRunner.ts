@@ -16,7 +16,7 @@ import { resolveTaskRunnerFlags } from '../plugins/resolveArgs';
 import { AbstractRunner, AbstractTerminalSession, type RunnerSpawnOptions } from './AbstractRunner';
 import type { AgentEvent, AgentProcessDeps, TaskModeAgentAdapter, TaskStartOptions } from './harness/AgentAdapter';
 import { mapAgentTool, normalizeAgentArgs } from './harness/agentTools';
-import { createTaskAdapter, takesOrdewellTools } from './harness/taskAdapters';
+import { createTaskAdapter, takesOrdewellTools } from './harness/connectors';
 
 /** How long a soft interrupt may take before the runner is killed and resumed instead. */
 const DEFAULT_INTERRUPT_GRACE_MS = 5000;

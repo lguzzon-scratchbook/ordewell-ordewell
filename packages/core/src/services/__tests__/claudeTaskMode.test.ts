@@ -4,7 +4,7 @@ import { ClaudeCodeAdapter } from '../harness/ClaudeCodeAdapter';
 import { CodexAdapter } from '../harness/CodexAdapter';
 import { OpenCodeAdapter } from '../harness/OpenCodeAdapter';
 import { TaskModeUnsupportedError, type AgentEvent, type AgentProcessDeps, type AgentStartOptions, type TaskStartOptions } from '../harness/AgentAdapter';
-import { supportsTaskMode, createTaskAdapter } from '../harness/taskAdapters';
+import { supportsTaskMode, createTaskAdapter } from '../harness/connectors';
 import { resolveArgs, resolveTaskRunnerFlags } from '../../plugins/resolveArgs';
 import { CLAUDE_CODE_MANIFEST } from '../../plugins/builtin/claude-code.manifest';
 import { mcpClientConfig } from '../mcp';
