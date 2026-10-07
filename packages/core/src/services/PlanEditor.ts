@@ -1,10 +1,11 @@
 import { canMergeTasks, canSplitTask } from './TaskOps';
-import { validateTaskEdit, type EditCatalog } from './TaskEditValidator';
+import { validateTaskEdit } from './TaskEditValidator';
 import { retargetTaskRunner, runnerAssignment, type RunnerCatalog } from './TaskRetarget';
 import { effectiveAllowlist } from './ModelAllowlistResolver';
 import { buildMergePrompt, buildSplitPrompt } from './PlanPrompts';
 import { conflictResolverTask } from './Landing';
 import { PlanEditError } from './PlanEditError';
+import type { SessionCatalog } from './SessionCatalog';
 import type { PlanStore } from './PlanStore';
 import type { TaskOrchestrator } from './TaskOrchestrator';
 import type { IsolationRunController } from './IsolationRunController';
@@ -12,18 +13,7 @@ import type { SessionBroadcaster } from './SessionMessage';
 import { opsFlag, type DiscoveredModel, type LegacyPlanState, type RunnerId, type Task } from '../models/Task';
 
 /** The catalogs an edit reads, as the session holds them at the moment of the edit. */
-export interface PlanEditCatalog {
-  /** What a model or task-mode edit is checked against: the catalog the planner is shown (see {@link EditCatalog}). */
-  edit(): EditCatalog;
-  /** Everything a runner offers. Spawns the runner's CLI to list its models. */
-  runner(runner: RunnerId): Promise<RunnerCatalog>;
-  /** The models the user allows on a runner right now; unset means no restriction. */
-  allowlist(runner: RunnerId): string[] | undefined;
-  /** Every runner's discovered models as the session knows them. */
-  models(): Partial<Record<RunnerId, DiscoveredModel[]>>;
-  /** Keep what a runner was found to offer, for the next coercion's effort clamping. */
-  remember(runner: RunnerId, models: DiscoveredModel[]): void;
-}
+export type PlanEditCatalog = Pick<SessionCatalog, 'edit' | 'runner' | 'allowlistFor' | 'models' | 'admit'>;
 
 export interface PlanEditorDeps {
   store: PlanStore;
@@ -232,7 +222,7 @@ export class PlanEditor {
     // The store is what the orchestrator resolves a spawn against, and nothing
     // reloads it between this edit and a single-task run.
     this.store.admitRunner(runner);
-    if (models.length > 0) this.catalog.remember(runner, models);
+    this.catalog.admit(runner, models);
   }
 
   /**
@@ -265,7 +255,7 @@ export class PlanEditor {
     // The other runners' catalogs are what lets `effectiveAllowlist` tell an id
     // this runner hasn't listed yet from one that belongs to a different runner.
     const allowed = effectiveAllowlist(
-      this.catalog.allowlist(runner),
+      this.catalog.allowlistFor(runner),
       runner,
       { ...this.catalog.models(), [runner]: catalog.models },
     );

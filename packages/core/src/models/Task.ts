@@ -580,12 +580,15 @@ export function inheritedOps(from: readonly Pick<Task, 'ops'>[], chosen?: boolea
   return chosen ?? from.every((t) => opsFlag(t.ops) === true);
 }
 
+/** The runner set a plan has until one is chosen: the one runner every host ships. */
+export const DEFAULT_RUNNERS: readonly RunnerId[] = ['claude-code'];
+
 export function createEmptyPlan(): LegacyPlanState {
   return {
     tasks: [],
     generatedAt: new Date().toISOString(),
     status: 'draft',
-    runners: ['claude-code'],
+    runners: [...DEFAULT_RUNNERS],
     lastUpdated: new Date().toISOString(),
   };
 }

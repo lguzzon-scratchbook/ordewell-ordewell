@@ -1,9 +1,9 @@
 import { createAiService, type IAiService } from './AiService';
 import { applyTaskOps, type TaskOp } from './TaskOps';
 import type { TaskQueryCatalog } from './TaskQuery';
+import { SessionCatalog } from './SessionCatalog';
 import { plannerToolHandler, runnersOf, type PlanEditOutcome } from './plannerTools';
 import { sharedMcpServer, type OrdewellMcpServer, type PlannerToolHandler } from './mcp';
-import type { EditCatalog } from './TaskEditValidator';
 import { ConversationEditError, PlannerConversation, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type PlannerSubmission, type RewindTarget } from './PlannerConversation';
 import { forkPlanState, type ForkedDialogue } from './conversationFork';
 import { Planner } from './Planner';
@@ -16,8 +16,7 @@ import { RunnerApprovals } from './RunnerApprovals';
 import { approvalScopes, isRunnerApproval, type ApprovalAnswer, type ApprovalRequest } from '../interfaces/IApproval';
 import { HttpWebFetcher } from './HttpWebFetcher';
 import { ModelResolver } from './ModelResolver';
-import { filterModelsForPrompt, coerceAssignments } from './ModelAllowlistResolver';
-import type { RunnerCatalog } from './TaskRetarget';
+import { coerceAssignments } from './ModelAllowlistResolver';
 import { plannerModesFrom, plannerRuntimeToggles } from './plannerModes';
 import type { UserSettings } from './SettingsService';
 import { SkillsService } from './SkillsService';
@@ -30,7 +29,7 @@ import { TaskLogRecorder } from './TaskLogRecorder';
 import { PlannerUsageLedger } from './PlannerUsage';
 import { mintSessionId } from '../utils/sessionId';
 import { savePrdMarkdown, extractPrdBlock } from '../utils/prdStore';
-import { flattenTasks, keepExecutionState, type DiscoveredModel, type LegacyPlanState, type PlanState, type QueuedMessage, type Task, type TaskSnapshot, type RunnerId } from '../models/Task';
+import { flattenTasks, keepExecutionState, DEFAULT_RUNNERS, type LegacyPlanState, type PlanState, type QueuedMessage, type Task, type TaskSnapshot, type RunnerId } from '../models/Task';
 import type { AiProvider, IConfig } from '../interfaces/IConfig';
 import type { IFileSystem } from '../interfaces/IFileSystem';
 import type { IWebFetcher } from '../interfaces/IWebFetcher';
@@ -43,7 +42,6 @@ import type { IsolationRunController } from './IsolationRunController';
 import { PlanEditor } from './PlanEditor';
 import { PlanEditError } from './PlanEditError';
 import type { RunnerRegistry } from '../plugins/RunnerRegistry';
-import { runnerModesFrom, resolveDefaultMode, type RunnerModeInfo } from './ModeResolver';
 
 /**
  * Options for plan generation. Progress is not overridable: every planner
@@ -353,9 +351,18 @@ export function createSession(deps: SessionDeps): Session {
   });
   deps.fsAdapter.setApproval?.(approvalPolicy);
 
-  const session = new Session({
+  const catalog = new SessionCatalog({
     config: deps.config,
     registry: deps.registry,
+    modelResolver: deps.modelResolver,
+    settings: deps.settings,
+    // Read through the Session, which holds the plan; the catalog is built first.
+    planRunners: (): RunnerId[] => session.planState?.runners ?? [],
+  });
+
+  const session = new Session({
+    config: deps.config,
+    catalog,
     workspace: deps.workspaceRoot(),
     fsAdapter: deps.fsAdapter,
     broadcast: deps.broadcast,
@@ -385,7 +392,7 @@ export function createSession(deps: SessionDeps): Session {
 /** What {@link createSession} hands a Session: every collaborator, already built and wired. */
 export interface SessionParts {
   config: IConfig;
-  registry: RunnerRegistry;
+  catalog: SessionCatalog;
   workspace: string;
   fsAdapter: IFileSystem;
   broadcast: SessionBroadcaster;
@@ -431,7 +438,7 @@ export class Session {
   private readonly runs: IsolationRunController;
   private readonly store: PlanStore;
   private readonly config: IConfig;
-  private readonly registry: RunnerRegistry;
+  private readonly catalog: SessionCatalog;
   private plan: LegacyPlanState | null = null;
   private goal = '';
   private workspace: string;
@@ -444,8 +451,6 @@ export class Session {
   private readonly fetcher: IWebFetcher;
   private readonly settingsFn: () => SessionRuntimeSettings;
   private readonly save: SaveSession;
-  /** Last discovered model catalog — lets sync plan commits clamp thinking efforts to real variants. */
-  private modelsCache: Partial<Record<RunnerId, DiscoveredModel[]>> = {};
   /** The queue drain in flight, which a second call joins; see {@link processQueuedMessages}. */
   private queueDrain: Promise<void> | null = null;
   /** The queued messages the planner has been given, no longer the user's to take back. */
@@ -460,7 +465,7 @@ export class Session {
   private readonly editor: PlanEditor;
   private readonly plannerTools: PlannerToolHandler = plannerToolHandler({
     liveCatalog: () => this.liveCatalog(),
-    coerce: (tasks, runners) => coerceAssignments(tasks, this.allowlist(), runners, this.models()),
+    coerce: (tasks, runners) => coerceAssignments(tasks, this.catalog.allowlist(), runners, this.catalog.models()),
     submitPlan: (tasks, runners) => this.submitPlanFromTool(tasks, runners),
     editPlan: (ops) => this.editPlanFromTool(ops),
     tasks: () => this.store.planTasks,
@@ -471,7 +476,7 @@ export class Session {
 
   constructor(parts: SessionParts) {
     this.config = parts.config;
-    this.registry = parts.registry;
+    this.catalog = parts.catalog;
     this.workspace = parts.workspace;
     this.fsAdapter = parts.fsAdapter;
     this.broadcast = parts.broadcast;
@@ -499,14 +504,14 @@ export class Session {
       aiService: () => this.aiService(),
       onProgress: (p) => this.events.progress(p),
       opening: (runners) => this.conversationOpening(runners),
-      catalog: () => this.catalogOf(this.plan?.runners ?? []),
+      catalog: () => this.catalog.queryCatalog(this.plan?.runners ?? []),
       tasks: () => this.store.planTasks,
       liveOutput: (taskId, opts) => this.orchestrator.getLiveOutput(taskId, opts),
       isExecuting: () => this.isExecuting,
       mutate: (op, notify) => this.mutatePlan(op, notify),
       broadcast: (msg) => this.broadcast(msg),
       broadcastPlan: (turnId) => this.events.planGenerated(this.plan, this.goal, turnId),
-      validateOps: (ops) => applyTaskOps(this.store.planTasks, ops, this.plan!.runners, this.editCatalog()),
+      validateOps: (ops) => applyTaskOps(this.store.planTasks, ops, this.plan!.runners, this.catalog.edit()),
       adoptTasks: (tasks, how) => this.adoptPlannerTasks(tasks, how),
       capturePrd: (text) => this.capturePrd(text),
       queueEdit: (userMessage) => {
@@ -520,13 +525,7 @@ export class Session {
     this.editor = new PlanEditor({
       store: this.store,
       plan: () => this.plan,
-      catalog: {
-        edit: () => this.editCatalog(),
-        runner: (runner) => this.catalogFor(runner),
-        allowlist: (runner) => this.allowlist()[runner],
-        models: () => this.models(),
-        remember: (runner, models) => { this.modelsCache = { ...this.modelsCache, [runner]: models }; },
-      },
+      catalog: this.catalog,
       mutate: (op, notify) => this.mutatePlan(op, notify),
       scheduler: this.orchestrator,
       runs: this.runs,
@@ -690,92 +689,13 @@ export class Session {
     // Session boundaries are hard (see ADR-0008): a path or command the user
     // approved for the previous goal must not stay approved for the next one.
     this.approvalPolicy.reset();
-    this.modelsCache = {};
+    this.catalog.reset();
     this.remintSessionId();
   }
 
-  /**
-   * What a planner may assign right now: every enabled runner, its modes, and
-   * its allowlisted models — read as of this call, so a runner enabled or an
-   * allowlist edited since planning started is in it (#69). Discovers a
-   * runner's models the first time it is asked for.
-   */
-  async liveCatalog(): Promise<TaskQueryCatalog> {
-    const runners = this.enabledRunners();
-    this.modelsCache = { ...this.modelsCache, ...await this.modelResolver.modelsForRunners(runners) };
-    return this.catalogOf(runners);
-  }
-
-  private catalogOf(runners: RunnerId[]): TaskQueryCatalog {
-    return {
-      runners,
-      // Allowlist-filtered: neither the per-turn block nor a read may offer
-      // a model the planner is forbidden to assign.
-      models: filterModelsForPrompt(this.models(), this.allowlist()),
-      modes: this.runnerModesFor(runners),
-      autonomousDefault: this.config.autonomousMode,
-    };
-  }
-
-  private runnerModesFor(runners: RunnerId[]): Record<RunnerId, RunnerModeInfo[]> {
-    return runnerModesFrom(this.registry, runners);
-  }
-
-  /**
-   * The catalog a model/task-mode edit is checked against — the same
-   * discovered models and manifest modes the per-turn catalog block shows the
-   * planner, so a refusal here can never name something invalid that the
-   * planner was never told about. The catalog is not filtered by the
-   * allowlist here — {@link checkModelAndModeValidity} narrows by
-   * allowlist itself, the same way `coerceAssignments` does.
-   */
-  private editCatalog(runners: RunnerId[] = this.plan?.runners ?? []): EditCatalog {
-    return {
-      modelsByRunner: this.models(),
-      runnerModes: this.runnerModesFor(runners),
-      perRunnerAllowlist: this.allowlist(),
-    };
-  }
-
-  /** The runners enabled right now — a toggle made since the session was built counts (#69). */
-  private enabledRunners(): RunnerId[] {
-    return this.settingsFn().enabledRunners ?? this.config.enabledRunners;
-  }
-
-  /**
-   * The allowlist in force right now. Unset means no restriction — falling
-   * back to the one planning started under would keep a restriction the user
-   * has since cleared.
-   */
-  private allowlist(): Record<string, string[]> {
-    return this.settingsFn().modelAllowlist ?? {};
-  }
-
-  /**
-   * The discovered catalog as the resolver holds it now, per runner, with this
-   * session's own discovery as the fallback where the resolver has nothing
-   * cached. The resolver's cache outlives this session's snapshot in both
-   * directions — an allowlist picker re-discovers into it mid-session — and a
-   * model allowed after that must reach the planner with its real label and
-   * variants, not as an id-only stub. Never triggers discovery itself.
-   */
-  private models(): Partial<Record<RunnerId, DiscoveredModel[]>> {
-    const out = { ...this.modelsCache };
-    for (const runner of new Set([...Object.keys(out), ...(this.plan?.runners ?? [])])) {
-      const cached = this.modelResolver.getCachedRunnerModels(runner);
-      if (cached.length > 0) out[runner] = cached;
-    }
-    return out;
-  }
-
-  /** What a runner offers, as `runnerAssignment` needs it. Spawns the runner's CLI to list models. */
-  private async catalogFor(runner: RunnerId): Promise<RunnerCatalog> {
-    const modes = this.runnerModesFor([runner])[runner];
-    return {
-      models: (await this.modelResolver.modelsForRunners([runner]))[runner] ?? [],
-      modes,
-      defaultMode: resolveDefaultMode(modes, this.config.autonomousMode),
-    };
+  /** What a planner may assign right now; see {@link SessionCatalog.live}. */
+  liveCatalog(): Promise<TaskQueryCatalog> {
+    return this.catalog.live();
   }
 
   get planState(): LegacyPlanState | null { return this.plan; }
@@ -856,11 +776,12 @@ export class Session {
     this.goal = goal;
     this.remintSessionId();
     this.beginFreshPlan();
-    const enabled = this.enabledRunners();
+    const enabled = this.catalog.enabledRunners();
     const chosenRunners = runners.filter((r) => enabled.includes(r));
     if (chosenRunners.length === 0) throw new Error('None of the requested runners are enabled');
 
-    const { modelsByRunner, runnerModes, settings } = await this.plannerCatalog(chosenRunners);
+    const { modelsByRunner, runnerModes } = await this.catalog.planning(chosenRunners);
+    const settings = this.settingsFn();
     // Every planner toggle, not the two this path used to remember: `modesFor`
     // drops the ones a one-shot run cannot honour, so a structural toggle like
     // verify — which only appends a task — stops being silently lost between
@@ -900,7 +821,7 @@ export class Session {
     this.goal = this.resolveSkillInvocation(goal);
     this.remintSessionId();
     this.beginFreshPlan();
-    const enabled = this.enabledRunners();
+    const enabled = this.catalog.enabledRunners();
     const chosenRunners = runners.filter((r) => enabled.includes(r));
     if (chosenRunners.length === 0) throw new Error('None of the requested runners are enabled');
 
@@ -990,7 +911,7 @@ export class Session {
    */
   private submitPlanFromTool(tasks: Task[], runners: RunnerId[]): boolean {
     if (!this.plan || !this.conversation.submit({ kind: 'plan', tasks })) return false;
-    for (const runner of runners) this.editor.admitRunner(runner, this.modelsCache[runner] ?? []);
+    for (const runner of runners) this.editor.admitRunner(runner, this.catalog.known(runner));
     return true;
   }
 
@@ -1014,10 +935,10 @@ export class Session {
     const queued = this.conversation.editWouldQueue(batch);
     let summary: string[] = [];
     if (!queued) {
-      const result = applyTaskOps(this.store.planTasks, batch, catalog.runners, this.editCatalog(catalog.runners));
+      const result = applyTaskOps(this.store.planTasks, batch, catalog.runners, this.catalog.edit(catalog.runners));
       if (!result.ok) return { ok: false, errors: result.errors };
       summary = result.summary;
-      for (const runner of runnersOf(result.tasks)) this.editor.admitRunner(runner, this.modelsCache[runner] ?? []);
+      for (const runner of runnersOf(result.tasks)) this.editor.admitRunner(runner, this.catalog.known(runner));
     }
     if (!this.conversation.submit({ kind: 'task_ops', ops: batch })) return refuse('No planning turn is open to take the edit.');
     return { ok: true, summary, queued };
@@ -1040,32 +961,14 @@ export class Session {
     return resolveSkillInvocation(text, this.skillsService);
   }
 
-  /**
-   * The one place planning discovers what it may draw from: the runners'
-   * models (cached for later effort clamping), their modes, and the settings
-   * in force. `filteredModels` is the allowlisted view a prompt may show;
-   * `modelsByRunner` stays whole because coercion needs real labels and variants.
-   */
-  private async plannerCatalog(runners: RunnerId[]) {
-    const modelsByRunner = await this.modelResolver.modelsForRunners(runners);
-    this.modelsCache = { ...this.modelsCache, ...modelsByRunner };
-    const settings = this.settingsFn();
-    return {
-      modelsByRunner,
-      filteredModels: filterModelsForPrompt(modelsByRunner, settings.modelAllowlist ?? {}),
-      runnerModes: this.runnerModesFor(runners),
-      settings,
-    };
-  }
-
   private async conversationOpening(runners: RunnerId[]): Promise<ConversationOpening> {
-    const { filteredModels, runnerModes, settings } = await this.plannerCatalog(runners);
+    const { filteredModels, runnerModes } = await this.catalog.planning(runners);
     return {
       runners,
       modelsByRunner: filteredModels,
       runnerModes,
       autonomousDefault: this.config.autonomousMode,
-      verificationEnabled: settings.verificationEnabled ?? false,
+      verificationEnabled: this.settingsFn().verificationEnabled ?? false,
       isolatedExecution: await this.runs.plannerLayout(),
       // The planner's own model window, when a cached catalog knows it, so the
       // usage line can show context fill (#49). Unknown stays absent.
@@ -1091,7 +994,7 @@ export class Session {
    */
   private adoptPlannerTasks(tasks: readonly Task[], how: 'edit' | 'commit'): number {
     const runners = this.plan!.runners;
-    let coerced = coerceAssignments(tasks, this.allowlist(), runners, this.models());
+    let coerced = coerceAssignments(tasks, this.catalog.allowlist(), runners, this.catalog.models());
     if (how === 'commit') coerced = keepExecutionState(this.store.planTasks, coerced);
     if (this.orchestrator.isRunning) {
       this.orchestrator.reconcilePlan(coerced, runners);
@@ -1253,8 +1156,8 @@ export class Session {
     );
 
     try {
-      const modelsByRunner = await this.modelResolver.modelsForRunners(this.enabledRunners());
-      const runnerModes = this.runnerModesFor(this.plan?.runners ?? ['claude-code']);
+      const modelsByRunner = await this.catalog.discover(this.catalog.enabledRunners());
+      const runnerModes = this.catalog.modes(this.plan?.runners ?? [...DEFAULT_RUNNERS]);
       const { modelAllowlist } = this.settingsFn();
 
       // The prompt calls this list the tasks not yet executed, so it must be
@@ -1267,7 +1170,7 @@ export class Session {
         activeSessions,
         userMessage: batchText,
         modelsByRunner,
-        runners: this.plan?.runners ?? ['claude-code'],
+        runners: this.plan?.runners ?? [...DEFAULT_RUNNERS],
         runnerModes,
         autonomousDefault: this.config.autonomousMode,
         perRunnerAllowlist: modelAllowlist,
