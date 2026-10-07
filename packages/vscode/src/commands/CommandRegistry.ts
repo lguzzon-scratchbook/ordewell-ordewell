@@ -33,9 +33,6 @@ export interface CommandDeps {
   getCurrentGoal: () => string;
   setCurrentGoal: (goal: string) => void;
   isGeneratingPlan: () => boolean;
-  setGeneratingPlan: (v: boolean) => void;
-  getResearchAbort: () => AbortController | null;
-  setResearchAbort: (c: AbortController | null) => void;
   handleApprovePlan: () => Promise<void>;
   handleStartPlanning: (text: string) => Promise<void>;
   sendRunnerAndModels: () => Promise<void>;

@@ -66,9 +66,9 @@ export interface SettleReplyOptions {
  */
 export async function settleReply(opts: SettleReplyOptions): Promise<ConversationTurn> {
   const researchLog: ResearchLogEntry[] = [];
-  const message = (text: string): ConversationTurn => ({ kind: 'message', text, researchLog });
+  const message = (text: string): Extract<ConversationTurn, { kind: 'message' }> => ({ kind: 'message', text, researchLog });
   const retract = () => opts.onProgress({ type: 'text_retracted' });
-  const asProse = (attempt: ReplyAttempt): ConversationTurn => {
+  const asProse = (attempt: ReplyAttempt) => {
     if (opts.replyJoinsSegments) retract();
     return message(said(attempt));
   };
@@ -94,7 +94,7 @@ export async function settleReply(opts: SettleReplyOptions): Promise<Conversatio
     },
     interpret: (attempt) => {
       if (attempt.aborted) {
-        const turn = asProse(attempt);
+        const turn: ConversationTurn = { ...asProse(attempt), aborted: true };
         opts.onProgress({ type: 'interrupted' });
         return { done: turn };
       }

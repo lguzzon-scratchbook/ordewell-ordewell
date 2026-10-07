@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import {
   Session, LegacyPlanState, Task, flattenTasks, RunnerId, DiscoveredModel, enabledRunners,
   saveState, clearState, ModelResolver, RunnerRegistry, isCliProvider, taskStartedNotice,
-  createEmptyPlan, markRequestFor, pastGateConfirmation, titledRefs, type INotification, type ITerminalRunner, type TaskRowAction,
+  createEmptyPlan, markRequestFor, pastGateConfirmation, titledRefs, PlannerTurnDiscardedError, type INotification, type ITerminalRunner, type TaskRowAction,
 } from '@ordewell/core';
 import type { TaskDraft, TaskEdit } from '../shared/protocol';
 import type { ChatViewProvider } from '../providers/ChatViewProvider';
@@ -26,10 +26,8 @@ export interface PlanManagerDeps {
   setCurrentPlan: (plan: LegacyPlanState) => void;
   getCurrentGoal: () => string;
   setCurrentGoal: (goal: string) => void;
+  /** Whether a planner turn holds the session — read off the session, never tracked here. */
   isGeneratingPlan: () => boolean;
-  setGeneratingPlan: (v: boolean) => void;
-  getResearchAbort: () => AbortController | null;
-  setResearchAbort: (c: AbortController | null) => void;
   persistState: () => void;
   saveCurrentSession: () => void;
   log: (msg: string) => void;
@@ -86,15 +84,15 @@ export function finishPlannerTurn(
   deps.saveCurrentSession();
 }
 
-export function reportPlannerError(err: unknown, deps: PlanManagerDeps, signal?: AbortSignal): void {
+export function reportPlannerError(err: unknown, deps: PlanManagerDeps): void {
   // Message text is not evidence: a real failure can mention "aborted" (a
-  // runner's "transaction aborted"). Only the stop's own signal or an abort
-  // error's identity counts.
-  const isAbort = signal?.aborted === true || (err instanceof Error && (
+  // runner's "transaction aborted"). Only an abort error's identity counts.
+  const isAbort = err instanceof PlannerTurnDiscardedError || (err instanceof Error && (
     err.name === 'AbortError' ||
     err.name === 'APIUserAbortError'
   ));
-  // The stop already ended the turn on screen.
+  // The stop already ended the turn on screen; a discarded turn belonged to a
+  // session the user has already left.
   if (isAbort) return;
   const message = err instanceof Error ? err.message : String(err);
   deps.chatProvider.showError(`Planner failed: ${message}`);
@@ -130,26 +128,12 @@ function plannerReady(deps: PlanManagerDeps): boolean {
   return false;
 }
 
-/**
- * One planner turn's bookkeeping: the generating flag and the abort a stop
- * reaches. A stopped turn can take a while to unwind, and a turn sent after
- * it may already be running when it does — so a turn only clears the state
- * while it is still its own, or it would leave the next turn unstoppable and
- * its queued prompts unheld.
- */
-async function inPlannerTurn(deps: PlanManagerDeps, run: (signal: AbortSignal) => Promise<void>): Promise<void> {
-  const controller = new AbortController();
-  deps.setGeneratingPlan(true);
-  deps.setResearchAbort(controller);
+/** The session owns the turn — its busy state and its stop; a failure is all that is left to report. */
+async function inPlannerTurn(deps: PlanManagerDeps, run: () => Promise<void>): Promise<void> {
   try {
-    await run(controller.signal);
+    await run();
   } catch (err) {
-    reportPlannerError(err, deps, controller.signal);
-  } finally {
-    if (deps.getResearchAbort() === controller) {
-      deps.setGeneratingPlan(false);
-      deps.setResearchAbort(null);
-    }
+    reportPlannerError(err, deps);
   }
 }
 
@@ -172,8 +156,8 @@ export async function handleStartPlanning(
   if (!runners) {
     return;
   }
-  await inPlannerTurn(deps, async (signal) => {
-    const plan = await deps.session.startPlanning(userDescription, runners, { signal });
+  await inPlannerTurn(deps, async () => {
+    const plan = await deps.session.startPlanning(userDescription, runners);
     deps.setCurrentGoal(userDescription);
     deps.setCurrentPlan(plan);
     finishPlannerTurn(plan, userDescription, deps);
@@ -184,9 +168,9 @@ export async function handleContinueConversation(
   text: string,
   deps: PlanManagerDeps,
 ): Promise<void> {
-  await inPlannerTurn(deps, async (signal) => {
+  await inPlannerTurn(deps, async () => {
     const prior = JSON.stringify(deps.getCurrentPlan().tasks);
-    adoptTurnPlan(prior, await deps.session.continueConversation(text, { signal }), deps);
+    adoptTurnPlan(prior, await deps.session.continueConversation(text), deps);
   });
 }
 
@@ -198,9 +182,9 @@ export async function handleContinueConversation(
  */
 export async function handleMergePlan(taskIds: string[], deps: PlanManagerDeps): Promise<void> {
   if (taskIds.length < 2) return;
-  await inPlannerTurn(deps, async (signal) => {
+  await inPlannerTurn(deps, async () => {
     const prior = JSON.stringify(deps.getCurrentPlan().tasks);
-    adoptTurnPlan(prior, await deps.session.requestMerge(taskIds, { signal }), deps);
+    adoptTurnPlan(prior, await deps.session.requestMerge(taskIds), deps);
   });
 }
 
@@ -210,9 +194,9 @@ export async function handleMergePlan(taskIds: string[], deps: PlanManagerDeps):
  * merge; the model generates the breakdown (no manual per-task specs).
  */
 export async function handleSplitPlan(taskId: string, deps: PlanManagerDeps): Promise<void> {
-  await inPlannerTurn(deps, async (signal) => {
+  await inPlannerTurn(deps, async () => {
     const prior = JSON.stringify(deps.getCurrentPlan().tasks);
-    adoptTurnPlan(prior, await deps.session.requestSplit(taskId, { signal }), deps);
+    adoptTurnPlan(prior, await deps.session.requestSplit(taskId), deps);
   });
 }
 
@@ -392,12 +376,11 @@ export async function handleTaskControl(
 
 /**
  * Stop aborts the current planner turn only — never the plan, the dialogue or
- * the persisted state; that is a new session. The turn stays the host's until
- * its handler returns, so a prompt sent meanwhile is held, not raced against
- * the turn still unwinding.
+ * the persisted state; that is a new session. The session stays busy until the
+ * turn has unwound, so a prompt sent meanwhile is held, not raced against it.
  */
 export function handleStopPlanning(deps: PlanManagerDeps): void {
-  deps.getResearchAbort()?.abort();
+  deps.session.abortPlannerTurn();
   deps.session.aiServiceInstance.reset();
   deps.chatProvider.conversation.stop();
   deps.log('Research stopped');
@@ -410,13 +393,9 @@ export function handleStopPlanning(deps: PlanManagerDeps): void {
  * view and the saved state.
  */
 export function handleNewSession(deps: Pick<PlanManagerDeps,
-  'session' | 'chatProvider' | 'terminalRunner' | 'fsAdapter' | 'setCurrentPlan' | 'setCurrentGoal'
-  | 'setGeneratingPlan' | 'getResearchAbort' | 'setResearchAbort' | 'log'>): void {
-  // Cleared before the abort lands, so the orphaned turn's abort error is
+  'session' | 'chatProvider' | 'terminalRunner' | 'fsAdapter' | 'setCurrentPlan' | 'setCurrentGoal' | 'log'>): void {
+  // Abandons the planner turn in flight: it settles as discarded, which is
   // not reported into the new session.
-  deps.setGeneratingPlan(false);
-  deps.getResearchAbort()?.abort();
-  deps.setResearchAbort(null);
   deps.session.reset();
   deps.terminalRunner.stopAll();
   deps.setCurrentPlan(createEmptyPlan());

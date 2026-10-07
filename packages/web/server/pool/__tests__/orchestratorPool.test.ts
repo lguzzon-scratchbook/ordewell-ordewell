@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { existsSync } from 'fs';
-import { ConversationBusyError, listSessions, saveSession, Session, WorkspaceNotFoundError, WorkspaceNotAProjectError, type LegacyPlanState } from '@ordewell/core';
+import { listSessions, saveSession, Session, WorkspaceNotFoundError, WorkspaceNotAProjectError, type LegacyPlanState } from '@ordewell/core';
 import { OrchestratorPool } from '../orchestratorPool';
 
 function savedPlan(over: Partial<LegacyPlanState> = {}): LegacyPlanState {
@@ -221,7 +221,7 @@ describe('OrchestratorPool.compactConversation', () => {
     vi.restoreAllMocks();
   });
 
-  it('answers the condensed plan with the summary, and clears its abort controller once settled', async () => {
+  it('answers the condensed plan with the summary', async () => {
     vi.spyOn(Session.prototype, 'compactConversation').mockResolvedValue({ summary: 'the state', keptMessages: 4 });
 
     const result = await pool.compactConversation('session-saved');
@@ -229,62 +229,6 @@ describe('OrchestratorPool.compactConversation', () => {
     expect(result.summary).toBe('the state');
     expect(result.keptMessages).toBe(4);
     expect(result.plan.tasks.map((t) => t.id)).toEqual(['t1', 't2']);
-    expect(pool.cancelPlanning('session-saved')).toBe(false);
-  });
-
-  it('lets a planning stop abort the summary turn', async () => {
-    let signal: AbortSignal | undefined;
-    let finish!: (v: { summary: string; keptMessages: number }) => void;
-    vi.spyOn(Session.prototype, 'compactConversation').mockImplementation((s) => {
-      signal = s;
-      return new Promise((resolve) => { finish = resolve; });
-    });
-
-    const call = pool.compactConversation('session-saved');
-    await Promise.resolve();
-
-    expect(pool.cancelPlanning('session-saved')).toBe(true);
-    expect(signal?.aborted).toBe(true);
-    finish({ summary: 's', keptMessages: 4 });
-    await call;
-  });
-
-  it('refuses while a planner turn is in flight without displacing that turn\'s abort controller', async () => {
-    let signal: AbortSignal | undefined;
-    let finish!: (v: LegacyPlanState) => void;
-    vi.spyOn(Session.prototype, 'continueConversation').mockImplementation((_m, options) => {
-      signal = options?.signal;
-      return new Promise((resolve) => { finish = resolve; });
-    });
-    const compact = vi.spyOn(Session.prototype, 'compactConversation');
-
-    const turn = pool.continuePlanning('session-saved', 'and CSV');
-    await expect(pool.compactConversation('session-saved')).rejects.toThrow(ConversationBusyError);
-
-    expect(compact).not.toHaveBeenCalled();
-    expect(pool.cancelPlanning('session-saved')).toBe(true);
-    expect(signal?.aborted).toBe(true);
-    finish(savedPlan());
-    await turn;
-  });
-
-  it('refuses a message sent mid-compaction without displacing the compaction\'s abort controller', async () => {
-    let signal: AbortSignal | undefined;
-    let finish!: (v: { summary: string; keptMessages: number }) => void;
-    vi.spyOn(Session.prototype, 'compactConversation').mockImplementation((s) => {
-      signal = s;
-      return new Promise((resolve) => { finish = resolve; });
-    });
-    const reply = vi.spyOn(Session.prototype, 'continueConversation');
-
-    const call = pool.compactConversation('session-saved');
-    await expect(pool.continuePlanning('session-saved', 'and CSV')).rejects.toThrow(ConversationBusyError);
-
-    expect(reply).not.toHaveBeenCalled();
-    expect(pool.cancelPlanning('session-saved')).toBe(true);
-    expect(signal?.aborted).toBe(true);
-    finish({ summary: 's', keptMessages: 4 });
-    await call;
   });
 
   it('refuses a session the pool never adopted', async () => {
@@ -444,30 +388,21 @@ describe('OrchestratorPool.cancelPlanning', () => {
     vi.restoreAllMocks();
   });
 
-  it('aborts the signal passed into the in-flight planning turn', async () => {
-    let capturedSignal: AbortSignal | undefined;
-    let resolvePlan!: (v: LegacyPlanState) => void;
-    const deferred = new Promise<LegacyPlanState>((resolve) => { resolvePlan = resolve; });
-    vi.spyOn(Session.prototype, 'startPlanning').mockImplementation(async (_goal, _runners, options) => {
-      capturedSignal = options?.signal;
-      return deferred;
-    });
+  it('stops the planner turn the session holds — the session owns it, the pool only routes', async () => {
+    vi.spyOn(Session.prototype, 'startPlanning').mockReturnValue(new Promise<LegacyPlanState>(() => {}));
+    const abort = vi.spyOn(Session.prototype, 'abortPlannerTurn').mockReturnValue(true);
 
-    const call = pool.startPlanning('session-abort', 'Add a widget', ['claude-code'], workspace);
-    await Promise.resolve();
+    void pool.startPlanning('session-abort', 'Add a widget', ['claude-code'], workspace);
 
     expect(pool.cancelPlanning('session-abort')).toBe(true);
-    expect(capturedSignal?.aborted).toBe(true);
-
-    resolvePlan(savedPlan());
-    await call;
+    expect(abort.mock.contexts).toEqual([pool.session('session-abort')]);
   });
 
   it('is a no-op when nothing is planning for that session', () => {
     expect(pool.cancelPlanning('nobody-home')).toBe(false);
   });
 
-  it('clears the controller once the turn settles, so a later cancel finds nothing to abort', async () => {
+  it('finds nothing to abort once the turn settles', async () => {
     vi.spyOn(Session.prototype, 'startPlanning').mockResolvedValue(savedPlan());
 
     await pool.startPlanning('session-settled', 'Add a widget', ['claude-code'], workspace);

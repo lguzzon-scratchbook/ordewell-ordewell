@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { createTask, type LegacyPlanState } from '../../models/Task';
 import type { SessionMessage } from '../SessionMessage';
 import type { ConversationTurn, IAiService } from '../AiService';
-import { ConversationBusyError, ConversationEditError, PlannerConversation, type PlannerConversationHost } from '../PlannerConversation';
+import { ConversationBusyError, ConversationEditError, PlannerConversation, PlannerTurnDiscardedError, type PlannerConversationHost } from '../PlannerConversation';
 import type { SaveSession } from '../createSession';
 import { makeSession, testWorkspace, queue } from './sessionTestKit';
 
@@ -61,6 +61,7 @@ function fakeHost(ai: IAiService, plan: LegacyPlanState | null = dialoguePlan())
     capturePrd: vi.fn(),
     queueEdit: vi.fn().mockReturnValue(1),
     afterEdit: vi.fn().mockResolvedValue(undefined),
+    turnAborted: vi.fn(),
   };
   const conversation = new PlannerConversation(host);
   return { conversation, host, state };
@@ -432,7 +433,7 @@ describe('PlannerConversation compact', () => {
   it('ignores task ops the summary turn emits alongside the summary', async () => {
     const ops: ConversationTurn = {
       kind: 'task_ops',
-      ops: [{ op: 'remove', ref: '#1' }] as never,
+      ops: [{ op: 'remove', taskId: '#1' }] as never,
       text: `{"task_ops":[{"op":"remove","ref":"#1"}]}\n<conversation_summary>kept</conversation_summary>`,
       researchLog: [{ id: 'x', type: 'user_prompt', content: 'ignored', timestamp: '2026-01-02T00:00:00Z' }],
     };
@@ -639,5 +640,164 @@ describe('PlannerConversation after a compaction', () => {
     const { conversation } = await compacted();
 
     expect(conversation.clone().conversationHistory[0]).toMatchObject({ kind: 'compaction' });
+  });
+});
+
+describe('PlannerConversation planner turn', () => {
+  /** A backend whose replies the test hands back one at a time, keeping each call's signal. */
+  function heldBackend() {
+    const calls: { finish: (turn: ConversationTurn) => void; signal?: AbortSignal }[] = [];
+    const ai = fakeAi({
+      continueConversation: vi.fn((_m: string, _p: unknown, signal?: AbortSignal) => new Promise<ConversationTurn>((resolve) => {
+        calls.push({ finish: resolve, signal });
+      })),
+    });
+    return { ai, calls };
+  }
+
+  const ended = (host: PlannerConversationHost) => vi.mocked(host.broadcast).mock.calls
+    .map(([msg]) => msg)
+    .filter((msg): msg is Extract<SessionMessage, { type: 'planner_turn_ended' }> => msg.type === 'planner_turn_ended');
+
+  it('refuses a second reply while one is live, leaving the first to settle alone', async () => {
+    const { ai, calls } = heldBackend();
+    const { conversation, state } = fakeHost(ai, threeTurnPlan());
+
+    const first = conversation.reply('Also CSV');
+    await expect(conversation.reply('And YAML')).rejects.toThrow(ConversationBusyError);
+    calls[0].finish({ kind: 'message', text: 'Noted', researchLog: [] });
+    await first;
+
+    expect(ai.continueConversation).toHaveBeenCalledTimes(1);
+    expect(state.plan!.conversationHistory!.slice(-2).map((m) => m.content)).toEqual(['Also CSV', 'Noted']);
+    expect(conversation.isTurnInFlight).toBe(false);
+  });
+
+  it('stops the live turn through its own signal, telling the host so, and ends it as stopped', async () => {
+    const { ai, calls } = heldBackend();
+    const { conversation, host } = fakeHost(ai, threeTurnPlan());
+
+    const turn = conversation.reply('Also CSV');
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    expect(conversation.stopTurn()).toBe(true);
+
+    expect(calls[0].signal?.aborted).toBe(true);
+    expect(host.turnAborted).toHaveBeenCalledTimes(1);
+    calls[0].finish({ kind: 'message', text: 'Stopped.', researchLog: [], aborted: true });
+    await turn;
+    expect(ended(host).at(-1)?.outcome).toBe('stopped');
+    expect(conversation.stopTurn()).toBe(false);
+  });
+
+  it('relays a caller signal into the turn, and detaches it once the turn settles', async () => {
+    const { ai, calls } = heldBackend();
+    const { conversation, host } = fakeHost(ai, threeTurnPlan());
+    const caller = new AbortController();
+
+    const turn = conversation.reply('Also CSV', { signal: caller.signal });
+    calls[0].finish({ kind: 'message', text: 'Noted', researchLog: [] });
+    await turn;
+    caller.abort();
+
+    expect(host.turnAborted).not.toHaveBeenCalled();
+  });
+
+  it('discards a turn whose plan was swapped out mid-turn, writing nothing into the new one', async () => {
+    const { ai, calls } = heldBackend();
+    const { conversation, host, state } = fakeHost(ai, threeTurnPlan());
+    const swapped = dialoguePlan();
+    const swappedHistory = swapped.conversationHistory;
+
+    const turn = conversation.reply('Also CSV');
+    state.plan = swapped;
+    calls[0].finish({ kind: 'message', text: 'Noted', researchLog: [] });
+
+    await expect(turn).rejects.toThrow(PlannerTurnDiscardedError);
+    expect(swapped.conversationHistory).toBe(swappedHistory);
+    expect(state.persists).toBe(0);
+    expect(vi.mocked(host.broadcast).mock.calls.map(([m]) => m.type)).not.toContain('planner_message');
+    expect(ended(host).at(-1)?.outcome).toBe('stopped');
+  });
+
+  it('applies no task edit a stale turn settles on', async () => {
+    const { ai, calls } = heldBackend();
+    const { conversation, host, state } = fakeHost(ai, threeTurnPlan());
+
+    const turn = conversation.reply('Rename #1');
+    state.plan = dialoguePlan();
+    calls[0].finish({ kind: 'task_ops', ops: [{ op: 'remove', taskId: '#1' }], text: '', researchLog: [] });
+
+    await expect(turn).rejects.toThrow(PlannerTurnDiscardedError);
+    expect(host.validateOps).not.toHaveBeenCalled();
+    expect(host.adoptTasks).not.toHaveBeenCalled();
+  });
+
+  it('discards a reply cut off by something other than its own stop, and takes its message back out', async () => {
+    const { ai, calls } = heldBackend();
+    const { conversation, state } = fakeHost(ai, threeTurnPlan());
+    const before = state.plan!.conversationHistory;
+
+    const turn = conversation.reply('Also CSV');
+    calls[0].finish({ kind: 'message', text: 'Half an ans', researchLog: [], aborted: true });
+
+    await expect(turn).rejects.toThrow(PlannerTurnDiscardedError);
+    expect(state.plan!.conversationHistory).toBe(before);
+  });
+
+  it('still lands what a stopped turn had, since the stop was its own', async () => {
+    const { ai, calls } = heldBackend();
+    const { conversation, state } = fakeHost(ai, threeTurnPlan());
+
+    const turn = conversation.reply('Also CSV');
+    conversation.stopTurn();
+    calls[0].finish({ kind: 'message', text: 'Stopped here.', researchLog: [], aborted: true });
+    await turn;
+
+    expect(state.plan!.conversationHistory!.at(-1)?.content).toBe('Stopped here.');
+  });
+
+  it('frees the conversation the moment a turn is abandoned, and discards the abandoned one when it settles', async () => {
+    const { ai, calls } = heldBackend();
+    const { conversation, state } = fakeHost(ai, threeTurnPlan());
+
+    const abandoned = conversation.reply('Also CSV');
+    conversation.abandonTurn();
+    expect(calls[0].signal?.aborted).toBe(true);
+    expect(conversation.isTurnInFlight).toBe(false);
+
+    const next = conversation.reply('And YAML');
+    calls[0].finish({ kind: 'message', text: 'late', researchLog: [] });
+    await expect(abandoned).rejects.toThrow(PlannerTurnDiscardedError);
+    calls[1].finish({ kind: 'message', text: 'Noted', researchLog: [] });
+    await next;
+
+    const contents = state.plan!.conversationHistory!.map((m) => m.content);
+    expect(contents).not.toContain('late');
+    expect(contents.slice(-2)).toEqual(['And YAML', 'Noted']);
+    expect(conversation.isTurnInFlight).toBe(false);
+  });
+
+  it('lets one-shot work hold the turn: a reply is refused under it, and it supersedes a live reply', async () => {
+    const { ai, calls } = heldBackend();
+    const { conversation } = fakeHost(ai, threeTurnPlan());
+
+    const live = conversation.reply('Also CSV');
+    let release!: () => void;
+    let held: { signal: AbortSignal; abandoned: boolean } | undefined;
+    const generation = conversation.hold(undefined, (turn) => {
+      held = turn;
+      return new Promise<void>((resolve) => { release = resolve; });
+    });
+
+    expect(calls[0].signal?.aborted).toBe(true);
+    await expect(conversation.reply('And YAML')).rejects.toThrow(ConversationBusyError);
+    expect(conversation.stopTurn()).toBe(true);
+    expect(held?.signal.aborted).toBe(true);
+    expect(held?.abandoned).toBe(false);
+    release();
+    await generation;
+    calls[0].finish({ kind: 'message', text: 'late', researchLog: [] });
+    await expect(live).rejects.toThrow(PlannerTurnDiscardedError);
+    expect(conversation.isTurnInFlight).toBe(false);
   });
 });

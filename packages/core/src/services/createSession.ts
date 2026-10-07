@@ -4,7 +4,7 @@ import type { TaskQueryCatalog } from './TaskQuery';
 import { SessionCatalog } from './SessionCatalog';
 import { plannerToolHandler, runnersOf, type PlanEditOutcome } from './plannerTools';
 import { sharedMcpServer, type OrdewellMcpServer, type PlannerToolHandler } from './mcp';
-import { ConversationEditError, PlannerConversation, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type PlannerSubmission, type RewindTarget } from './PlannerConversation';
+import { ConversationEditError, PlannerConversation, PlannerTurnDiscardedError, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type PlannerSubmission, type RewindTarget } from './PlannerConversation';
 import { forkPlanState, type ForkedDialogue } from './conversationFork';
 import { Planner } from './Planner';
 import { createTaskOrchestrator } from './TaskOrchestrator';
@@ -520,6 +520,10 @@ export class Session {
         return this.orchestrator.queuedCount;
       },
       afterEdit: () => this.orchestrator.tick(),
+      // A prompt raised by a turn nobody is waiting on has no one left to
+      // serve; denying it at once unblocks the research loop, which otherwise
+      // sat out the approval's five-minute timeout before seeing the stop.
+      turnAborted: () => this.approvals.clear(isPlannerApproval),
     });
 
     this.editor = new PlanEditor({
@@ -658,6 +662,7 @@ export class Session {
   private beginFreshPlan(): void {
     if (this.isExecuting) this.stopExecution();
     this.events.dropSubagentRuns();
+    this.conversation.abandonTurn();
     this.conversation.reset();
     // Totals belong to the plan they were recorded under; a fresh plan starts
     // its ledger from zero so the previous session's line never lingers.
@@ -737,38 +742,15 @@ export class Session {
   get isExecuting(): boolean { return this.orchestrator.hasLiveWork; }
   get status(): 'approved' | 'running' | 'completed' { return this.orchestrator.status; }
 
-  /**
-   * Deny every parked approval as soon as a planning turn is aborted, for the
-   * same reason `beginFreshPlan` does it: a prompt raised by a turn nobody is
-   * waiting on has no one left to serve, and denying it unblocks the research
-   * loop instead of stranding it. Without this the request sat out its
-   * five-minute timeout and the loop then carried on as if nothing had
-   * happened — the abort was real, but invisible until long after the user
-   * pressed stop.
-   *
-   * The listener is returned as a disposer rather than left attached: callers
-   * own the signal and may reuse it, and a leaked listener would deny the
-   * *next* turn's prompts the moment that stale signal aborted.
-   */
-  private denyApprovalsOnAbort(signal: AbortSignal | undefined): () => void {
-    if (!signal) return () => {};
-    if (signal.aborted) {
-      this.approvals.clear(isPlannerApproval);
-      return () => {};
-    }
-    const onAbort = () => this.approvals.clear(isPlannerApproval);
-    signal.addEventListener('abort', onAbort);
-    return () => signal.removeEventListener('abort', onAbort);
-  }
+  /** Whether a planner turn — a reply, a compaction, plan generation — holds the conversation. */
+  get isPlannerBusy(): boolean { return this.conversation.isTurnInFlight; }
 
-  /** Run a planner call with {@link denyApprovalsOnAbort} wired for its duration only. */
-  private async withAbortDenial<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
-    const releaseAbort = this.denyApprovalsOnAbort(signal);
-    try {
-      return await fn();
-    } finally {
-      releaseAbort();
-    }
+  /**
+   * Stop the planner turn in flight. It still settles — a backend hands back
+   * what it had — and ends as stopped. False when no turn is in flight.
+   */
+  abortPlannerTurn(): boolean {
+    return this.conversation.stopTurn();
   }
 
   async generatePlan(goal: string, runners: RunnerId[], options?: GeneratePlanOptions): Promise<LegacyPlanState> {
@@ -780,35 +762,38 @@ export class Session {
     const chosenRunners = runners.filter((r) => enabled.includes(r));
     if (chosenRunners.length === 0) throw new Error('None of the requested runners are enabled');
 
-    const { modelsByRunner, runnerModes } = await this.catalog.planning(chosenRunners);
-    const settings = this.settingsFn();
-    // Every planner toggle, not the two this path used to remember: `modesFor`
-    // drops the ones a one-shot run cannot honour, so a structural toggle like
-    // verify — which only appends a task — stops being silently lost between
-    // here and the prompt.
-    const modes = { ...plannerModesFrom(settings, this.config.autonomousMode), isolatedExecution: await this.runs.plannerLayout() };
+    return this.conversation.hold(options?.signal, async (turn) => {
+      const { modelsByRunner, runnerModes } = await this.catalog.planning(chosenRunners);
+      const settings = this.settingsFn();
+      // Every planner toggle, not the two this path used to remember: `modesFor`
+      // drops the ones a one-shot run cannot honour, so a structural toggle like
+      // verify — which only appends a task — stops being silently lost between
+      // here and the prompt.
+      const modes = { ...plannerModesFrom(settings, this.config.autonomousMode), isolatedExecution: await this.runs.plannerLayout() };
 
-    const plan = await this.withAbortDenial(options?.signal, () => this.planner.generate({
-      goal,
-      runners: chosenRunners,
-      modelsByRunner,
-      runnerModes,
-      autonomousDefault: this.config.autonomousMode,
-      fs: this.fsAdapter,
-      fetcher: this.fetcher,
-      onProgress: (p) => this.events.progress(p),
-      signal: options?.signal,
-      perRunnerAllowlist: settings.modelAllowlist,
-      modes,
-    }));
+      const plan = await this.planner.generate({
+        goal,
+        runners: chosenRunners,
+        modelsByRunner,
+        runnerModes,
+        autonomousDefault: this.config.autonomousMode,
+        fs: this.fsAdapter,
+        fetcher: this.fetcher,
+        onProgress: (p) => this.events.progress(p),
+        signal: turn.signal,
+        perRunnerAllowlist: settings.modelAllowlist,
+        modes,
+      });
+      if (turn.abandoned) throw new PlannerTurnDiscardedError();
 
-    this.plan = plan;
-    this.saved(() => {
-      this.orchestrator.loadPlan(plan.tasks, plan.runners);
-      this.store.resetForRun({ preserveCompleted: false });
+      this.plan = plan;
+      this.saved(() => {
+        this.orchestrator.loadPlan(plan.tasks, plan.runners);
+        this.store.resetForRun({ preserveCompleted: false });
+      });
+      this.events.planGenerated(this.plan, this.goal);
+      return plan;
     });
-    this.events.planGenerated(this.plan, this.goal);
-    return plan;
   }
 
   /**
@@ -825,11 +810,10 @@ export class Session {
     const chosenRunners = runners.filter((r) => enabled.includes(r));
     if (chosenRunners.length === 0) throw new Error('None of the requested runners are enabled');
 
-    const opening = await this.conversationOpening(chosenRunners);
     const now = new Date().toISOString();
     this.plan = { tasks: [], generatedAt: now, status: 'draft', runners: chosenRunners, lastUpdated: now };
 
-    return this.withAbortDenial(options?.signal, () => this.conversation.start(this.goal, opening, options?.signal));
+    return this.conversation.start(this.goal, () => this.conversationOpening(chosenRunners), options?.signal);
   }
 
   /**
@@ -841,10 +825,10 @@ export class Session {
     // A turn that failed before persist leaves its runs unflushed; drop them so
     // the next turn's log cannot absorb a previous turn's uncommitted activity.
     this.events.dropSubagentRuns();
-    return this.withAbortDenial(options?.signal, () => this.conversation.reply(this.resolveSkillInvocation(userMessage), {
+    return this.conversation.reply(this.resolveSkillInvocation(userMessage), {
       signal: options?.signal,
       verbatim: userMessage,
-    }));
+    });
   }
 
   /**
@@ -888,7 +872,7 @@ export class Session {
    */
   async compactConversation(signal?: AbortSignal): Promise<ConversationCompaction> {
     if (!this.plan) throw new ConversationEditError('No planning conversation to condense');
-    return this.withAbortDenial(signal, () => this.conversation.compact(signal));
+    return this.conversation.compact(signal);
   }
 
   rewindTargets(): RewindTarget[] {
@@ -1455,6 +1439,7 @@ export class Session {
     // a drop, the first user send reseeds it from this plan's own transcript.
     const adopting = plan !== this.plan;
     if (adopting) {
+      this.conversation.abandonTurn();
       this.conversation.reset();
       // The execution log and queued messages are scoped to the outgoing plan;
       // callers restoring a saved queue re-apply it after adoption.
@@ -1496,6 +1481,7 @@ export class Session {
     // Planning research runs on a separate conduit from task execution — a
     // live spawn_research_agent/bash tool call would otherwise keep running
     // server-side after the client has already moved on to a new session.
+    this.conversation.abandonTurn();
     this.conversation.reset();
     // Deny any still-pending approval prompts so their timers and awaited
     // continuations settle before the Session goes away.

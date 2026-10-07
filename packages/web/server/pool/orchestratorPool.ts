@@ -2,7 +2,6 @@ import { WebSocket } from 'ws';
 import {
   Session,
   createSession,
-  ConversationBusyError,
   type ConversationCompaction,
   type ConversationFork,
   type SessionMessage,
@@ -80,10 +79,6 @@ export interface OrchestratorPoolDeps {
 export class OrchestratorPool {
   private sessions = new Map<string, Session>();
   private clients = new Map<string, Set<WebSocket>>();
-  /** The in-flight planning turn's abort controller, one per session — see `cancelPlanning`. */
-  private planningAborts = new Map<string, AbortController>();
-  /** Sessions whose planning slot a compaction holds; a reply must not take it over. */
-  private compacting = new Set<string>();
   private registry: CoreRunnerRegistry = (() => { const r = new RunnerRegistry(); r.loadUserPlugins(); return r; })();
   private modelResolver: ModelResolver;
   private runnerInstallation = new RunnerInstallation(this.registry);
@@ -487,14 +482,7 @@ export class OrchestratorPool {
     // the session is in this map. Registering only on return made the first
     // approval of every session unanswerable until its 5-minute timeout.
     this.sessions.set(sessionId, session);
-    const controller = new AbortController();
-    this.planningAborts.set(sessionId, controller);
-    try {
-      const plan = await session.generatePlan(goal, runners, { signal: controller.signal });
-      return migratePlanState(plan);
-    } finally {
-      this.clearPlanningAbort(sessionId, controller);
-    }
+    return migratePlanState(await session.generatePlan(goal, runners));
   }
 
   /**
@@ -509,72 +497,28 @@ export class OrchestratorPool {
     // See generatePlan: must be registered before the blocking call so a
     // mid-research approval is answerable rather than 404ing until timeout.
     this.sessions.set(sessionId, session);
-    const controller = new AbortController();
-    this.planningAborts.set(sessionId, controller);
-    try {
-      return await session.startPlanning(goal, runners, { signal: controller.signal });
-    } finally {
-      this.clearPlanningAbort(sessionId, controller);
-    }
+    return session.startPlanning(goal, runners);
   }
 
-  /**
-   * Continue the planner dialogue with the user's reply. Refused during a
-   * compaction before the abort slot is touched: the session refuses the reply
-   * too, but by then the compaction's controller would be gone and a stop could
-   * no longer reach its summary turn.
-   */
+  /** Continue the planner dialogue with the user's reply; refused while a planner turn is in flight. */
   async continuePlanning(sessionId: string, message: string): Promise<LegacyPlanState> {
-    if (this.compacting.has(sessionId)) throw new ConversationBusyError('send a message');
-    const controller = new AbortController();
-    this.planningAborts.set(sessionId, controller);
-    try {
-      return await this.session(sessionId).continueConversation(message, { signal: controller.signal });
-    } finally {
-      this.clearPlanningAbort(sessionId, controller);
-    }
+    return this.session(sessionId).continueConversation(message);
   }
 
-  /**
-   * Condense a session's conversation. The summary turn is a planning turn as
-   * far as a surface is concerned, so it registers the same abort controller
-   * and `cancelPlanning` stops it — but only when no turn holds that slot
-   * already: taking it over would leave the reply in flight beyond stopping.
-   */
+  /** Condense a session's conversation. The summary turn is a planner turn, so `cancelPlanning` stops it. */
   async compactConversation(sessionId: string): Promise<ConversationCompaction & { plan: LegacyPlanState }> {
     const session = this.session(sessionId);
-    if (this.planningAborts.has(sessionId)) throw new ConversationBusyError('condense the conversation');
-    const controller = new AbortController();
-    this.planningAborts.set(sessionId, controller);
-    this.compacting.add(sessionId);
-    try {
-      const compaction = await session.compactConversation(controller.signal);
-      return { ...compaction, plan: session.planState! };
-    } finally {
-      this.compacting.delete(sessionId);
-      this.clearPlanningAbort(sessionId, controller);
-    }
+    const compaction = await session.compactConversation();
+    return { ...compaction, plan: session.planState! };
   }
 
   /**
-   * Abort the planning turn in flight for a session, if any. Answers whether
+   * Abort the planner turn in flight for a session, if any. Answers whether
    * there was one to cancel — the route reports that rather than 404ing a
    * session that simply is not planning right now.
    */
   cancelPlanning(sessionId: string): boolean {
-    const controller = this.planningAborts.get(sessionId);
-    if (!controller) return false;
-    controller.abort();
-    return true;
-  }
-
-  /**
-   * Only clears the map entry if it still holds the controller this turn
-   * created — a later turn may already have installed its own by the time
-   * this one's `finally` runs (a fresh request racing a slow abort).
-   */
-  private clearPlanningAbort(sessionId: string, controller: AbortController): void {
-    if (this.planningAborts.get(sessionId) === controller) this.planningAborts.delete(sessionId);
+    return this.sessions.get(sessionId)?.abortPlannerTurn() ?? false;
   }
 
   /**
@@ -636,11 +580,7 @@ export class OrchestratorPool {
     return session;
   }
 
-  // The Session drops its planner context, but the model call in flight is
-  // the pool's to abort: it holds the only signal that reaches it.
   destroy(sessionId: string): void {
-    this.planningAborts.get(sessionId)?.abort();
-    this.planningAborts.delete(sessionId);
     this.sessions.get(sessionId)?.destroy();
     this.sessions.delete(sessionId);
   }

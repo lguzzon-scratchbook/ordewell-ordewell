@@ -44,11 +44,12 @@ describe('POST /:sessionId/planning/stop', () => {
 /**
  * The two tests above assert on a mocked pool — they pin the route's contract
  * but not the wiring. This drives the real seam a live daemon uses: the HTTP
- * route, a real OrchestratorPool, and a real Session, so the only double is
- * the planner call itself (the one edge no offline test can make real).
+ * route and a real OrchestratorPool, down to the Session planning under that
+ * id, which owns the turn and its stop (core's sessionPlannerTurn tests show
+ * the stop reaching the planner call).
  */
 describe('POST /:sessionId/converse/start then /planning/stop — real daemon wiring', () => {
-  it('aborts the signal a live planning turn is actually waiting on', async () => {
+  it('stops the planner turn of the session that is planning', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'ordewell-planstop-'));
     mkdirSync(join(workspace, '.git'));
     const pool = new OrchestratorPool();
@@ -56,13 +57,10 @@ describe('POST /:sessionId/converse/start then /planning/stop — real daemon wi
     const app = new Hono();
     app.route('/api/plans', plansRoute(pool));
 
-    let capturedSignal: AbortSignal | undefined;
     let resolvePlan!: (v: LegacyPlanState) => void;
     const deferred = new Promise<LegacyPlanState>((resolve) => { resolvePlan = resolve; });
-    const spy = vi.spyOn(Session.prototype, 'startPlanning').mockImplementation(async (_goal, _runners, options) => {
-      capturedSignal = options?.signal;
-      return deferred;
-    });
+    const spy = vi.spyOn(Session.prototype, 'startPlanning').mockReturnValue(deferred);
+    const abort = vi.spyOn(Session.prototype, 'abortPlannerTurn').mockReturnValue(true);
 
     try {
       const startCall = app.request('/api/plans/s-real/converse/start', {
@@ -78,7 +76,7 @@ describe('POST /:sessionId/converse/start then /planning/stop — real daemon wi
 
       expect(stopRes.status).toBe(200);
       expect(await stopRes.json()).toEqual({ cancelled: true });
-      expect(capturedSignal?.aborted).toBe(true);
+      expect(abort.mock.contexts).toEqual([pool.session('s-real')]);
 
       resolvePlan({
         tasks: [], runners: ['claude-code'], generatedAt: new Date().toISOString(),
@@ -88,6 +86,7 @@ describe('POST /:sessionId/converse/start then /planning/stop — real daemon wi
       expect(startRes.status).toBe(200);
     } finally {
       spy.mockRestore();
+      abort.mockRestore();
       pool.destroyAll();
       rmSync(workspace, { recursive: true, force: true });
     }
