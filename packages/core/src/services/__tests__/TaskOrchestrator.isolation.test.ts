@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTaskOrchestrator } from '../TaskOrchestrator';
-import type { TaskOrchestrator } from '../TaskOrchestrator';
+import { TaskOrchestrator } from '../TaskOrchestrator';
 import { createTask, type Task } from '../../models/Task';
 import type { ITerminalRunner } from '../../interfaces/ITerminalRunner';
 import type { IConfig } from '../../interfaces/IConfig';
@@ -26,7 +25,7 @@ function setup(opts: { isolation?: FakeWorktreeIsolation; workspace?: string; co
   const { sessions, spawn, runner } = sessionRunner();
   const notifications = fakeNotification();
   const output = new BufferedTaskOutputSource({ transcripts: { finalAssistantText: async () => null } });
-  const orchestrator = createTaskOrchestrator({
+  const orchestrator = TaskOrchestrator.compose({
     config: fakeConfig(opts.config),
     notifications,
     terminalRunner: runner,
@@ -1411,7 +1410,7 @@ describe('TaskOrchestrator with worktree isolation', () => {
     });
     const isolation = new FakeWorktreeIsolation();
     const { sessions, runner } = sessionRunner();
-    const orchestrator = createTaskOrchestrator({ config: fakeConfig(), notifications: fakeNotification(), terminalRunner: runner, output, isolation });
+    const orchestrator = TaskOrchestrator.compose({ config: fakeConfig(), notifications: fakeNotification(), terminalRunner: runner, output, isolation });
     const t1 = task('t1', 1);
     orchestrator.loadPlan([t1]);
     await orchestrator.approveReview();

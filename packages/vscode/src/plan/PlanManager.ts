@@ -67,7 +67,6 @@ export function resolveRunnerSet(
 
 export function finishPlannerTurn(
   plan: LegacyPlanState,
-  currentGoal: string,
   deps: PlanManagerDeps,
   opts?: { planChanged?: boolean },
 ): void {
@@ -76,7 +75,6 @@ export function finishPlannerTurn(
     if (planChanged) {
       deps.chatProvider.planGenerated(plan);
     }
-    deps.chatProvider.setGoal(currentGoal);
   } else {
     deps.chatProvider.setState('planDraft');
   }
@@ -144,7 +142,7 @@ async function inPlannerTurn(deps: PlanManagerDeps, run: () => Promise<void>): P
  */
 function adoptTurnPlan(prior: string, plan: LegacyPlanState, deps: PlanManagerDeps): void {
   deps.setCurrentPlan(plan);
-  finishPlannerTurn(plan, deps.getCurrentGoal(), deps, { planChanged: JSON.stringify(plan.tasks) !== prior });
+  finishPlannerTurn(plan, deps, { planChanged: JSON.stringify(plan.tasks) !== prior });
 }
 
 export async function handleStartPlanning(
@@ -161,7 +159,7 @@ export async function handleStartPlanning(
     const plan = await deps.session.startPlanning(userDescription, runners);
     deps.setCurrentGoal(userDescription);
     deps.setCurrentPlan(plan);
-    finishPlannerTurn(plan, userDescription, deps);
+    finishPlannerTurn(plan, deps);
   });
 }
 
@@ -403,7 +401,6 @@ export function handleNewSession(deps: Pick<PlanManagerDeps,
   deps.setCurrentGoal('');
   deps.chatProvider.setState('empty');
   deps.chatProvider.conversation.reset();
-  deps.chatProvider.setGoal('');
   clearState(deps.fsAdapter.getWorkspaceRoot());
   deps.log('New session started');
 }

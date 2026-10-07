@@ -1,4 +1,4 @@
-import type { ApprovalDecision, AwaitingReason, ConversationMessage, PlannerUsage, ResearchLogEntry, RunnerTransport, SessionMessage, SettingsResponse, TaskLogEvent } from '@ordewell/core';
+import type { AiProvider, ApprovalDecision, AwaitingReason, ConversationMessage, PlannerUsage, ResearchLogEntry, RunnerTransport, SessionMessage, SettingsResponse, TaskLogEvent } from '@ordewell/core';
 import type { Key } from '../keys';
 import type {
   GateView, HandoffView, LandedTaskView, ModelView, ModeView, RewindTargetView, RunnerView, SessionView,
@@ -128,7 +128,7 @@ export type Action =
   /** The execution socket dropped before the run reported an end; whatever the pane shows as running no longer has a feed. */
   | { type: 'executionLost'; sessionId?: string }
   | { type: 'settingsLoaded'; settings: Partial<SettingsResponse> }
-  | { type: 'modelsLoaded'; models: ModelView[]; orchestratorModels?: ModelView[]; providers?: string[]; providerErrors?: Record<string, string>; modesByRunner?: Record<string, ModeView[]> }
+  | { type: 'modelsLoaded'; models: ModelView[]; orchestratorModels?: ModelView[]; providers?: AiProvider[]; providerErrors?: Record<string, string>; modesByRunner?: Record<string, ModeView[]> }
   | { type: 'sessionsLoaded'; sessions: SessionView[] }
   | { type: 'sessionForked'; sessionId: string; goal: string }
   | { type: 'inputPrefilled'; text: string; sessionId?: string }

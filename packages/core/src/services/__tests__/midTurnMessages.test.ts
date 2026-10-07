@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { StructuredRunner } from '../StructuredRunner';
-import { createTaskOrchestrator } from '../TaskOrchestrator';
+import { TaskOrchestrator } from '../TaskOrchestrator';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import { createTask } from '../../models/Task';
 import { RunnerRegistry } from '../../plugins/RunnerRegistry';
@@ -433,7 +433,7 @@ describe('the attempt\'s verdict when a message is read mid-turn', () => {
       stopAll: () => session.kill(),
       activeCount: 1,
     } satisfies ITerminalRunner;
-    const orchestrator = createTaskOrchestrator({
+    const orchestrator = TaskOrchestrator.compose({
       config: fakeConfig(), notifications: fakeNotification(), terminalRunner: runner,
       output: new BufferedTaskOutputSource({ transcripts: { finalAssistantText: async () => null } }),
       registry: new RunnerRegistry(), workspaceRoot: () => '/repo',
@@ -621,7 +621,7 @@ describe('force send through the orchestrator', () => {
       stopAll: () => session.kill(),
       activeCount: 1,
     } satisfies ITerminalRunner;
-    const orchestrator = createTaskOrchestrator({
+    const orchestrator = TaskOrchestrator.compose({
       config: fakeConfig(), notifications: fakeNotification(), terminalRunner: runner,
       output: new BufferedTaskOutputSource({ transcripts: { finalAssistantText: async () => null } }),
       registry: new RunnerRegistry(), workspaceRoot: () => '/repo',

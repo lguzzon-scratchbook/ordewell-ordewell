@@ -62,22 +62,12 @@ describe('ChatViewProvider after its webview is disposed', () => {
     executeCommand.mockClear();
 
     dispose();
-    provider.setGoal('late');
+    provider.setConversationBusy(true);
     provider.reveal();
 
     expect(posted).toEqual([]);
     expect(view.show).not.toHaveBeenCalled();
     expect(executeCommand).toHaveBeenCalledWith('ordewellChatView.focus');
-  });
-});
-
-describe('ChatViewProvider.setGoal', () => {
-  it('never sends a state transition — an empty goal must not wipe the webview timeline', () => {
-    const { provider, posted } = providerWithCapture();
-    provider.setGoal('');
-    provider.setGoal('build a login page');
-    expect(posted.map((m) => m.type)).toEqual(['setGoal', 'setGoal']);
-    expect(posted.some((m) => m.type === 'setState')).toBe(false);
   });
 });
 

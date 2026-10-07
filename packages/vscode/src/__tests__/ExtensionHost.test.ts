@@ -48,7 +48,6 @@ function fakeChat() {
     setState: vi.fn(),
     showError: vi.fn(),
     showPlan: vi.fn(),
-    setGoal: vi.fn(),
     planGenerated: vi.fn(),
     planApproved: vi.fn(),
     setSkillToggles: vi.fn(),
@@ -63,7 +62,6 @@ function fakeChat() {
     sendConfiguredProviders: vi.fn(),
     setModelConfig: vi.fn(),
     setModelOptions: vi.fn(),
-    setModelApiMapping: vi.fn(),
     setModelDiscoveryErrors: vi.fn(),
     setPlannerBackends: vi.fn(),
     showPendingPlanEdits: vi.fn(),
@@ -282,7 +280,7 @@ describe('the extension host wires one state, one deps bag and one lifecycle', (
     expect(h.vscodeApi.api.commands.registerCommand).toHaveBeenCalledWith('ordewell.setMaxParallel', expect.any(Function));
   });
 
-  it('replays plan, goal, planner state and models when the webview reconnects', async () => {
+  it('replays plan, planner state and models when the webview reconnects', async () => {
     await h.host.start();
 
     h.chat.messages.fire({ type: 'sendMessage', text: 'build a parser', typed: true });
@@ -290,7 +288,6 @@ describe('the extension host wires one state, one deps bag and one lifecycle', (
 
     h.chat.provider.resendAllState.mockClear();
     h.chat.provider.showPlan.mockClear();
-    h.chat.provider.setGoal.mockClear();
     h.chat.provider.setModels.mockClear();
 
     h.chat.messages.fire({ type: 'ready' });
@@ -300,7 +297,6 @@ describe('the extension host wires one state, one deps bag and one lifecycle', (
     expect(h.chat.provider.showPlan).toHaveBeenCalledWith(expect.objectContaining({
       tasks: [expect.objectContaining({ id: 't1' })],
     }));
-    expect(h.chat.provider.setGoal).toHaveBeenCalledWith('build a parser');
     expect(h.chat.provider.setRunnerTransport).toHaveBeenCalledWith('structured');
     await vi.waitFor(() => expect(h.chat.provider.setModels).toHaveBeenCalledWith(models));
     await vi.waitFor(() => expect(h.chat.provider.setPlannerBackends).toHaveBeenCalledWith(

@@ -49,7 +49,7 @@ export async function handlePlanner(subArgs: string[], injectedApi?: ApiClient):
       : `Planner set to ${meta.label}.`,
   );
   console.log(plannerModelLine(recall));
-  if (!isCliProvider(provider as AiProvider) && !catalog.providers.includes(provider)) {
+  if (!isCliProvider(provider as AiProvider) && !catalog.providers.includes(provider as AiProvider)) {
     console.log(`  No ${meta.apiKeyEnvVar} configured yet — set one with \`ordewell key set ${provider} <key>\`.`);
   }
 }

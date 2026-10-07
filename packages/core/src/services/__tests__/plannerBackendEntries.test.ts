@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { plannerBackendEntries, HARNESS_PLANNER_REASON, type PlannerUsability } from '../ProviderRegistry';
+import { plannerBackendEntries, HARNESS_PLANNER_REASON, HARNESS_PLANNER_UNAVAILABLE_REASON, type PlannerUsability } from '../ProviderRegistry';
 
 describe('plannerBackendEntries', () => {
   it('lists harness planners first, then configured vendors in PROVIDER_PRIORITY order', () => {
@@ -35,9 +35,10 @@ describe('plannerBackendEntries', () => {
     expect(codex).toMatchObject({ usable: false, reason: 'codex is not installed or is not on PATH.' });
   });
 
-  it('treats a runner absent from the usability map as unusable', () => {
+  it('treats a runner absent from the usability map as unusable, with an accurate reason', () => {
     const codex = plannerBackendEntries({}, []).find((e) => e.id === 'codex')!;
     expect(codex.usable).toBe(false);
+    expect(codex.reason).toBe(HARNESS_PLANNER_UNAVAILABLE_REASON);
   });
 
   it('offers vendors with their API-key variable as the reason, always usable', () => {

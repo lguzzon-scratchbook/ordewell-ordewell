@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTaskOrchestrator, TaskControlError } from '../TaskOrchestrator';
+import { TaskOrchestrator, TaskControlError } from '../TaskOrchestrator';
 import { createTask, type Task } from '../../models/Task';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import { serializeTaskStatus } from '../SessionMessage';
@@ -42,7 +42,7 @@ function routingRunner(opts: { resumes?: (id: string) => string | null } = {}) {
 function setup(opts: { runner?: ITerminalRunner; isolation?: IWorktreeIsolation; resumes?: (id: string) => string | null } = {}) {
   const routed = routingRunner({ resumes: opts.resumes });
   const notifications = fakeNotification();
-  const orchestrator = createTaskOrchestrator({
+  const orchestrator = TaskOrchestrator.compose({
     config: fakeConfig({ worktreeIsolation: opts.isolation !== undefined }),
     notifications,
     terminalRunner: opts.runner ?? routed.runner,

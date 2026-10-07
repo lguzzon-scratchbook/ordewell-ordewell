@@ -199,10 +199,8 @@ export type HostToWebview =
   | { type: 'setModesByRunner'; modesByRunner: Record<string, RunnerModeMeta[]> }
   | { type: 'setModelConfig'; modelConfig: { orchestrator: string; orchestratorProvider?: string } }
   | { type: 'setPlannerBackends'; backends: PlannerBackend[]; provider: string; runner?: string; effort?: string }
-  | { type: 'setModelApiMapping'; modelApiMapping: Record<string, AiProvider[]> }
   | { type: 'setModelDiscoveryErrors'; errors: Record<string, string> }
   | { type: 'checkpoint'; taskId: string; taskTitle: string; summary: string }
-  | { type: 'setGoal'; goal: string }
   // Per-task isolation state (ADR-0013) — sent only for tasks that have one, so
   // a shared-root plan's cards stay quiet (US34).
   | { type: 'taskIsolation'; taskId: string; isolation: TaskIsolation }

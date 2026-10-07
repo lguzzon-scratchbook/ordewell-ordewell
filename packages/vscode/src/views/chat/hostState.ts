@@ -1,5 +1,5 @@
-import type { LegacyPlanState, DiscoveredModel, RunnerId, RunnerTransport, IsolationHandoff, IsolationMergeResult, MergeGateView, TaskIsolation, AiProvider } from '@ordewell/core';
-import { EMPTY_HOLD, type PromptHold } from '@ordewell/core/plan-utils';
+import { type LegacyPlanState, type DiscoveredModel, type RunnerId, type RunnerTransport, type IsolationHandoff, type IsolationMergeResult, type MergeGateView, type TaskIsolation, type AiProvider } from '@ordewell/core';
+import { DEFAULT_RUNNERS, EMPTY_HOLD, type PromptHold } from '@ordewell/core/plan-utils';
 import type { HostToWebview, PendingPlanEdit, PlannerBackend, RunnerMeta } from '../../shared/protocol';
 import { applyConversationPatch, EMPTY_PATCHED_VIEW, type PatchedView } from '../../shared/conversationPatch';
 import { appendTaskOutput, type TaskOutputMap } from './taskOutput';
@@ -85,8 +85,8 @@ export const INITIAL_HOST_STATE: HostState = {
   models: [],
   modelsByRunner: {},
   runnerList: [],
-  enabledRunnerIds: ['claude-code'],
-  runners: ['claude-code'],
+  enabledRunnerIds: [...DEFAULT_RUNNERS],
+  runners: [...DEFAULT_RUNNERS],
   pendingEdits: [],
   held: EMPTY_HOLD,
   unsent: null,
@@ -128,7 +128,19 @@ export type HostAction =
   | { type: 'resetSession'; kind: SessionResetKind }
   | { type: 'turnStopped' }
   | { type: 'turnRequested' }
-  | { type: 'patch'; patch: { [K in keyof HostState]?: Updatable<HostState[K]> } };
+  | { type: 'patchPlan'; plan: Updatable<LegacyPlanState | null> }
+  | { type: 'patchResearchActive'; active: boolean }
+  | { type: 'patchExecuting'; executing: boolean }
+  | { type: 'patchError'; error: string }
+  | { type: 'patchReady'; ready: boolean }
+  | { type: 'patchRunners'; runners: Updatable<RunnerId[]> }
+  | { type: 'patchPendingEdits'; edits: Updatable<PendingPlanEdit[]> }
+  | { type: 'patchTddEnabled'; enabled: boolean }
+  | { type: 'patchVerifyEnabled'; enabled: boolean }
+  | { type: 'patchRunnerTransport'; transport: RunnerTransport }
+  | { type: 'patchCheckpoint'; checkpoint: HostState['checkpoint'] }
+  | { type: 'patchDockHeight'; height: number | undefined }
+  | { type: 'patchDockExpanded'; expanded: Updatable<boolean> };
 
 /**
  * Clears what belongs to the previous session. Fields per kind:
@@ -184,14 +196,44 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
     case 'turnRequested':
       return { ...state, stopped: false, sessionCleared: false, error: '', isResearchActive: true };
 
-    case 'patch': {
-      const next: HostState = { ...state };
-      const target = next as unknown as Record<string, unknown>;
-      for (const [key, value] of Object.entries(action.patch)) {
-        target[key] = resolve(value, target[key]);
-      }
-      return next;
-    }
+    case 'patchPlan':
+      return { ...state, plan: resolve(action.plan, state.plan) };
+
+    case 'patchResearchActive':
+      return { ...state, isResearchActive: action.active };
+
+    case 'patchExecuting':
+      return { ...state, isExecuting: action.executing };
+
+    case 'patchError':
+      return { ...state, error: action.error };
+
+    case 'patchReady':
+      return { ...state, isReady: action.ready };
+
+    case 'patchRunners':
+      return { ...state, runners: resolve(action.runners, state.runners) };
+
+    case 'patchPendingEdits':
+      return { ...state, pendingEdits: resolve(action.edits, state.pendingEdits) };
+
+    case 'patchTddEnabled':
+      return { ...state, tddEnabled: action.enabled };
+
+    case 'patchVerifyEnabled':
+      return { ...state, verifyEnabled: action.enabled };
+
+    case 'patchRunnerTransport':
+      return { ...state, runnerTransport: action.transport };
+
+    case 'patchCheckpoint':
+      return { ...state, checkpoint: action.checkpoint };
+
+    case 'patchDockHeight':
+      return { ...state, dockHeight: action.height };
+
+    case 'patchDockExpanded':
+      return { ...state, dockExpanded: resolve(action.expanded, state.dockExpanded) };
 
     case 'setState': {
       const base = action.state === 'empty' ? resetSession(state, 'empty') : state;
@@ -298,7 +340,7 @@ export function reduceHost(state: HostState, action: HostAction): HostState {
       const ids = list.filter((r: RunnerMeta) => r.enabled).map((r: RunnerMeta) => r.id);
       let runners: RunnerId[];
       if (ids.length === 1) runners = ids;
-      else if (ids.length === 0) runners = ['claude-code'];
+      else if (ids.length === 0) runners = [...DEFAULT_RUNNERS];
       else {
         const valid = state.runners.filter((r) => ids.includes(r));
         runners = valid.length > 0 ? valid : ids;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTaskOrchestrator } from '../TaskOrchestrator';
+import { TaskOrchestrator } from '../TaskOrchestrator';
 import { createTask, type LegacyPlanState } from '../../models/Task';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import { serializeTaskStatus } from '../SessionMessage';
@@ -35,7 +35,7 @@ function routingRunner() {
 }
 
 function orchestratorWith(setting: { value: RunnerTransport }, runner: ITerminalRunner) {
-  return createTaskOrchestrator({
+  return TaskOrchestrator.compose({
     config: fakeConfig(),
     notifications: fakeNotification(),
     terminalRunner: runner,

@@ -118,11 +118,8 @@ export class ModelDiscovery {
     void d.refreshPlannerState().catch((err) => d.log(`Planner state refresh failed: ${err}`));
     d.chatProvider.setModelOptions(ModelResolver.builtinOptions());
 
-    const discoveredModelIds = allModels.map((m) => m.modelId);
     this.options().then((opts) => {
       d.chatProvider.setModelOptions(opts);
-      const mapping = modelApiMappingFromOptions(discoveredModelIds, opts);
-      d.chatProvider.setModelApiMapping(mapping);
       // Flag any configured provider whose catalog fetch failed — both in the
       // webview (persistent banner) and as a one-shot toast.
       const errors = d.modelResolver.getDiscoveryErrors();
@@ -296,20 +293,6 @@ function providerLabelForId(id: string): string {
     if (meta?.modelPrefix && id.startsWith(meta.modelPrefix)) return meta.shortLabel;
   }
   return 'OpenRouter';
-}
-
-function modelApiMappingFromOptions(
-  modelIds: string[],
-  options: { id: string; apiProvider?: AiProvider }[],
-): Record<string, AiProvider[]> {
-  const byId = new Map<string, AiProvider>();
-  for (const o of options) if (o.apiProvider) byId.set(o.id, o.apiProvider);
-  const mapping: Record<string, AiProvider[]> = {};
-  for (const id of modelIds) {
-    const provider = byId.get(id);
-    mapping[id] = provider ? [provider] : [];
-  }
-  return mapping;
 }
 
 function modelQuickPickItem(o: PickerOption): vscode.QuickPickItem & { modelId: string } {

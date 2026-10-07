@@ -78,7 +78,7 @@ export interface ModelsResponse {
   /** Each runner's manifest modes, so a surface can offer a per-task mode picker. */
   modesByRunner: Record<string, RunnerModeInfo[]>;
   orchestratorModel: string;
-  providers: string[];
+  providers: AiProvider[];
   /** Full cross-provider catalog for the orchestrator (planner) model picker. */
   orchestratorModels: OrchestratorOption[];
   /** Per-provider catalog-fetch failures, keyed by provider id. */

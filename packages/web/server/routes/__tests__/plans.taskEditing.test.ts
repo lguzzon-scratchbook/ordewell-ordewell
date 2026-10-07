@@ -141,6 +141,15 @@ describe('task editing routes', () => {
 
       expect(res.status).toBe(404);
     });
+
+    it('survives a non-Error throw rather than crashing the route', async () => {
+      session.markTaskIncomplete.mockRejectedValue('boom');
+
+      const res = await app.request('/api/plans/s1/tasks/t1/uncomplete', { method: 'POST' });
+
+      expect(res.status).toBe(404);
+      expect((await res.json() as { error: string }).error).toBe('Not found');
+    });
   });
 
   describe('DELETE /tasks/:taskId', () => {

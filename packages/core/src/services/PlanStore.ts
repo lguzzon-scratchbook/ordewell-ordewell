@@ -339,32 +339,6 @@ export class PlanStore {
     if (task) task.transport = transport;
   }
 
-  getPlanVisualization(): { tasks: { id: string; title: string; dependencies: string[]; parallelGroups: number[][] }[]; parallelGroups: number[][] } {
-    const unscheduled = new Set(this._planTasks.map(t => t.id));
-    const completed = new Set<string>();
-    const parallelGroups: number[][] = [];
-
-    while (unscheduled.size > 0) {
-      const batch: string[] = [];
-      for (const t of this._planTasks) {
-        if (!unscheduled.has(t.id)) continue;
-        if (t.dependencies.length > 0 && t.dependencies.some(depId => !completed.has(depId))) continue;
-        batch.push(t.id);
-      }
-      if (batch.length === 0) break;
-      for (const id of batch) {
-        unscheduled.delete(id);
-        completed.add(id);
-      }
-      parallelGroups.push(batch.map(id => this._taskMap.get(id)?.order ?? 0).sort((a, b) => a - b));
-    }
-
-    return {
-      tasks: this._planTasks.map(t => ({ id: t.id, title: t.title, dependencies: [...t.dependencies], parallelGroups: [] })),
-      parallelGroups,
-    };
-  }
-
   /**
    * Widen the plan's runner set. Retargeting a task onto a runner the plan has
    * not used before has to land here as well as on the plan state, or

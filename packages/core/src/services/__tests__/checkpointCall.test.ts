@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { createTaskOrchestrator } from '../TaskOrchestrator';
+import { TaskOrchestrator } from '../TaskOrchestrator';
 import { createTask, type Task } from '../../models/Task';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import { StructuredRunner } from '../StructuredRunner';
@@ -81,7 +81,7 @@ async function asking() {
     interruptGraceMs: 20,
   });
   runners.push(runner);
-  const orchestrator = createTaskOrchestrator({
+  const orchestrator = TaskOrchestrator.compose({
     config: fakeConfig(), notifications: fakeNotification(), terminalRunner: runner,
     output: new BufferedTaskOutputSource({ transcripts: { finalAssistantText: async () => null } }),
     registry: new RunnerRegistry(), workspaceRoot: () => '/repo',

@@ -7,8 +7,7 @@ import { sharedMcpServer, type OrdewellMcpServer, type PlannerToolHandler } from
 import { ConversationEditError, PlannerConversation, PlannerTurnDiscardedError, type ConversationCompaction, type ConversationOpening, type PlannerConversationHost, type PlannerSubmission, type RewindTarget } from './PlannerConversation';
 import { forkPlanState, type ForkedDialogue } from './conversationFork';
 import { Planner } from './Planner';
-import { createTaskOrchestrator } from './TaskOrchestrator';
-import type { OrchestratorObserver, TaskOrchestrator } from './TaskOrchestrator';
+import { TaskOrchestrator, type OrchestratorObserver } from './TaskOrchestrator';
 import { PlanStore } from './PlanStore';
 import { ApprovalPolicy } from './ApprovalPolicy';
 import { PendingApprovals, type PendingApproval } from './PendingApprovals';
@@ -310,7 +309,7 @@ export function createSession(deps: SessionDeps): Session {
     },
   });
   const runnerApprovals = new RunnerApprovals(approvals);
-  const orchestrator = createTaskOrchestrator({
+  const orchestrator = TaskOrchestrator.compose({
     config: deps.config,
     notifications: deps.notifications,
     terminalRunner: taskLogs.wrap(runnerApprovals.wrap(deps.runner)),

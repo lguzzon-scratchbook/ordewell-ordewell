@@ -16,3 +16,6 @@ export * from './conversation';
 // from the facts the TUI paints its plan row from.
 export * from './taskRow';
 export { taskOrderLabel, taskRef, titledTaskRef } from './order-labels';
+// The one runner default, shared with the webview so its initial state cannot
+// drift from the plans the host builds.
+export { DEFAULT_RUNNERS } from './models/Task';

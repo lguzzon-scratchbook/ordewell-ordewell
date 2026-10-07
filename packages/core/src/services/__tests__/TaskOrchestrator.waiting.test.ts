@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createTaskOrchestrator, TaskControlError, type TaskOrchestrator } from '../TaskOrchestrator';
+import { TaskOrchestrator, TaskControlError } from '../TaskOrchestrator';
 import { createTask, type LegacyPlanState, type Task } from '../../models/Task';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import { serializeTaskStatus, type SessionMessage } from '../SessionMessage';
@@ -23,7 +23,7 @@ function setup(transport: RunnerTransport = 'structured') {
     stopAll: vi.fn(),
     activeCount: 0,
   } satisfies ITerminalRunner;
-  const orchestrator = createTaskOrchestrator({
+  const orchestrator = TaskOrchestrator.compose({
     config: fakeConfig(),
     notifications: fakeNotification(),
     terminalRunner: runner,

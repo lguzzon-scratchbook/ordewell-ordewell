@@ -8,6 +8,7 @@ import {
   type ResearchStep,
   type RunnerId,
   type LegacyPlanState,
+  DEFAULT_RUNNERS,
 } from '../../models/Task';
 import { addUsage, type UsageTotals } from '../../models/Usage';
 import type { IConfig } from '../../interfaces/IConfig';
@@ -654,7 +655,7 @@ export class CliAgentAiService implements IAiService {
 
   async generatePlanDirect(
     userDescription: string,
-    runners: RunnerId[] = ['claude-code'],
+    runners: RunnerId[] = [...DEFAULT_RUNNERS],
     modelsByRunner: Partial<Record<RunnerId, DiscoveredModel[]>> = {},
     onToken?: (token: string) => void,
     _fs?: IFileSystem,

@@ -1,4 +1,4 @@
-import { AiProvider, BaseConfig, isCliProvider, normalizeGeminiModel, resolveProvider } from '@ordewell/core';
+import { AiProvider, BaseConfig, DEFAULT_RUNNERS, isCliProvider, normalizeGeminiModel, resolveProvider } from '@ordewell/core';
 import type { ProviderModelLists } from '@ordewell/core';
 
 interface WebConfigOpts {
@@ -104,7 +104,7 @@ export class WebConfig extends BaseConfig {
     if (process.env.ORDEWELL_OPENCODE_ENABLED === 'true' || process.env.ORDEWELL_OPENCODE_ENABLED === '1') {
       out.push('opencode');
     }
-    return out.length > 0 ? out : ['claude-code'];
+    return out.length > 0 ? out : [...DEFAULT_RUNNERS];
   }
 
 }

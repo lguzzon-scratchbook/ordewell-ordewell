@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { AiProvider, BaseConfig, DEFAULT_MAX_PARALLEL, parseMaxParallel, normalizeGeminiModel, resolveProvider, ALL_PROVIDERS, getProviderMeta, configuredProviders } from '@ordewell/core';
+import { AiProvider, BaseConfig, DEFAULT_MAX_PARALLEL, DEFAULT_RUNNERS, parseMaxParallel, normalizeGeminiModel, resolveProvider, ALL_PROVIDERS, getProviderMeta, configuredProviders } from '@ordewell/core';
 import type { ProviderModelLists } from '@ordewell/core';
 import { SecretStore, type ApiProvider, type SecretKey } from './SecretStore';
 
@@ -220,7 +220,7 @@ export class VsCodeConfig extends BaseConfig {
     }
     if (legacyCodex !== undefined && legacyCodex) enabled.push('codex');
     if (legacyOc !== undefined && legacyOc) enabled.push('opencode');
-    return enabled.length > 0 ? enabled : ['claude-code'];
+    return enabled.length > 0 ? enabled : [...DEFAULT_RUNNERS];
   }
 
   get maxParallelSessions() { return parseMaxParallel(this.config.get<number>('maxParallelSessions', DEFAULT_MAX_PARALLEL)) ?? DEFAULT_MAX_PARALLEL; }
