@@ -140,6 +140,13 @@ export interface Segment {
   cwd?: string[];
   /** Something else on the line can change where this `cd` lands — see {@link markShellState}. */
   cdSteered?: boolean;
+  /**
+   * A cmd.exe command word this lexer cannot read as a clean name: it holds a
+   * `/` (cmd ends a name there, so `C:/…/rm.exe` is a drive plus a switch, not a
+   * path) or a `=` (cmd has no `NAME=value cmd` prefix). Refused rather than
+   * basenamed, where the basename would drop the part that decides what runs.
+   */
+  ambiguousCmdName?: string;
 }
 
 /** An output redirect whose target is not provably a no-op (`/dev/null`, an fd duplication). */
@@ -162,6 +169,12 @@ export interface Lexed {
   unbalanced: boolean;
   /** A substitution holds a construct that hides where it ends — see {@link matchParen}. */
   unreadable?: boolean;
+  /**
+   * An unquoted `(( … ))` arithmetic command. The lexer does not evaluate
+   * arithmetic, and a `<<` inside it is a left-shift, not a here-document — so
+   * rather than read it wrong, the whole line is refused.
+   */
+  arithmetic?: boolean;
   /**
    * A cmd.exe command word starts with `/`. cmd.exe reads it as a switch, and
    * after a `;` — a space to cmd.exe, a separator here — as one belonging to
@@ -354,6 +367,7 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
   let processSubstitution = false;
   let unbalanced = false;
   let unreadable = false;
+  let arithmetic = false;
   let switchName: string | undefined;
   let grouped = false;
   let joinedBy: Segment['joinedBy'];
@@ -387,6 +401,12 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
   let braceOpen = false;
   let braceList = false;
 
+  // An unquoted `#` has opened a comment that runs to the end of this physical
+  // line. The lexer does not otherwise model comments (it over-refuses a `;` or
+  // `rm` written in one, which is safe), but a `<<` in a comment is not a
+  // here-document, so while this is set no here-document is opened.
+  let inComment = false;
+
   const endToken = (hardBoundary = true) => {
     braceOpen = false;
     braceList = false;
@@ -417,8 +437,9 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
   };
   // cmd.exe ends a command name at an unquoted `/` or `,` and skips `,` and
   // `=` before one — escaped ones too, since it strips `^` before reading the
-  // name. A `=` inside the name is left alone: the word is then an assignment,
-  // which the policy refuses.
+  // name. A `=` inside the name is left alone, and a `/` after a drive letter
+  // is not split off: either leaves the word holding a delimiter, which
+  // `toSegment` refuses rather than basename down to the wrong name.
   const nameDelimiter = (ch: string): boolean => {
     if (!dialect.nameDelimiters.includes(ch) || tokens.length > 0 || redirectTarget) return false;
     if (!started) {
@@ -427,6 +448,8 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
       return false;
     }
     if (ch === '=') return false;
+    // `C:/…` is one drive-absolute path, not the drive `C:` plus a `/switch`.
+    if (ch === '/' && /^[A-Za-z]:/.test(current)) return false;
     endToken();
     if (ch === '/') { current = ch; started = true; }
     return true;
@@ -503,6 +526,19 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
       expandable = true;
       current += c; started = true; i++; continue;
     }
+    // `${…}` and old-style `$[…]` arithmetic are consumed whole, so a `<<`
+    // inside one (`${x:-a<<b}`, `$[1<<2]`) is never read as a here-document
+    // operator. A nested construct could hide where the expansion ends — the
+    // same risk `matchParen` refuses inside `$(…)` — so one refuses rather than
+    // guess; a plain expansion is kept in the word as written.
+    if (dialect.dollarQuotes && (command[i + 1] === '{' || command[i + 1] === '[') && c === '$') {
+      const closeCh = command[i + 1] === '{' ? '}' : ']';
+      const end = command.indexOf(closeCh, i + 2);
+      if (end < 0) { unbalanced = true; break; }
+      if (/[()'"`$\\{\n]/.test(command.slice(i + 2, end))) { unreadable = true; break; }
+      current += command.slice(i, end + 1); started = true; expandable = true;
+      i = end + 1; continue;
+    }
     if (dialect.expansion.test(command.slice(i, i + 2))) {
       expandable = true;
       current += c; started = true; i++; continue;
@@ -549,7 +585,7 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
       if (c === '>') {
         redirectTarget = 'write';
         redirectOperator = fd + c.repeat(run);
-      } else if (run === 2 && dialect.hereDocuments) {
+      } else if (run === 2 && dialect.hereDocuments && !inComment) {
         redirectTarget = 'heredoc';
         hereDocStripTabs = command[i + run] === '-';
         if (hereDocStripTabs) i++;
@@ -571,6 +607,12 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
       continue;
     }
 
+    // `(( … ))` arithmetic: a `<<` inside it is a left-shift, not a
+    // here-document, and the lexer does not evaluate arithmetic — refuse rather
+    // than read it as either. `$((…))` never reaches here: its `$(` is consumed
+    // above. A genuine nested subshell `( (…) )` has a space between the parens.
+    if (c === '(' && command[i + 1] === '(' && dialect.dollarQuotes) { arithmetic = true; break; }
+
     // Subshell grouping is not part of any token: `(rm -rf /)` must lex to `rm`.
     if (c === '(' || c === ')') { endToken(); grouped = true; i++; continue; }
 
@@ -583,6 +625,7 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
     }
     if (c === '&' || c === ';' || c === '\n') {
       endSegment(false, c === '&' && command[i + 1] === '&' ? 'and' : 'other');
+      if (c === '\n') inComment = false;
       if (c === '\n' && hereDocs.length > 0) {
         const end = skipHereDocuments(command, i + 1, hereDocs.splice(0), nested, dialect);
         if (end === UNREADABLE) { unreadable = true; break; }
@@ -596,7 +639,10 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
     if (/\s/.test(c)) { endToken(false); i++; continue; }
     if (quote === '' && nameDelimiter(c)) { i++; continue; }
 
-    if (c === '{') braceOpen = true;
+    // A `#` at a word boundary opens a comment for the rest of this line; only
+    // its effect on here-document opening is modeled (see {@link inComment}).
+    if (c === '#' && !started && dialect.hereDocuments) inComment = true;
+    else if (c === '{') braceOpen = true;
     else if (braceOpen && (c === ',' || (c === '.' && command[i + 1] === '.'))) braceList = true;
     else if (braceOpen && braceList && c === '}') expandable = true;
     current += c; started = true; i++;
@@ -607,7 +653,7 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
   // The line ended before a body began: a here-document that never closed.
   if (hereDocs.length > 0) unbalanced = true;
 
-  return { segments, unsafeRedirect, processSubstitution, unbalanced, unreadable, switchName, grouped, followable, bareSegment };
+  return { segments, unsafeRedirect, processSubstitution, unbalanced, unreadable, arithmetic, switchName, grouped, followable, bareSegment };
 }
 
 /**
@@ -646,17 +692,27 @@ export function toSegment(tokens: string[], piped: boolean, dialect: Dialect): S
   const rest = [...tokens];
   const assignments: string[] = [];
   // `FOO=bar cmd` — assignments precede the binary. Kept on the segment, not
-  // dropped: they are refused, and the message has to name the one it saw.
-  while (rest.length > 0 && ASSIGNMENT.test(rest[0])) assignments.push(rest.shift()!);
+  // dropped: they are refused, and the message has to name the one it saw. Only
+  // a POSIX shell has this prefix form; cmd.exe has no `NAME=value cmd`, so
+  // there a `=`-bearing word is a command name, caught by {@link ambiguousCmdName}.
+  const hasAssignments = !dialect.nameDelimiters.includes('=');
+  while (hasAssignments && rest.length > 0 && ASSIGNMENT.test(rest[0])) assignments.push(rest.shift()!);
+  const first = rest[0];
+  // A cmd.exe command word holding a `/` or `=` cannot be read as a clean name:
+  // cmd ends a name at `/` (so the basename would drop the part after it) and
+  // has no assignment prefix. The policy refuses it rather than basename down.
+  const ambiguousCmdName = dialect.nameDelimiters.includes('/') && first !== undefined && /[/=]/.test(first)
+    ? first : undefined;
   return {
-    binary: rest.length > 0 ? binaryName(rest[0], dialect) : '',
+    binary: first !== undefined ? binaryName(first, dialect) : '',
     args: rest.slice(1),
     assignments,
     piped,
     stdinRedirected: false,
     expandable: false,
     inputs: [],
-    ...(rest.length > 0 && isComputedWord(rest[0], dialect) ? { computedBinary: rest[0] } : {}),
+    ...(first !== undefined && isComputedWord(first, dialect) ? { computedBinary: first } : {}),
+    ...(ambiguousCmdName !== undefined ? { ambiguousCmdName } : {}),
   };
 }
 
@@ -676,6 +732,7 @@ export function lexAll(command: string, dialect: Dialect, cdpathSet = false): Le
     all.processSubstitution ||= inner.processSubstitution;
     all.unbalanced ||= inner.unbalanced;
     all.unreadable ||= inner.unreadable;
+    all.arithmetic ||= inner.arithmetic;
     all.switchName ??= inner.switchName;
   }
   // Whatever is still queued would run unclassified.

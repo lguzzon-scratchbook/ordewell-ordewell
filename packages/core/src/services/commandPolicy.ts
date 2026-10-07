@@ -147,14 +147,22 @@ const INTERPRETER_ALIASES: Record<string, string> = { nodejs: 'node', pypy: 'pyt
 
 /**
  * The interpreter family a binary belongs to, or undefined. Distributions
- * install versioned names beside the plain one (`python3.12`, `node22`,
- * `php8.2`), and an exact-name list let every one of them run inline code at
- * the prompt tier.
+ * install the plain name with a version and often a build or channel suffix
+ * beside it (`python3.12`, `node22`, `php8.2`, `python3.12m`, `python3.12-dbg`,
+ * `pwsh-preview`), and an exact-name list let every one of them run inline code
+ * at the prompt tier. The suffix must start with a digit or a `-`, so a
+ * different tool whose name merely begins with a family name (`nodemon`,
+ * `bundle`) is not swept in.
  */
 function interpreterFamily(binary: string): string | undefined {
-  const name = /^(.*?)[0-9][0-9.]*$/.exec(binary)?.[1] || binary;
-  const family = INTERPRETER_ALIASES[name] ?? name;
-  return INTERPRETERS.includes(family) ? family : undefined;
+  const direct = INTERPRETER_ALIASES[binary] ?? binary;
+  if (INTERPRETERS.includes(direct)) return direct;
+  for (const base of [...INTERPRETERS, ...Object.keys(INTERPRETER_ALIASES)]) {
+    if (new RegExp(`^${base}(?=[0-9-])[0-9.]*(?:-?[A-Za-z][A-Za-z0-9]*)?$`).test(binary)) {
+      return INTERPRETER_ALIASES[base] ?? base;
+    }
+  }
+  return undefined;
 }
 
 /** Runtimes that import a module from a `data:` URL, which is code written inline. */
@@ -526,6 +534,14 @@ function refusalFor(seg: Segment): string | undefined {
   if (seg.computedBinary !== undefined) {
     return `"${seg.computedBinary}" is a command name the shell computes as it runs, so this classifier cannot tell what would run. Name the program directly.`;
   }
+  // A cmd.exe command word cmd reads a delimiter inside of: a `/` (cmd ends the
+  // name there, so a drive-absolute path like `C:/…/rm.exe` is the drive `C:`
+  // plus a `/switch`, not a path) or a `=` (cmd has no `NAME=value cmd`). Either
+  // way the name is not what a basename would make it, so it is refused rather
+  // than classified — and never scoped to a bare drive.
+  if (seg.ambiguousCmdName !== undefined) {
+    return `cmd.exe reads a "/" or "=" inside "${seg.ambiguousCmdName}" as ending the command name, so this classifier cannot tell which program would run. Name the program as a plain command, or describe the work as a task.`;
+  }
   if (REFUSED_COMMANDS.includes(seg.binary)) {
     return `"${seg.binary}" modifies state. You are a read-only planner — describe the change as a task instead, and the runner executing the plan will make it.`;
   }
@@ -698,7 +714,15 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
   if (!trimmed) return { tier: 'refuse', scope: '', reason: 'Empty command.' };
 
   const dialect = dialectFor(opts.dialect);
-  const { segments, unsafeRedirect, processSubstitution, unbalanced, unreadable, switchName, truncated } = lexAll(trimmed, dialect, opts.cdpathSet);
+  const { segments, unsafeRedirect, processSubstitution, unbalanced, unreadable, arithmetic, switchName, truncated } = lexAll(trimmed, dialect, opts.cdpathSet);
+
+  if (arithmetic) {
+    return {
+      tier: 'refuse',
+      scope: '',
+      reason: 'An arithmetic command "(( … ))" is not something this classifier reads — a "<<" inside it is a shift, not a here-document. Run the inner commands directly, or describe the work as a task.',
+    };
+  }
 
   if (unreadable) {
     return {

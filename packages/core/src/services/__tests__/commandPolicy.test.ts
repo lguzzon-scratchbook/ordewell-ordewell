@@ -1512,3 +1512,77 @@ describe('remaining lexer gaps', () => {
     }
   });
 });
+
+// G1: f1175e3's here-document skipping trusted any `<<` the top-level lexer
+// saw, but the top-level lexer models neither comments nor `${…}`, `$[…]`,
+// `((…))`, so a `<<` inside one of those started a body bash never reads as one
+// — and the hidden line (`rm -rf ~`) ran. Each shape is confirmed in real bash.
+describe('G1 — here-document skipping fails closed outside a real `<<`', () => {
+  it.each([
+    'echo x # <<EOF\nrm -rf ~\nEOF',
+    'echo ${x:-a<<b}\nrm -rf ~\nb}',
+    'echo $[1<<2]\nrm -rf ~\n2]',
+    '((x<<2))\nrm -rf ~\n2',
+    // The same shapes inside `$( )`, reached through the nested lexer.
+    'echo $(echo x # <<EOF\nrm -rf ~\nEOF)',
+    'echo $(echo ${x:-a<<b}\nrm -rf ~\nb})',
+    'echo $(echo $[1<<2]\nrm -rf ~\n2])',
+  ])('does not skip a `<<` the shell never reads as a here-document: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it('still reads a provable here-document body as data', () => {
+    expect(classifyCommand('cat <<EOF\nrm -rf ~\nEOF').tier).toBe('auto');
+    expect(classifyCommand("cat <<'EOF'\n$(rm -rf ~); rm x\nEOF").tier).toBe('auto');
+    expect(classifyCommand('cat <<EOF\n$(npm test)\nEOF\ngit status')).toEqual({ tier: 'ask', scope: 'npm test' });
+  });
+});
+
+// G1: cmd-dialect command-name reading. `nameDelimiter` split a word at its
+// first `/`, so a drive-absolute program path (`C:/…/rm.exe`) became the bare
+// drive `C:` — ask, scope `C:` — and since grants match scopes by exact string,
+// approving `C:/…/ls.exe` once would silently authorise `C:/…/rm.exe`.
+describe('G1 — cmd command names are read where cmd ends them', () => {
+  it.each([
+    'C:/Git/usr/bin/rm.exe x',
+    'C:/Git/usr/bin/ls.exe src',
+    'c:/tools/cat.exe f',
+    'cmd"/c" del x',
+    'del=x & echo hi',
+    'call del x',
+    'start "" cmd /c del x',
+  ])('refuses rather than scoping to a bare drive or a basenamed name: %s', (cmd) => {
+    const result = classifyCommand(cmd, { dialect: 'cmd' });
+    expect(result.tier).toBe('refuse');
+    expect(result.scope).not.toBe('C:');
+    expect(result.scope).toBe('');
+  });
+
+  it('still refuses `cmd/c` with the inline-code reason, name ending at the slash', () => {
+    expect(classifyCommand('cmd/c del x', { dialect: 'cmd' }).reason).toContain('Inline code via "cmd /c"');
+  });
+
+  it('does not refuse a `=` or `/` that sits in an argument, not the command name', () => {
+    expect(classifyCommand('echo del=x', { dialect: 'cmd' }).tier).toBe('auto');
+    expect(classifyCommand('echo a/b', { dialect: 'cmd' }).tier).toBe('auto');
+  });
+});
+
+// G1: the interpreter-family regex only stripped a trailing numeric version, so
+// a build-variant or channel suffix (`python3.12m`, `python3.12-dbg`,
+// `pwsh-preview`) slipped past the inline-code refusal.
+describe('G1 — interpreter family matches version and suffix', () => {
+  it.each([
+    "python3.12m -c 'import os'",
+    "python3.12-dbg -c 'import os'",
+    'pwsh-preview Remove-Item x',
+    "pypy3 -c 'import os'",
+  ])('refuses inline code under a suffixed interpreter name: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it('does not treat a lookalike name as an interpreter family', () => {
+    expect(classifyCommand('nodemon server.js').tier).not.toBe('refuse');
+    expect(classifyCommand('bundle exec rspec').tier).not.toBe('refuse');
+  });
+});

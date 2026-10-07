@@ -116,6 +116,26 @@ export const WRAPPER_FAMILY: Record<string, WrapperSpec> = {
 };
 
 /**
+ * cmd.exe wrappers, consulted only under the cmd dialect. `call del x` runs
+ * `del`, so classified on `call` it merely asked and the grant was `call`;
+ * unwrapped, the real command is judged. `call` takes no options of its own, so
+ * like `builtin` its whole tail is the command.
+ */
+const CMD_WRAPPER_FAMILY: Record<string, WrapperSpec> = {
+  call: {},
+};
+
+/**
+ * cmd.exe's `start` launches a program, optionally behind a quoted window title
+ * and its own `/`-switches. Reading that argument grammar wrongly would classify
+ * the wrong token as the command, so `start` is refused outright — the inner
+ * command can be run directly.
+ */
+const CMD_REFUSED_RUNNERS: Record<string, string> = {
+  start: 'launches a program behind an optional window title and its own switches, which this classifier cannot reliably separate from the command',
+};
+
+/**
  * `xargs`'s own flags, walked like a wrapper's. `-e`, `-i` and `-l` take an
  * optional value glued on, so every spelling of them consumes one token. Absent
  * on purpose: `--process-slot-var` sets an environment variable in the command
@@ -337,8 +357,17 @@ export function unwrap(seg: Segment, dialect: Dialect): Unwrapped {
   const assignments = [...seg.assignments];
   let current: Segment = seg;
   let runner: string | undefined;
+  // cmd.exe is the one dialect whose escape is `^`; its `call`/`start` are
+  // builtins, not programs a POSIX shell would run.
+  const isCmd = dialect.escape === '^';
 
   for (;;) {
+    if (isCmd) {
+      const refused = CMD_REFUSED_RUNNERS[current.binary.toLowerCase()];
+      if (refused) return { seg: { ...current, assignments }, wrappers, runner, reason:
+        `"${current.binary}" ${refused}. Run the inner command directly, or describe it as a task.` };
+    }
+
     // Once only: `xargs xargs < list` hands the inner one its command from the
     // input, so a second `xargs` is left for XARGS_TARGETS to refuse.
     if (current.binary.toLowerCase() === 'xargs' && runner === undefined) {
@@ -351,7 +380,8 @@ export function unwrap(seg: Segment, dialect: Dialect): Unwrapped {
       continue;
     }
 
-    const spec = WRAPPER_FAMILY[current.binary.toLowerCase()];
+    const spec = (isCmd ? CMD_WRAPPER_FAMILY[current.binary.toLowerCase()] : undefined)
+      ?? WRAPPER_FAMILY[current.binary.toLowerCase()];
     if (!spec) break;
     const scan = scanWrapperArgs(current.binary, spec, current.args);
     if (scan.kind === 'refuse') return { seg: { ...current, assignments }, wrappers, runner, reason: scan.reason };
