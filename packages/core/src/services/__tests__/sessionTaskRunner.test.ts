@@ -192,3 +192,28 @@ describe('Session.setTaskRunner — what it saves and announces', () => {
     expect(order.indexOf('save:codex')).toBeLessThan(order.indexOf('plan_generated'));
   });
 });
+
+describe('Session.setTaskRunner — the remembered catalog', () => {
+  it('keeps the admitted runner\'s models when a later planner opening discovers only some runners', async () => {
+    const modelsForRunners = vi.fn()
+      .mockResolvedValueOnce(CODEX_CATALOG)
+      // Codex discovery came back empty this time; what was learned before still holds.
+      .mockResolvedValue({ 'claude-code': [{ modelId: 'claude-sonnet-4-5', modelLabel: 'Claude Sonnet 4.5', variants: [] }] });
+    const session = makeSession({
+      modelResolver: { modelsForRunners } as unknown as Pick<ModelResolver, 'modelsForRunners'>,
+      aiService: {
+        startConversation: vi.fn().mockResolvedValue({ kind: 'message', text: 'ok', researchLog: [] }),
+        continueConversation: vi.fn(),
+        hasActiveConversation: () => false,
+        reset: vi.fn(),
+      },
+    });
+    session.loadPlan(planWith(), 'goal', testWorkspace, { persist: false });
+    await session.setTaskRunner('t1', 'codex');
+
+    await session.continueConversation('anything else?');
+
+    await expect(session.updateTask('t1', { assignedModel: { modelId: 'not-a-codex-model', modelLabel: 'Nope' } }))
+      .rejects.toThrow(/does not offer/);
+  });
+});

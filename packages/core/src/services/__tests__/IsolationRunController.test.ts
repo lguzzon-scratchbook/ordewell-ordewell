@@ -161,6 +161,20 @@ describe('IsolationRunController', () => {
       expect(ops(isolation)).not.toContain('stash');
     });
 
+    it('keeps the choice open when the stash fails', async () => {
+      const isolation = new FakeWorktreeIsolation();
+      isolation.availability = { active: false, reason: 'dirty' };
+      const { runs } = setup(isolation);
+      const resume = vi.fn(async () => undefined);
+      await runs.decide(resume);
+      isolation.stash = async () => { throw new Error('git stash failed'); };
+
+      await expect(runs.continueBlocked('stash')).rejects.toThrow('git stash failed');
+
+      expect(runs.blocked).toBe(true);
+      expect(await runs.continueBlocked('shared')).toBe(resume);
+    });
+
     it('has nothing to continue without a parked start', async () => {
       const { runs } = setup();
       expect(await runs.continueBlocked('stash')).toBeNull();
@@ -214,6 +228,41 @@ describe('IsolationRunController', () => {
 
       runs.interrupt();
       expect(runs.isOpen).toBe(false);
+    });
+
+    it('does not reopen a run a Stop interrupted while its activation was in flight', async () => {
+      const isolation = new FakeWorktreeIsolation();
+      let assessed!: () => void;
+      const gate = new Promise<void>((resolve) => { assessed = resolve; });
+      const isActive = isolation.isActive.bind(isolation);
+      isolation.isActive = async (root) => { await gate; return isActive(root); };
+      const { runs } = setup(isolation);
+
+      const deciding = runs.decide(async () => undefined);
+      runs.interrupt();
+      assessed();
+
+      expect(await deciding).toBe(false);
+      expect(runs.isOpen).toBe(false);
+      expect(runs.decided).toBe(false);
+    });
+
+    it('lets the next run decide afresh after an interrupted activation', async () => {
+      const isolation = new FakeWorktreeIsolation();
+      let assessed!: () => void;
+      const gate = new Promise<void>((resolve) => { assessed = resolve; });
+      const isActive = isolation.isActive.bind(isolation);
+      isolation.isActive = async (root) => { await gate; return isActive(root); };
+      const { runs } = setup(isolation);
+
+      const stale = runs.decide(async () => undefined);
+      runs.interrupt();
+      const next = runs.decide(async () => undefined);
+      assessed();
+
+      expect(await stale).toBe(false);
+      expect(await next).toBe(true);
+      expect(runs.isolating).toBe(true);
     });
 
     it('forgets a settled run once everything merged into the checked-out branch', async () => {

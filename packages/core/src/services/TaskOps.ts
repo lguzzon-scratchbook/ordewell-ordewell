@@ -533,7 +533,7 @@ export function applyTaskOps(currentTasks: readonly Task[], ops: TaskOp[], runne
         if (badRef) { errors.push(`${label}: ${badRef.error}`); break; }
         const resolved = (refs as { id: string }[]).map((r) => findTopLevel(tasks, r.id));
         if (resolved.some((t) => !t)) { errors.push(`${label}: unknown task in merge list (already removed, merged, or split by an earlier op)`); break; }
-        const toMerge = resolved.map((t) => t!).sort((a, b) => a.order - b.order);
+        const toMerge = [...new Map(resolved.map((t) => [t!.id, t!])).values()].sort((a, b) => a.order - b.order);
         if (toMerge.length < 2) { errors.push(`${label}: merge needs at least two tasks`); break; }
         const locked = toMerge.find((t) => t.status === 'in_progress' || t.status === 'completed');
         if (locked) {

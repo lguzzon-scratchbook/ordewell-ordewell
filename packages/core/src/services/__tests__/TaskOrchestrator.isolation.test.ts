@@ -1469,3 +1469,22 @@ describe('TaskOrchestrator with worktree isolation', () => {
     });
   });
 });
+
+describe('TaskOrchestrator — a verdict whose settling throws', () => {
+  it('keeps the passed task completed and says why the next one could not start', async () => {
+    const isolation = new FakeWorktreeIsolation();
+    const { orchestrator, notifications, pass, spawn } = setup({ isolation });
+    const deploy = task('o1', 1, { ops: true });
+    const build = task('t2', 2, { dependencies: ['o1'] });
+    orchestrator.loadPlan([deploy, build]);
+    await orchestrator.approveReview();
+    isolation.isActive = async () => { throw new Error('git exploded'); };
+
+    pass(deploy);
+
+    await vi.waitFor(() => expect(notifications.error).toHaveBeenCalledWith(expect.stringContaining('git exploded')));
+    expect(orchestrator.storeInstance.get('o1')!.status).toBe('completed');
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(orchestrator.hasLiveWork).toBe(false);
+  });
+});

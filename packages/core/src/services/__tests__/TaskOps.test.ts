@@ -543,6 +543,12 @@ describe('applyTaskOps — merge', () => {
     expect(res.errors[0]).toMatch(/at least two/i);
   });
 
+  it('counts a task named twice once, so merging it with itself is refused', () => {
+    const res = applyTaskOps(samplePlan(), [{ op: 'merge', taskIds: ['#1', 'a'], merged: { title: 'x' } }], ['claude-code']);
+    expect(res.ok).toBe(false);
+    expect(res.errors[0]).toMatch(/at least two/i);
+  });
+
   it('rejects a merge whose merged spec has no title', () => {
     const res = applyTaskOps(samplePlan(), [{ op: 'merge', taskIds: ['a', 'b'], merged: {} }], ['claude-code']);
     expect(res.ok).toBe(false);

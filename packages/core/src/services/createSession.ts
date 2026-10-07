@@ -446,6 +446,10 @@ export class Session {
   private readonly save: SaveSession;
   /** Last discovered model catalog — lets sync plan commits clamp thinking efforts to real variants. */
   private modelsCache: Partial<Record<RunnerId, DiscoveredModel[]>> = {};
+  /** The queue drain in flight, which a second call joins; see {@link processQueuedMessages}. */
+  private queueDrain: Promise<void> | null = null;
+  /** The queued messages the planner has been given, no longer the user's to take back. */
+  private drainingIds = new Set<string>();
   private unsubObserver: (() => void) | null;
   private readonly hostSessionId?: string;
   private currentSessionId: string;
@@ -1041,7 +1045,7 @@ export class Session {
    */
   private async plannerCatalog(runners: RunnerId[]) {
     const modelsByRunner = await this.modelResolver.modelsForRunners(runners);
-    this.modelsCache = modelsByRunner;
+    this.modelsCache = { ...this.modelsCache, ...modelsByRunner };
     const settings = this.settingsFn();
     return {
       modelsByRunner,
@@ -1191,15 +1195,54 @@ export class Session {
     this.persist();
   }
 
+  /**
+   * Hand the queued edits to the planner. The messages stay queued until its
+   * answer is applied, so the scheduler stays paused behind them meanwhile;
+   * one drain runs at a time, and a call made during it joins it. Whatever
+   * was queued while it ran is drained after, before the run goes on.
+   */
   async processQueuedMessages(): Promise<void> {
-    const messages = this.orchestrator.getQueuedMessages();
-    if (messages.length === 0) return;
+    if (this.queueDrain) return this.queueDrain;
+    if (this.orchestrator.getQueuedMessages().length === 0) return;
+    this.queueDrain = this.drainQueue();
+    try {
+      await this.queueDrain;
+    } finally {
+      this.queueDrain = null;
+    }
 
-    this.orchestrator.clearQueuedMessages();
-    // The saved queue goes with the live one, or a reload restores the edit
-    // and it is applied a second time.
-    if (this.plan) this.plan.queuedMessages = [];
+    // Re-schedule. `onQueueReady` only fires when no task is active, so a paused
+    // run still has `running === true` — `start()` would no-op (it early-returns
+    // when already running). Ticking directly spawns the dependents that became
+    // ready after reconcile. `start()` covers the halted case (`running === false`,
+    // e.g. a retry that cleared the queue), re-entering approval-free.
+    if (this.orchestrator.isRunning) {
+      await this.orchestrator.tick();
+    } else {
+      await this.orchestrator.start();
+    }
+  }
 
+  private async drainQueue(): Promise<void> {
+    for (let messages = this.orchestrator.getQueuedMessages(); messages.length > 0; messages = this.orchestrator.getQueuedMessages()) {
+      for (const m of messages) this.drainingIds.add(m.id);
+      try {
+        await this.applyQueuedEdits(messages);
+      } finally {
+        // Already gone unless no plan was left to apply them to; never drained twice.
+        for (const m of messages) this.orchestrator.removeQueuedMessage(m.id);
+        this.drainingIds.clear();
+      }
+    }
+  }
+
+  private async applyQueuedEdits(messages: QueuedMessage[]): Promise<void> {
+    // Taken off with the plan change they made, so the saved queue goes with
+    // the live one — or a reload restores the edit and it is applied twice.
+    const dequeue = () => {
+      for (const m of messages) this.orchestrator.removeQueuedMessage(m.id);
+      if (this.plan) this.plan.queuedMessages = this.getQueuedMessages();
+    };
     const batchText = messages.map((m) => m.text).join('\n');
     const texts = messages.map((m) => m.text);
     const activeSessions = new Map(
@@ -1232,6 +1275,7 @@ export class Session {
       });
 
       this.mutatePlan(() => {
+        dequeue();
         const tasks = keepExecutionState(this.store.planTasks, result.pendingTasks);
         this.orchestrator.reconcilePlan(tasks, this.plan!.runners);
         this.conversation.recordQueuedEdits(texts, tasks.length);
@@ -1242,21 +1286,11 @@ export class Session {
       // parked behind the queue stays parked with nothing left to wake it.
       const reason = err instanceof Error ? err.message : String(err);
       this.mutatePlan(() => {
+        dequeue();
         this.conversation.recordQueuedEditsFailed(texts, reason);
         return true;
       });
       this.onNotice?.({ type: 'notice', level: 'error', message: `Your queued change could not be applied, so the plan is unchanged: ${reason}. Send it again to retry.` });
-    }
-
-    // Re-schedule. `onQueueReady` only fires when no task is active, so a paused
-    // run still has `running === true` — `start()` would no-op (it early-returns
-    // when already running). Ticking directly spawns the dependents that became
-    // ready after reconcile. `start()` covers the halted case (`running === false`,
-    // e.g. a retry that cleared the queue), re-entering approval-free.
-    if (this.orchestrator.isRunning) {
-      await this.orchestrator.tick();
-    } else {
-      await this.orchestrator.start();
     }
   }
 
@@ -1324,10 +1358,14 @@ export class Session {
   }
 
   getQueuedMessages(): QueuedMessage[] { return this.orchestrator.getQueuedMessages(); }
-  /** Take back one unsent message; the plan's persisted queue follows so a reload cannot resurrect it. */
+  /** Take back one unsent message — false once the planner has it; the plan's persisted queue follows so a reload cannot resurrect it. */
   removeQueuedMessage(id: string): boolean {
+    if (this.drainingIds.has(id)) return false;
     const removed = this.orchestrator.removeQueuedMessage(id);
-    if (removed && this.plan) this.plan.queuedMessages = this.getQueuedMessages();
+    if (removed && this.plan) {
+      this.plan.queuedMessages = this.getQueuedMessages();
+      this.persist({ background: true });
+    }
     return removed;
   }
   setQueuedMessages(msgs: QueuedMessage[]): void {

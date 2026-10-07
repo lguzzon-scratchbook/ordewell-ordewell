@@ -161,6 +161,8 @@ export class IsolationRunController {
   /** Resolver task id → the conflicted task it resolves; see {@link linkResolver}. */
   private resolvers: Record<string, string> = {};
   private opening: Promise<boolean> | null = null;
+  /** Bumped by an interrupt, so an activation in flight across it does not open the run it ended. */
+  private activations = 0;
   /** The start a dirty tree turned away, handed back once the user chooses how to go on. */
   private blockedStart: (() => Promise<void>) | null = null;
   /** The dirty repos behind {@link blockedStart}, for the stash notice. */
@@ -264,7 +266,12 @@ export class IsolationRunController {
     this.open();
     if (this.decided) return Promise.resolve(true);
     if (this.blockedStart) return Promise.resolve(false);
-    this.opening ??= this.activate(resume).finally(() => { this.opening = null; });
+    if (!this.opening) {
+      const opening = this.activate(resume, this.activations).finally(() => {
+        if (this.opening === opening) this.opening = null;
+      });
+      this.opening = opening;
+    }
     return this.opening;
   }
 
@@ -291,13 +298,16 @@ export class IsolationRunController {
   async continueBlocked(how: 'stash' | 'shared'): Promise<(() => Promise<void>) | null> {
     const resume = this.blockedStart;
     if (!resume) return null;
-    this.blockedStart = null;
     if (how === 'stash') {
+      // Parked until the stash succeeds: one that throws leaves the user their choice.
       await this.isolation.stash(this.workspaceRoot());
+      if (this.blockedStart !== resume) return null;
+      this.blockedStart = null;
       this.tell('info', this.blockedRepos.length > 0
         ? `Stashed your uncommitted changes in ${this.blockedRepos.join(', ')} — \`git stash pop\` in each brings them back.`
         : 'Stashed your uncommitted changes — `git stash pop` brings them back.');
     } else {
+      this.blockedStart = null;
       this.begin('shared');
       this.tell('info', 'Running without worktree isolation — tasks share the workspace root for this run.');
     }
@@ -455,7 +465,11 @@ export class IsolationRunController {
    * start is dropped. `keepOpen` spares a run the scheduler is still driving.
    */
   interrupt(opts: { keepOpen?: boolean } = {}): void {
-    if (!opts.keepOpen) this.mode = null;
+    if (!opts.keepOpen) {
+      this.mode = null;
+      this.activations++;
+      this.opening = null;
+    }
     this.blockedStart = null;
   }
 
@@ -605,9 +619,11 @@ export class IsolationRunController {
     return { mode: 'shared', reason: availability.reason, repos: availability.repos ?? [] };
   }
 
-  private async activate(resume: () => Promise<void>): Promise<boolean> {
+  private async activate(resume: () => Promise<void>, activation: number): Promise<boolean> {
     const root = this.workspaceRoot();
     const decision = await this.assess(root);
+    const interrupted = () => activation !== this.activations;
+    if (interrupted()) return false;
     if (decision.mode === 'blocked') {
       this.blockedStart = resume;
       this.blockedRepos = decision.repos;
@@ -623,12 +639,14 @@ export class IsolationRunController {
       try {
         await this.mint(root);
       } catch (err) {
+        if (interrupted()) return false;
         // Git can still refuse every repo of the group once a run is minted — the one check `isActive` cannot make.
         this.tell('info', `${err instanceof Error ? err.message : String(err)} — ${SHARED_ROOT_TAIL}`);
         this.listener.changed();
         this.begin('shared');
         return true;
       }
+      if (interrupted()) return false;
     }
     this.begin('isolated');
     await this.sweep();
