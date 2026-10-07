@@ -124,15 +124,36 @@ The fix in every case fails closed:
   runs it; it is refused with the other keywords.
 - **Substitution bodies are matched quote- and escape-aware.** A quoted or
   escaped `)` no longer closes `$(…)`, and `` \` `` inside backticks is a nested
-  substitution. A here-document or comment inside `$(…)` makes the line
-  unbalanced, since only a parser could find its end. Past 32 bodies the line
-  is refused rather than judged on the bodies read so far.
+  substitution. A here-document, a comment, or a `${…}` holding a quote, paren,
+  escape or nested expansion inside `$(…)` refuses the line, since only a
+  parser could find its end: `"$(ls ${x%)}; rm -rf ~)"` closed at the `)` of
+  the pattern. Past 32 bodies the line is refused rather than judged on the
+  bodies read so far.
+- **`$'…'` is its own quoting.** A backslash escapes inside it, `\'` included,
+  so `echo $'\''; rm -rf ~ #'` is an `echo` and an `rm`, not one `echo`. One
+  left open refuses the line.
+- **A here-document body is data.** Lexed as commands, a quote in the body hid
+  the lines after the delimiter. The body is skipped to its delimiter line
+  (`<<-` strips tabs); an unquoted delimiter still expands the body, so its
+  substitutions are classified. A here-document never closed, or a delimiter
+  holding `$` or a backtick, refuses the line.
 - **Stdin is a pipe for an interpreter.** `bash <<< '…'`, a here-document, and
   `sh < x.sh` hand the interpreter code exactly as `… | sh` does.
 - **Inline-code flags are read in every spelling.** Clusters and glued code
   (`bash -lc`, `perl -lne`, `perl -e'…'`), `node -p`/`--print`, `php -r`,
   PowerShell's `-EncodedCommand` and any prefix of its code parameters, and
   `cmd /q/c`.
+- **Inline code has more spellings than flags.** Interpreters are matched by
+  family, so a versioned name (`python3.12`, `node22`, `php8.2`) or alias
+  (`nodejs`) is one too. `deno eval`, a `data:` URL handed to `node`, `deno` or
+  `bun` (`--import`, `--require`, `--loader`, a script operand), and
+  PowerShell's positional command (`powershell Remove-Item x`) are refused.
+  PowerShell's first argument passes only as a plain `.ps1` path — under
+  `powershell`, only as the last argument, since the rest join its command —
+  and a parameter it cannot place refuses.
+- **cmd.exe ends a command name where it reads one.** `cmd/c del x` is `cmd
+  /c`, `,del x` is `del`, and a command word starting with `/` (`cmd;/c del x`,
+  where `;` is a space to cmd.exe) refuses.
 - **Refusal reads names case-insensitively.** `DEL`, `Rd`, `CMD /c` and `RM`
   run on cmd.exe and on case-insensitive filesystems. The permitted tier stays
   exact-case, so a re-cased name never gains `auto`.
@@ -303,3 +324,4 @@ resolves rather than as written.
 - 2026-10-04 — a `cd` or shell-moving builtin that asks is granted for its exact line.
 - 2026-10-04 — `builtin` unwrapped; `enable -f` refused.
 - 2026-10-07 — `!`, quote-aware substitution matching, stdin-fed interpreters, inline-code spellings, case-insensitive refusal, `+=` assignments.
+- 2026-10-07 — `${…}` in substitutions, `$'…'` escapes, here-document bodies, interpreter families, `deno eval`, `data:` URLs, PowerShell's positional command, cmd.exe command names.

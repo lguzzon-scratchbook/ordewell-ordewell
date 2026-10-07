@@ -135,11 +135,30 @@ const SHELL_KEYWORDS = ['{', '}', 'if', 'then', 'elif', 'else', 'fi', 'for', 'wh
 /**
  * Binaries that execute whatever they are handed — refused when given inline code or fed from a pipe.
  * `xargs` is not here: it is unwrapped to the command it runs, see {@link XARGS_TARGETS}.
+ * Matched by family, see {@link interpreterFamily}.
  */
 const INTERPRETERS = ['sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'csh', 'tcsh', 'pwsh', 'powershell',
-  'python', 'python2', 'python3', 'node', 'deno', 'bun', 'ruby', 'perl', 'php', 'eval', 'exec',
+  'python', 'py', 'node', 'deno', 'bun', 'ruby', 'perl', 'php', 'eval', 'exec',
   // Windows interpreters. `cmd /c "…"` is the platform's spelling of `sh -c`.
   'cmd', 'wscript', 'cscript', 'mshta', 'rundll32', 'regsvr32'];
+
+/** Other names an interpreter family is installed under. */
+const INTERPRETER_ALIASES: Record<string, string> = { nodejs: 'node', pypy: 'python' };
+
+/**
+ * The interpreter family a binary belongs to, or undefined. Distributions
+ * install versioned names beside the plain one (`python3.12`, `node22`,
+ * `php8.2`), and an exact-name list let every one of them run inline code at
+ * the prompt tier.
+ */
+function interpreterFamily(binary: string): string | undefined {
+  const name = /^(.*?)[0-9][0-9.]*$/.exec(binary)?.[1] || binary;
+  const family = INTERPRETER_ALIASES[name] ?? name;
+  return INTERPRETERS.includes(family) ? family : undefined;
+}
+
+/** Runtimes that import a module from a `data:` URL, which is code written inline. */
+const DATA_URL_RUNTIMES = ['node', 'deno', 'bun'];
 
 /**
  * Flags that hand an interpreter code to run. Compared case-insensitively:
@@ -158,7 +177,7 @@ const INLINE_CODE_FLAGS = ['-c', '-e', '--eval', '--command', '-Command', '--exe
  */
 const INLINE_CODE_LETTERS: Record<string, string> = {
   sh: 'c', bash: 'c', zsh: 'c', fish: 'c', dash: 'c', ksh: 'c', csh: 'c', tcsh: 'c',
-  python: 'c', python2: 'c', python3: 'c',
+  python: 'c', py: 'c',
   node: 'ep', bun: 'ep', ruby: 'e', perl: 'e', php: 'rbe',
 };
 
@@ -177,11 +196,51 @@ function isInlineCodeFlag(binary: string, arg: string): boolean {
     const name = /^(?:--?|\/)([a-z]+)(?::|$)/.exec(arg.toLowerCase())?.[1];
     return name !== undefined && (PWSH_CODE_ALIASES.includes(name) || PWSH_CODE_PARAMS.some((p) => p.startsWith(name)));
   }
-  // cmd.exe reads `/c` wherever it sits in a run of switches, and with the
-  // command glued straight on: `cmd /q/c del x`, `cmd /cdel x`.
-  if (binary === 'cmd') return arg.startsWith('/') && /\/[ckr]/i.test(arg);
+  // cmd.exe reads `/c` wherever it sits in a run of switches, with the command
+  // glued straight on, and after the `,` it reads as a space: `cmd /q/c del x`,
+  // `cmd /cdel x`, `cmd ,/c del x`.
+  if (binary === 'cmd') return /\/[ckr]/i.test(arg);
   const letters = INLINE_CODE_LETTERS[binary];
   return letters !== undefined && /^-[^-]/.test(arg) && [...lower.slice(1)].some((ch) => letters.includes(ch));
+}
+
+/**
+ * PowerShell's parameters that take a value, and the switches that take none,
+ * as {@link pwshPositional} reads them. Matched by prefix like the code
+ * parameters above.
+ */
+const PWSH_VALUE_PARAMS = ['configurationname', 'configurationfile', 'custompipename', 'executionpolicy',
+  'inputformat', 'outputformat', 'psconsolefile', 'settingsfile', 'version', 'windowstyle', 'workingdirectory'];
+const PWSH_VALUE_ALIASES = ['ep', 'if', 'of', 'wd'];
+const PWSH_SWITCH_PARAMS = ['help', 'interactive', 'login', 'mta', 'noexit', 'nologo', 'noninteractive',
+  'noprofile', 'noprofileloadtime', 'sshservermode', 'sta'];
+
+/**
+ * The argument PowerShell runs as code because no parameter named it, if any.
+ *
+ * The first argument that is not a parameter is `-Command` to Windows
+ * PowerShell, and `-File` to `pwsh`, so `powershell Remove-Item x` runs
+ * `Remove-Item` with no code flag in sight. Only a plain `.ps1` path passes:
+ * under `powershell`, only as the last argument, since every later one is
+ * joined into the command. A parameter it cannot place — unknown, or a
+ * prefix of both a switch and a value parameter — fails closed.
+ */
+function pwshPositional(binary: string, args: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const param = /^(?:--?|\/)([a-z?]+)(:.*)?$/i.exec(arg);
+    if (!param) {
+      const script = /^[^\s;&|(){}$`'"]+\.ps1$/i.test(arg);
+      return script && (binary === 'pwsh' || i === args.length - 1) ? undefined : arg;
+    }
+    const name = param[1].toLowerCase();
+    if ('file'.startsWith(name)) return undefined;
+    const takesValue = PWSH_VALUE_ALIASES.includes(name) || PWSH_VALUE_PARAMS.some((p) => p.startsWith(name));
+    const isSwitch = name === '?' || PWSH_SWITCH_PARAMS.some((p) => p.startsWith(name));
+    if (takesValue === isSwitch) return arg;
+    if (takesValue && param[2] === undefined) i++;
+  }
+  return undefined;
 }
 
 /** Binaries whose leading arguments name the operation, and so belong in a grant's scope. */
@@ -555,16 +614,28 @@ function refusalFor(seg: Segment): string | undefined {
       return `The shell rewrites part of this "${seg.binary}" command before "${seg.binary}" sees it, so its program cannot be inspected. Put the program in single quotes, name files literally, and re-run.`;
     }
   }
-  if (INTERPRETERS.includes(seg.binary)) {
+  const family = interpreterFamily(seg.binary);
+  if (family !== undefined) {
     if (seg.piped) {
       return `Piping into "${seg.binary}" would run code this classifier cannot inspect. Run the producing command on its own and read its output.`;
     }
     if (seg.stdinRedirected) {
       return `Feeding "${seg.binary}" from a redirect, here-document or here-string would run code this classifier cannot inspect. Read the file instead, or describe it as a task.`;
     }
-    const inline = seg.args.find((a) => isInlineCodeFlag(seg.binary, a));
+    const inline = seg.args.find((a) => isInlineCodeFlag(family, a))
+      ?? (family === 'deno' ? seg.args.find((a) => a === 'eval') : undefined);
     if (inline !== undefined) {
       return `Inline code via "${seg.binary} ${inline}" is not available to the planner. Use the read-only research tools, or describe it as a task.`;
+    }
+    // `--import`, `--require`, `--loader` and a script operand all accept one,
+    // so any argument holding a `data:` URL is read as code.
+    const dataUrl = DATA_URL_RUNTIMES.includes(family) ? seg.args.find((a) => /data:/i.test(a)) : undefined;
+    if (dataUrl !== undefined) {
+      return `"${seg.binary}" runs the code inside a data: URL, which is inline code this classifier cannot inspect. Use the read-only research tools, or describe it as a task.`;
+    }
+    const positional = family === 'pwsh' || family === 'powershell' ? pwshPositional(family, seg.args) : undefined;
+    if (positional !== undefined) {
+      return `"${seg.binary}" runs "${positional}" as PowerShell code, which this classifier cannot inspect. Run a script with -File, or describe it as a task.`;
     }
   }
   // Checked last, so a segment whose binary or subcommand is refused on its own
@@ -627,13 +698,29 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
   if (!trimmed) return { tier: 'refuse', scope: '', reason: 'Empty command.' };
 
   const dialect = dialectFor(opts.dialect);
-  const { segments, unsafeRedirect, processSubstitution, unbalanced, truncated } = lexAll(trimmed, dialect, opts.cdpathSet);
+  const { segments, unsafeRedirect, processSubstitution, unbalanced, unreadable, switchName, truncated } = lexAll(trimmed, dialect, opts.cdpathSet);
+
+  if (unreadable) {
+    return {
+      tier: 'refuse',
+      scope: '',
+      reason: 'A here-document, comment or ${…} expansion inside a command substitution, or a here-document delimiter holding a $ or backtick, hides where it ends, so this classifier cannot tell what would actually run. Run the inner command on its own.',
+    };
+  }
+
+  if (switchName !== undefined) {
+    return {
+      tier: 'refuse',
+      scope: '',
+      reason: `cmd.exe reads "${switchName}" as a switch, not a command name, and after a ";" or "," as a switch to the command before it. Put a space between a command and its switches, and separate commands with "&".`,
+    };
+  }
 
   if (unbalanced) {
     return {
       tier: 'refuse',
       scope: '',
-      reason: 'Unterminated quote or command substitution — this classifier cannot tell what would actually run. Rewrite the command with balanced quotes.',
+      reason: 'Unterminated quote, command substitution or here-document — this classifier cannot tell what would actually run. Rewrite the command with balanced quotes and every here-document closed.',
     };
   }
 

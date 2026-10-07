@@ -1,5 +1,5 @@
 /**
- * The lexer behind {@link classifyCommand}: a command line becomes segments.
+ * The lexer behind `classifyCommand` (commandPolicy.ts): a command line becomes segments.
  *
  * Which interpreter will run the line decides what the tokens are (see
  * {@link Dialect}), and `cd`-following lives here because only the lexer sees
@@ -47,8 +47,22 @@ export interface Dialect {
    * Whether `$'…'` and `$"…"` are quoting forms of their own (bash's ANSI-C
    * and locale quoting). Read as a literal `$` and a plain quote,
    * `cat $'/etc/passwd'` hid its path behind a `$` no path check recognizes.
+   * `$'…'` is not a single-quoted run: `\'` inside it is an escaped quote, so
+   * reading it as one ended the string early and `echo $'\''; rm -rf ~ #'`
+   * lexed as a lone `echo`. See {@link ansiCQuoteEnd}.
    */
   dollarQuotes: boolean;
+  /**
+   * Whether `<<` opens a here-document whose body is the lines that follow.
+   * cmd.exe has none, so there the lines after it are commands.
+   */
+  hereDocuments: boolean;
+  /**
+   * Characters that end a command name with no space before them. cmd.exe
+   * reads `cmd/c del x` as `cmd /c del x`, and skips `,` and `=` like spaces,
+   * so `,del x` runs `del`. Read by `nameDelimiter` in {@link lex}.
+   */
+  nameDelimiters: string;
   /** Executable extensions stripped before a binary is matched against the tiers. */
   strippedExtensions: string[];
 }
@@ -60,6 +74,8 @@ const POSIX_DIALECT: Dialect = {
   // Positional and special parameters (`$1`, `$@`, `$$`, …) expand too.
   expansion: /^\$[A-Za-z_{0-9@*#?$!-]/,
   dollarQuotes: true,
+  hereDocuments: true,
+  nameDelimiters: '',
   strippedExtensions: [],
 };
 
@@ -70,6 +86,8 @@ const CMD_DIALECT: Dialect = {
   // `%VAR%` and delayed-expansion `!VAR!`.
   expansion: /^[%!][A-Za-z_]/,
   dollarQuotes: false,
+  hereDocuments: false,
+  nameDelimiters: '/,=',
   // Without this, `del.exe` and `C:\bin\del.exe` both missed the refusal list.
   strippedExtensions: ['.exe', '.cmd', '.bat', '.com', '.ps1', '.msc'],
 };
@@ -88,7 +106,7 @@ export interface Segment {
    * Retained rather than discarded: the assignment is what decides what the
    * binary does — `LD_PRELOAD` loads attacker code into it, `PATH` changes
    * which executable is even reached — so classifying the binary alone answers
-   * the wrong question. See {@link refusalFor}.
+   * the wrong question. See `refusalFor` in commandPolicy.ts.
    */
   assignments: string[];
   /** True when this segment consumes another command's output (`… | seg`). */
@@ -142,6 +160,14 @@ export interface Lexed {
   processSubstitution: boolean;
   /** Lexing ran off the end inside a quote or a substitution — nothing here is trustworthy. */
   unbalanced: boolean;
+  /** A substitution holds a construct that hides where it ends — see {@link matchParen}. */
+  unreadable?: boolean;
+  /**
+   * A cmd.exe command word starts with `/`. cmd.exe reads it as a switch, and
+   * after a `;` — a space to cmd.exe, a separator here — as one belonging to
+   * the command before it: `cmd;/c del x` runs `del`.
+   */
+  switchName?: string;
   /** Substitution bodies were left unlexed when {@link lexAll} hit its bound. */
   truncated?: boolean;
   /**
@@ -172,14 +198,21 @@ function isDevNullTarget(target: string): boolean {
   return `/${resolved.join('/')}` === '/dev/null';
 }
 
+/** {@link matchParen} met a construct only a parser could find the end of. */
+const UNREADABLE = -2;
+
 /**
- * Index of the `)` closing the `$(` whose `(` is at `open`, or -1.
+ * Index of the `)` closing the `$(` whose `(` is at `open`; -1 when the line
+ * ends first, or {@link UNREADABLE}.
  *
  * The shell parses the body as a command line of its own, so a quoted or
  * escaped `)` does not close it. Counting bare parens closed
  * `"$(echo \); rm -rf ~)"` at the `\)` and left the `rm` inside what the lexer
- * took for a quoted string. A here-document or a comment can hide a `)` from
- * any scan short of a parser, so either one answers -1 and the caller refuses.
+ * took for a quoted string. Three constructs can hide a `)` from any scan short
+ * of a parser, and each answers UNREADABLE so the caller refuses: a
+ * here-document, a comment, and a `${…}` expansion, whose quoting rules differ
+ * by operator — `"$(ls ${x%)}; rm -rf ~)"` closed at the `)` of its pattern.
+ * A `${…}` holding no quote, paren, escape or nested expansion is skipped.
  */
 function matchParen(s: string, open: number, dialect: Dialect): number {
   let depth = 0;
@@ -188,9 +221,20 @@ function matchParen(s: string, open: number, dialect: Dialect): number {
     const c = s[i];
     if (quote === "'") { if (c === "'") quote = ''; continue; }
     if (c === dialect.escape && (quote === '' || dialect.escapeInQuotes)) { i++; continue; }
+    if (dialect.dollarQuotes && quote === '' && c === '$' && s[i + 1] === "'") {
+      const end = ansiCQuoteEnd(s, i + 2);
+      if (end < 0) return -1;
+      i = end; continue;
+    }
+    if (c === '$' && s[i + 1] === '{') {
+      const end = s.indexOf('}', i + 2);
+      if (end < 0) return -1;
+      if (/[()'"`$\\{\n]/.test(s.slice(i + 2, end))) return UNREADABLE;
+      i = end; continue;
+    }
     if (c === '$' && s[i + 1] === '(') {
       const close = matchParen(s, i + 1, dialect);
-      if (close < 0) return -1;
+      if (close < 0) return close;
       i = close; continue;
     }
     if (c === '`') {
@@ -201,8 +245,8 @@ function matchParen(s: string, open: number, dialect: Dialect): number {
     if (quote === '"') { if (c === '"') quote = ''; continue; }
     if (dialect.quotes.includes(c)) { quote = c; continue; }
     if (c === '<' && s.startsWith('<<<', i)) { i += 2; continue; }
-    if (c === '<' && s[i + 1] === '<') return -1;
-    if (c === '#' && (i === open + 1 || /[\s;&|(]/.test(s[i - 1]))) return -1;
+    if (c === '<' && s[i + 1] === '<') return UNREADABLE;
+    if (c === '#' && (i === open + 1 || /[\s;&|(]/.test(s[i - 1]))) return UNREADABLE;
     if (c === '(') depth++;
     else if (c === ')' && --depth === 0) return i;
   }
@@ -219,6 +263,76 @@ function matchBacktick(s: string, open: number, dialect: Dialect): number {
     else if (s[i] === '`') return i;
   }
   return -1;
+}
+
+/**
+ * Index of the `'` closing a `$'…'` whose body starts at `start`, or -1.
+ * Unlike a single-quoted run, a backslash escapes the next character, `\'`
+ * included.
+ */
+function ansiCQuoteEnd(s: string, start: number): number {
+  for (let i = start; i < s.length; i++) {
+    if (s[i] === '\\') i++;
+    else if (s[i] === "'") return i;
+  }
+  return -1;
+}
+
+/** A backtick body as the shell runs it: inside backticks `\`` is a nested substitution, not a literal backtick. */
+function backtickBody(body: string, dialect: Dialect): string {
+  return dialect.escape === '\\' ? body.replace(/\\([$`\\])/g, '$1') : body;
+}
+
+interface HereDocument {
+  delimiter: string;
+  /** Any part of the delimiter was quoted, so the body is not expanded. */
+  quoted: boolean;
+  /** `<<-`: leading tabs are stripped from the body and the delimiter line. */
+  stripTabs: boolean;
+}
+
+/**
+ * Skip the here-document bodies that start at `start`, returning the index
+ * after the last delimiter line, -1 when one is never closed, or
+ * {@link UNREADABLE}.
+ *
+ * A body is data, not commands. Lexed as commands, a quote in it opened a
+ * string that hid the lines after the delimiter: `cat <<EOF\n'\nEOF\nrm -rf ~ #'`
+ * lexed as one `cat`. An unquoted delimiter still expands the body, so its
+ * substitutions run and are queued in `nested` like any other.
+ */
+function skipHereDocuments(s: string, start: number, docs: HereDocument[], nested: string[], dialect: Dialect): number {
+  let pos = start;
+  for (const doc of docs) {
+    const bodyStart = pos;
+    let bodyEnd = -1;
+    while (pos < s.length) {
+      const newline = s.indexOf('\n', pos);
+      const lineEnd = newline < 0 ? s.length : newline;
+      const line = s.slice(pos, lineEnd);
+      const lineStart = pos;
+      pos = newline < 0 ? s.length : newline + 1;
+      if ((doc.stripTabs ? line.replace(/^\t+/, '') : line) === doc.delimiter) { bodyEnd = lineStart; break; }
+    }
+    if (bodyEnd < 0) return -1;
+    if (doc.quoted) continue;
+    const body = s.slice(bodyStart, bodyEnd);
+    for (let i = 0; i < body.length; i++) {
+      if (body[i] === '\\') { i++; continue; }
+      if (body[i] === '$' && body[i + 1] === '(') {
+        const close = matchParen(body, i + 1, dialect);
+        if (close < 0) return close;
+        nested.push(body.slice(i + 2, close));
+        i = close;
+      } else if (body[i] === '`') {
+        const close = matchBacktick(body, i, dialect);
+        if (close < 0) return -1;
+        nested.push(backtickBody(body.slice(i + 1, close), dialect));
+        i = close;
+      }
+    }
+  }
+  return pos;
 }
 
 /**
@@ -239,6 +353,8 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
   let unsafeRedirect: UnsafeRedirect | undefined;
   let processSubstitution = false;
   let unbalanced = false;
+  let unreadable = false;
+  let switchName: string | undefined;
   let grouped = false;
   let joinedBy: Segment['joinedBy'];
   let followable = true;
@@ -256,10 +372,15 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
   // captured as the redirect's operand instead of pushed onto the segment as an
   // ordinary argument. An input redirect's word used to be pushed: it can come
   // first, so `< cat rm x` lexed as a `cat` while the shell ran `rm x`. `data`
-  // is a here-document delimiter or here-string, which names no file.
-  let redirectTarget: 'write' | 'read' | 'data' | undefined;
+  // is a here-string, and `heredoc` a here-document delimiter; neither names a file.
+  let redirectTarget: 'write' | 'read' | 'data' | 'heredoc' | undefined;
   let redirectOperator = '';
   let inputs: string[] = [];
+
+  // Here-documents opened on the current line, whose bodies start after its newline.
+  const hereDocs: HereDocument[] = [];
+  let hereDocQuoted = false;
+  let hereDocStripTabs = false;
 
   // Brace expansion (`{a,b}`, `{1..3}`) in the current word, unquoted: bash
   // turns it into other words before anything runs.
@@ -277,6 +398,14 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
         unsafeRedirect = { operator: redirectOperator, target: current };
       }
       if (redirectTarget === 'read' && started) inputs.push(current);
+      if (redirectTarget === 'heredoc') {
+        // The shell does not expand a delimiter, so a `$` in one is spelled in
+        // a way this lexer does not track; and with no delimiter there is no body end.
+        if (!started) unbalanced = true;
+        else if (/[$`]/.test(current)) unreadable = true;
+        else hereDocs.push({ delimiter: current, quoted: hereDocQuoted, stripTabs: hereDocStripTabs });
+        hereDocQuoted = false;
+      }
       redirectTarget = undefined;
       current = '';
       started = false;
@@ -285,6 +414,22 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
     if (started) tokens.push(current);
     current = '';
     started = false;
+  };
+  // cmd.exe ends a command name at an unquoted `/` or `,` and skips `,` and
+  // `=` before one — escaped ones too, since it strips `^` before reading the
+  // name. A `=` inside the name is left alone: the word is then an assignment,
+  // which the policy refuses.
+  const nameDelimiter = (ch: string): boolean => {
+    if (!dialect.nameDelimiters.includes(ch) || tokens.length > 0 || redirectTarget) return false;
+    if (!started) {
+      if (ch !== '/') return true;
+      switchName ??= /^\S*/.exec(command.slice(i))?.[0];
+      return false;
+    }
+    if (ch === '=') return false;
+    endToken();
+    if (ch === '/') { current = ch; started = true; }
+    return true;
   };
   const endSegment = (nextPiped: boolean, next: Segment['joinedBy'] = 'other', last = false) => {
     endToken();
@@ -321,7 +466,8 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
     // `quote` is '' or '"' here — the single-quote run returned above.
     if (c === dialect.escape && (quote === '' || dialect.escapeInQuotes)) {
       const next = command[i + 1];
-      if (next !== undefined) { current += next; started = true; }
+      if (redirectTarget === 'heredoc') hereDocQuoted = true;
+      if (next !== undefined && !(quote === '' && nameDelimiter(next))) { current += next; started = true; }
       i += 2; continue;
     }
 
@@ -332,6 +478,7 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
     // as a command name took the whole segment out of classification.
     if (c === '$' && command[i + 1] === '(') {
       const close = matchParen(command, i + 1, dialect);
+      if (close === UNREADABLE) { unreadable = true; break; }
       if (close < 0) { unbalanced = true; break; }
       nested.push(command.slice(i + 2, close));
       current += command.slice(i, close + 1); started = true; expandable = true;
@@ -340,14 +487,19 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
     if (c === '`') {
       const close = matchBacktick(command, i, dialect);
       if (close < 0) { unbalanced = true; break; }
-      // Inside backticks `\`` is a nested substitution, not a literal backtick,
-      // so the body is lexed with the escapes the shell strips already gone.
-      const body = command.slice(i + 1, close);
-      nested.push(dialect.escape === '\\' ? body.replace(/\\([$`\\])/g, '$1') : body);
+      nested.push(backtickBody(command.slice(i + 1, close), dialect));
       current += command.slice(i, close + 1); started = true; expandable = true;
       i = close + 1; continue;
     }
-    if (dialect.dollarQuotes && quote === '' && c === '$' && (command[i + 1] === "'" || command[i + 1] === '"')) {
+    if (dialect.dollarQuotes && quote === '' && c === '$' && command[i + 1] === "'") {
+      const end = ansiCQuoteEnd(command, i + 2);
+      if (end < 0) { unbalanced = true; break; }
+      // Kept undecoded, `$` included: the word is computed either way.
+      expandable = true;
+      current += `$${command.slice(i + 2, end)}`; started = true;
+      i = end + 1; continue;
+    }
+    if (dialect.dollarQuotes && quote === '' && c === '$' && command[i + 1] === '"') {
       expandable = true;
       current += c; started = true; i++; continue;
     }
@@ -361,7 +513,10 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
       current += c; started = true; i++; continue;
     }
 
-    if (dialect.quotes.includes(c)) { quote = c; started = true; i++; continue; }
+    if (dialect.quotes.includes(c)) {
+      if (redirectTarget === 'heredoc') hereDocQuoted = true;
+      quote = c; started = true; i++; continue;
+    }
 
     if (c === '<' || c === '>') {
       if (command[i + 1] === '(') { processSubstitution = true; i += 2; continue; }
@@ -394,6 +549,10 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
       if (c === '>') {
         redirectTarget = 'write';
         redirectOperator = fd + c.repeat(run);
+      } else if (run === 2 && dialect.hereDocuments) {
+        redirectTarget = 'heredoc';
+        hereDocStripTabs = command[i + run] === '-';
+        if (hereDocStripTabs) i++;
       } else {
         redirectTarget = run === 1 ? 'read' : 'data';
       }
@@ -424,11 +583,18 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
     }
     if (c === '&' || c === ';' || c === '\n') {
       endSegment(false, c === '&' && command[i + 1] === '&' ? 'and' : 'other');
+      if (c === '\n' && hereDocs.length > 0) {
+        const end = skipHereDocuments(command, i + 1, hereDocs.splice(0), nested, dialect);
+        if (end === UNREADABLE) { unreadable = true; break; }
+        if (end < 0) { unbalanced = true; break; }
+        i = end; continue;
+      }
       i += command[i + 1] === c ? 2 : 1;
       continue;
     }
 
     if (/\s/.test(c)) { endToken(false); i++; continue; }
+    if (quote === '' && nameDelimiter(c)) { i++; continue; }
 
     if (c === '{') braceOpen = true;
     else if (braceOpen && (c === ',' || (c === '.' && command[i + 1] === '.'))) braceList = true;
@@ -438,8 +604,10 @@ export function lex(command: string, nested: string[], dialect: Dialect): Lexed 
 
   if (quote !== '') unbalanced = true;
   endSegment(false, 'other', true);
+  // The line ended before a body began: a here-document that never closed.
+  if (hereDocs.length > 0) unbalanced = true;
 
-  return { segments, unsafeRedirect, processSubstitution, unbalanced, grouped, followable, bareSegment };
+  return { segments, unsafeRedirect, processSubstitution, unbalanced, unreadable, switchName, grouped, followable, bareSegment };
 }
 
 /**
@@ -507,6 +675,8 @@ export function lexAll(command: string, dialect: Dialect, cdpathSet = false): Le
     all.unsafeRedirect ??= inner.unsafeRedirect;
     all.processSubstitution ||= inner.processSubstitution;
     all.unbalanced ||= inner.unbalanced;
+    all.unreadable ||= inner.unreadable;
+    all.switchName ??= inner.switchName;
   }
   // Whatever is still queued would run unclassified.
   if (queue.length > 0) all.truncated = true;
