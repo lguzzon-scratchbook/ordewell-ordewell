@@ -75,7 +75,6 @@ function fakeDaemon() {
     }),
     stopExecution: vi.fn(async () => ({ status: 'stopped' })),
     cancelPlanning: vi.fn(async () => ({ cancelled: true })),
-    processQueued: vi.fn(async () => ({ ok: true })),
     taskControl: vi.fn(async () => ({ ok: true })),
     markTaskComplete: vi.fn(async () => ({ ok: true })),
     markTaskIncomplete: vi.fn(async () => ({ ok: true })),

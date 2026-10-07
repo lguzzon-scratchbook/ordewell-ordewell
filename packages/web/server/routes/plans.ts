@@ -444,20 +444,6 @@ export function plansRoute(pool: OrchestratorPool) {
     }
   });
 
-  // Drain queued structural edits between task batches. The orchestrator pauses
-  // fan-out while a message is queued (so an edit can't race a spawn) and emits
-  // `queue_ready` once no task is active; a surface calls this to apply the edit
-  // via the planner and resume scheduling. Without a route the TUI/CLI could
-  // never clear the queue, permanently suppressing dependents after one edit.
-  router.post('/:sessionId/process-queued', async (c) => {
-    try {
-      await pool.session(c.req.param('sessionId')).processQueuedMessages();
-      return c.json({ ok: true });
-    } catch (err) {
-      return failure(c, err, { 'Session not found': 404 }, 500, 'process queued');
-    }
-  });
-
   router.get('/:sessionId/prd', (c) => {
     const plan = pool.getPlan(c.req.param('sessionId'));
     if (!plan?.prdMarkdown) return c.json({ error: 'No PRD found' }, 404);

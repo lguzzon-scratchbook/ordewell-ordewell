@@ -84,16 +84,15 @@ describe('SessionEventRelay', () => {
     const { relay, sent, notices, types } = setup();
     const observer = relay.observer(() => plan());
 
-    observer.onQueueReady();
     observer.onReviewApproved({ tasks: [] });
     observer.onCheckpoint({ taskId: 't3', taskTitle: 'Third', summary: 'look' });
     observer.onIsolationBlocked({ reason: 'dirty', repos: ['api', 'web'] });
     observer.onIsolationNotice({ level: 'warn', message: 'shared paths' });
     observer.onExecutionComplete();
 
-    expect(types()).toEqual(['queue_ready', 'review_approved', 'checkpoint', 'isolation_blocked', 'execution_complete']);
-    expect(sent[3]).toMatchObject({ repos: ['api', 'web'], message: expect.stringContaining('in api, web') });
-    expect(sent[4]).toEqual({ type: 'execution_complete', summary: { total: 3, completed: 1, failed: 1 } });
+    expect(types()).toEqual(['review_approved', 'checkpoint', 'isolation_blocked', 'execution_complete']);
+    expect(sent[2]).toMatchObject({ repos: ['api', 'web'], message: expect.stringContaining('in api, web') });
+    expect(sent[3]).toEqual({ type: 'execution_complete', summary: { total: 3, completed: 1, failed: 1 } });
     expect(notices).toEqual([{ type: 'notice', level: 'warn', message: 'shared paths' }]);
   });
 

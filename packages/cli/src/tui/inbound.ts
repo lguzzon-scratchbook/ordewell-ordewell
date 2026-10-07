@@ -372,14 +372,6 @@ function dispatchLifecycle(dispatch: Dispatch, event: LifecycleMessage, sessionI
       dispatch({ type: 'notice', message: 'Plan approved.' });
       return;
 
-    // The orchestrator paused fan-out because a structural edit is queued; drain
-    // it so the planner reconciles the plan and dependents resume spawning.
-    // Dropped on the floor, the queue suppresses every later tick() — which is
-    // exactly "tasks did not fan out when the dependent ones finished."
-    case 'queue_ready':
-      dispatch({ type: 'queueReady', sessionId });
-      return;
-
     case 'execution_complete':
       dispatch({ type: 'executionComplete', summary: event.summary, sessionId });
       return;

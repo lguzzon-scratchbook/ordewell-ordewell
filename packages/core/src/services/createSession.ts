@@ -450,6 +450,8 @@ export class Session {
   private queueDrain: Promise<void> | null = null;
   /** The queued messages the planner has been given, no longer the user's to take back. */
   private drainingIds = new Set<string>();
+  /** User controls in flight; see {@link withSave}. */
+  private controlsInFlight = 0;
   private unsubObserver: (() => void) | null;
   private readonly hostSessionId?: string;
   private currentSessionId: string;
@@ -576,12 +578,27 @@ export class Session {
   /**
    * The relay announces every orchestrator event; this adds the saves some of
    * them owe, each made before the announcement so no surface sees state the
-   * disk lacks.
+   * disk lacks, and drains the queue the scheduler parked behind.
    */
   private observer(): OrchestratorObserver {
     const relay = this.events.observer(() => this.plan);
     return {
       ...relay,
+      onTaskChanged: () => {
+        this.saveForControl();
+        relay.onTaskChanged();
+      },
+      onTick: () => {
+        this.saveForControl();
+        relay.onTick();
+      },
+      // The scheduler stays parked until the queue is gone, so nothing but
+      // this drain can wake it again.
+      onQueueReady: () => {
+        this.processQueuedMessages().catch((err: unknown) => {
+          this.onNotice?.({ type: 'notice', level: 'error', message: `The run could not resume after your queued change: ${err instanceof Error ? err.message : String(err)}` });
+        });
+      },
       // Saved the moment it settles: a shared run has no run record to save
       // it mid-run, so a crash would otherwise lose every verdict since the
       // last Session operation.
@@ -865,12 +882,10 @@ export class Session {
     }));
 
     this.plan = plan;
-    this.events.holdStatus(() => {
+    this.saved(() => {
       this.orchestrator.loadPlan(plan.tasks, plan.runners);
       this.store.resetForRun({ preserveCompleted: false });
     });
-    this.persist();
-    this.events.releaseStatus(this.plan);
     this.events.planGenerated(this.plan, this.goal);
     return plan;
   }
@@ -1107,23 +1122,23 @@ export class Session {
     if (!this.plan || !this.store.planTasks.length) throw new Error('No plan to execute');
     if (this.orchestrator.hasLiveWork) throw new Error('Session already executing');
 
-    // A scheduler armed from an earlier run but with nothing live — paused on a
-    // hold, a user task, or a cancellation — would ignore the restart: `start`
-    // no-ops while armed and `loadPlan` keeps the run mode. Disarm it so this
-    // run starts cleanly; with nothing live, stopping has nothing to interrupt.
-    this.orchestrator.stop();
+    const plan = this.plan;
+    await this.withSave(async () => {
+      // A scheduler armed from an earlier run but with nothing live — paused on a
+      // hold, a user task, or a cancellation — would ignore the restart: `start`
+      // no-ops while armed and `loadPlan` keeps the run mode. Disarm it so this
+      // run starts cleanly; with nothing live, stopping has nothing to interrupt.
+      this.orchestrator.stop();
 
-    this.plan.status = 'approved';
-    this.store.clearLog();
-    this.store.resetForRun();
+      plan.status = 'approved';
+      this.store.clearLog();
+      this.store.resetForRun();
 
-    this.orchestrator.loadPlan(this.store.planTasks, this.plan.runners);
-    await this.orchestrator.approveReview();
+      this.orchestrator.loadPlan(this.store.planTasks, plan.runners);
+      await this.orchestrator.approveReview();
+    });
 
-    if (!this.orchestrator.isRunning && !this.runs.blocked) {
-      this.events.executionComplete(this.plan);
-      this.persist();
-    }
+    if (!this.orchestrator.isRunning && !this.runs.blocked) this.events.executionComplete(this.plan);
   }
 
   async approveReview(): Promise<LegacyPlanState> {
@@ -1137,7 +1152,7 @@ export class Session {
     if (!this.store.get(taskId)) {
       this.orchestrator.loadPlan(this.store.planTasks, this.plan.runners);
     }
-    await this.orchestrator.forceStartTask(taskId);
+    await this.withSave(() => this.orchestrator.forceStartTask(taskId));
   }
 
   async runTask(taskId: string): Promise<void> {
@@ -1145,7 +1160,7 @@ export class Session {
     if (!this.store.get(taskId)) {
       this.orchestrator.loadPlan(this.store.planTasks, this.plan.runners);
     }
-    await this.orchestrator.runTask(taskId);
+    await this.withSave(() => this.orchestrator.runTask(taskId));
   }
 
   /** Start whatever the scheduler can now fit — after the parallel limit was raised mid-run, say. */
@@ -1154,8 +1169,7 @@ export class Session {
   }
 
   async retryTask(taskId: string): Promise<void> {
-    await this.orchestrator.retryTask(taskId);
-    this.persist();
+    await this.withSave(() => this.orchestrator.retryTask(taskId));
   }
 
   /**
@@ -1164,30 +1178,28 @@ export class Session {
    * cannot be continued.
    */
   async continueTask(taskId: string, message: string): Promise<void> {
-    await this.orchestrator.continueTask(taskId, message);
-    this.persist();
+    await this.withSave(() => this.orchestrator.continueTask(taskId, message));
   }
 
   async cancelTask(taskId: string): Promise<void> {
-    await this.orchestrator.cancelTask(taskId);
-    this.persist();
+    await this.withSave(() => this.orchestrator.cancelTask(taskId));
   }
 
   async markTaskComplete(taskId: string): Promise<void> {
-    await this.orchestrator.markTaskComplete(taskId);
-    this.persist();
+    await this.withSave(() => this.orchestrator.markTaskComplete(taskId));
   }
 
   async markTaskIncomplete(taskId: string): Promise<void> {
-    await this.orchestrator.markTaskIncomplete(taskId);
-    this.persist();
+    await this.withSave(() => this.orchestrator.markTaskIncomplete(taskId));
   }
 
   /**
-   * Hand the queued edits to the planner. The messages stay queued until its
-   * answer is applied, so the scheduler stays paused behind them meanwhile;
-   * one drain runs at a time, and a call made during it joins it. Whatever
-   * was queued while it ran is drained after, before the run goes on.
+   * Hand the queued edits to the planner. The Session does this itself each
+   * time the scheduler parks behind the queue, so no surface has to; a caller
+   * only needs it to await the drain. The messages stay queued until the
+   * planner's answer is applied, so the scheduler stays paused behind them
+   * meanwhile; one drain runs at a time, and a call made during it joins it.
+   * Whatever was queued while it ran is drained after, before the run goes on.
    */
   async processQueuedMessages(): Promise<void> {
     if (this.queueDrain) return this.queueDrain;
@@ -1297,11 +1309,11 @@ export class Session {
   }
 
   approveCheckpoint(taskId: string): void {
-    this.orchestrator.approveCheckpoint(taskId);
+    this.saved(() => this.orchestrator.approveCheckpoint(taskId));
   }
 
   rejectCheckpoint(taskId: string, reason?: string): void {
-    this.orchestrator.rejectCheckpoint(taskId, reason);
+    this.saved(() => this.orchestrator.rejectCheckpoint(taskId, reason));
   }
 
   /** Whether an answer would reach the task: it waits at a checkpoint and a runner is left to hear it. */
@@ -1315,10 +1327,7 @@ export class Session {
    * is back in progress, and saved so before any surface is told.
    */
   sendTaskMessage(taskId: string, text: string): string {
-    const id = this.events.holdStatus(() => this.orchestrator.sendTaskMessage(taskId, text));
-    this.persist({ background: true });
-    this.events.releaseStatus(this.plan);
-    return id;
+    return this.saved(() => this.orchestrator.sendTaskMessage(taskId, text), { background: true });
   }
 
   /**
@@ -1327,10 +1336,7 @@ export class Session {
    * and for a task on the terminal transport.
    */
   forceSendTaskMessage(taskId: string, text: string): string {
-    const id = this.events.holdStatus(() => this.orchestrator.forceSendTaskMessage(taskId, text));
-    this.persist({ background: true });
-    this.events.releaseStatus(this.plan);
-    return id;
+    return this.saved(() => this.orchestrator.forceSendTaskMessage(taskId, text), { background: true });
   }
 
   forceSendQueuedTaskMessage(taskId: string, id: string): boolean {
@@ -1362,14 +1368,12 @@ export class Session {
 
   /** Replay a run a dirty tree blocked, after stashing the tracked changes. */
   async continueWithStash(): Promise<void> {
-    await this.orchestrator.continueBlockedRun('stash');
-    this.persist();
+    await this.withSave(() => this.orchestrator.continueBlockedRun('stash'));
   }
 
   /** Replay a run a dirty tree blocked, in the workspace root, for this run only. */
   async continueWithoutIsolation(): Promise<void> {
-    await this.orchestrator.continueBlockedRun('shared');
-    this.persist();
+    await this.withSave(() => this.orchestrator.continueBlockedRun('shared'));
   }
 
   /**
@@ -1415,8 +1419,7 @@ export class Session {
   /** Remove the run's worktrees and task branches; keep its integration branch to review or merge. */
   async cleanupRun(): Promise<void> {
     this.requireSettledRun();
-    await this.runs.cleanup();
-    this.persist();
+    await this.withSave(() => this.runs.cleanup());
   }
 
   /**
@@ -1426,8 +1429,7 @@ export class Session {
    */
   async discardRun(): Promise<void> {
     this.requireSettledRun();
-    await this.runs.discard();
-    this.persist();
+    await this.withSave(() => this.runs.discard());
   }
 
   private requireSettledRun(): void {
@@ -1441,8 +1443,39 @@ export class Session {
   }
 
   stopExecution(): void {
-    this.orchestrator.stop();
+    this.saved(() => this.orchestrator.stop());
     this.broadcast({ type: 'execution_stopped' });
+  }
+
+  /**
+   * Run a user control and save what it changed before any surface hears of
+   * it. Not a status hold, as {@link saved} is: these await spawns and git, so
+   * a hold would stall every task's status for as long, and an
+   * `execution_complete` the control triggers would overtake the status held
+   * back — which a surface treats as the end of the stream. Instead each status
+   * announced while one runs is saved first (see {@link observer}).
+   */
+  private async withSave<T>(op: () => Promise<T>): Promise<T> {
+    this.controlsInFlight++;
+    try {
+      const result = await op();
+      this.persist();
+      return result;
+    } finally {
+      this.controlsInFlight--;
+    }
+  }
+
+  private saveForControl(): void {
+    if (this.controlsInFlight > 0) this.persist();
+  }
+
+  /** A control that finishes synchronously: its status is held until it is saved. */
+  private saved<T>(op: () => T, opts: { background?: boolean } = {}): T {
+    const result = this.events.holdStatus(op);
+    this.persist(opts);
+    this.events.releaseStatus(this.plan);
+    return result;
   }
 
   /**

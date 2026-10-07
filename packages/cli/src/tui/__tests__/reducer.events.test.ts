@@ -367,17 +367,3 @@ describe('messages from the runtime', () => {
     expect(s.goal).toBe('');
   });
 });
-
-describe('queueReady', () => {
-  it('emits a processQueued effect so the runtime drains the queue and resumes fan-out', () => {
-    const st = { ...initialState(), sessionId: 's7' };
-    const result = reduce(st, { type: 'queueReady', sessionId: 's7' });
-    expect(result.effects).toEqual([{ type: 'processQueued', sessionId: 's7' }]);
-  });
-
-  it('falls back to the current session id when the event carried none', () => {
-    const st = { ...initialState(), sessionId: 'current' };
-    const result = reduce(st, { type: 'queueReady' });
-    expect(result.effects).toEqual([{ type: 'processQueued', sessionId: 'current' }]);
-  });
-});

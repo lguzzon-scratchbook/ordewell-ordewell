@@ -484,6 +484,7 @@ describe('Session.removeTask of a task not in the plan', () => {
     const session = makeSession({ runner, modelResolver: resolverFor(CLAUDE_CATALOG) });
     session.loadPlan(soloPlan(), 'goal', testWorkspace, { persist: false });
     await session.executePlan();
+    saves(session).mockClear();
 
     expect(await session.removeTask('ghost')).toBeNull();
 
