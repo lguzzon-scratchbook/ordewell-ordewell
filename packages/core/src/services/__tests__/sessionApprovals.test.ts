@@ -314,6 +314,19 @@ describe('Session approval flow', () => {
       expect(session.outstandingApprovals()).toEqual([]);
     });
 
+    it('denies it just the same when the stop comes through the session rather than a caller signal', async () => {
+      const { session, messages, bash } = sessionParkedOnApproval();
+
+      const planning = session.startPlanning('goal', ['claude-code']);
+      await vi.waitFor(() => expect(approvalRequests(messages)).toHaveLength(1));
+
+      expect(session.abortPlannerTurn()).toBe(true);
+      await planning;
+
+      expect(bash.outcome?.output).toContain('not approved');
+      expect(session.outstandingApprovals()).toEqual([]);
+    });
+
     it('lands the stopped turn as a message, so the transcript shows where research ended', async () => {
       const { session, messages, controller } = sessionParkedOnApproval();
 

@@ -144,6 +144,7 @@ function fakeSession() {
     reschedule: vi.fn(async () => {}),
     isExecuting: false,
     isConversationActive: false,
+    isPlannerBusy: false,
     status: 'draft',
     planState: null,
     planTasks: [],
@@ -295,7 +296,7 @@ describe('the extension host wires one state, one deps bag and one lifecycle', (
     h.chat.messages.fire({ type: 'ready' });
 
     await vi.waitFor(() => expect(h.chat.provider.resendAllState).toHaveBeenCalled());
-    expect(h.session.spies.startPlanning).toHaveBeenCalledWith('build a parser', ['claude-code'], expect.anything());
+    expect(h.session.spies.startPlanning).toHaveBeenCalledWith('build a parser', ['claude-code']);
     expect(h.chat.provider.showPlan).toHaveBeenCalledWith(expect.objectContaining({
       tasks: [expect.objectContaining({ id: 't1' })],
     }));

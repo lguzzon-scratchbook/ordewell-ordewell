@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { PlannerTurnDiscardedError } from '@ordewell/core';
 import { reportPlannerError, type PlanManagerDeps } from '../PlanManager';
 
 function harness() {
@@ -20,11 +21,9 @@ describe('reportPlannerError', () => {
     expect(showError).not.toHaveBeenCalled();
   });
 
-  it('stays quiet for any error once the turn\'s own signal was aborted', () => {
+  it('stays quiet for a turn discarded because the session it answered was left', () => {
     const { deps, showError } = harness();
-    const controller = new AbortController();
-    controller.abort();
-    reportPlannerError(new Error('spawn failed'), deps, controller.signal);
+    reportPlannerError(new PlannerTurnDiscardedError(), deps);
     expect(showError).not.toHaveBeenCalled();
   });
 });

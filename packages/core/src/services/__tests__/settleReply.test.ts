@@ -173,12 +173,12 @@ describe('settleReply', () => {
   describe('a stop', () => {
     // A reply that was already in flight when the user stopped must not land
     // as a plan on whatever session is current by then.
-    it('settles what the stopped call had as a message, without classifying it', async () => {
+    it('settles what the stopped call had as a message marked aborted, without classifying it', async () => {
       const m = model(reply(PLAN_JSON, { aborted: true }));
 
       const turn = await settleReply(m.opts());
 
-      expect(turn).toEqual({ kind: 'message', text: PLAN_JSON, researchLog: [] });
+      expect(turn).toEqual({ kind: 'message', text: PLAN_JSON, researchLog: [], aborted: true });
       expect(m.timeline).toEqual(['send', 'interrupted']);
     });
 

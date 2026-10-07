@@ -31,7 +31,8 @@ plan is the artifact.
 **Session** — the deep module owning one plan's full lifecycle: generation,
 execution, mutation and persistence. It
 *hosts* the planner conversation but does not own it: `startPlanning`,
-`continueConversation` and `isConversationActive` are thin delegations to a
+`continueConversation`, `isConversationActive`, and the **Planner turn**'s
+`isPlannerBusy` and `abortPlannerTurn` are thin delegations to a
 **PlannerConversation**, which reaches plan state, persistence and scheduling
 only through the host interface Session hands it.
 **`createSession(deps)` is the composition root**: hosts pass injected adapters
@@ -149,9 +150,30 @@ mid-turn — does not count: the turn still rolls back, and the undo is saved
 through the mutation ritual so disk follows memory. Transcript edits are whole-array
 operations (`append`, `replace`), so compacting a conversation is a
 transcript edit plus a `reset`; forking and rewinding copy it instead
-(`clone`, `cloneBefore`) and leave it as it was.
+(`clone`, `cloneBefore`) and leave it as it was. It owns the **Planner turn**
+too, so no surface keeps its own abort controller or busy flag, and a turn that
+settles after its plan was swapped out never writes into the new one.
 *Avoid:* "chat" or "thread" for the module — the conversation is the thing; the
 AI service only holds a disposable copy of it.
+
+**Planner turn** (`PlannerTurn`; `Session.isPlannerBusy`,
+`Session.abortPlannerTurn()`) — the one piece of planner work holding a
+session's conversation at a time: a reply (merge and split requests included),
+a compaction, the conversation's opening, or one-shot plan generation.
+Starting one creates its abort signal, and a caller's own signal is relayed
+into it. A turn that continues the dialogue is refused while another is live
+(`ConversationBusyError`, 409 from the daemon); one that starts a fresh plan
+supersedes it. `abortPlannerTurn` *stops* the turn: it still settles, with
+whatever the backend had, as `stopped`. A turn whose plan is dropped under it —
+a new plan, another session adopted, the session closed — is *abandoned*:
+stopped, the conversation freed at once, and whatever it settles is discarded
+(`PlannerTurnDiscardedError`) instead of committed. So is a reply cut off by
+something other than its own stop (an `IAiService.reset`), since what such a
+call hands back is a fragment.
+*Avoid:* "planning abort" or "generating" for it — both named a surface's copy
+of this state, and the copies drifted; *Avoid:* confusing it with **Turn**, the
+streamed span a surface draws under one `turnId`: every user turn is a planner
+turn, but a compaction or a one-shot generation streams no Turn.
 
 **SessionMessage** — the single union every delivery surface consumes: the
 plan-lifecycle events (`plan_generated`, `planner_message`, `status_update`, …)

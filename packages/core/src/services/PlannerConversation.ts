@@ -48,6 +48,49 @@ function freshReadBudget(): ReadBudget {
   return { answered: 0, seen: new Set() };
 }
 
+/**
+ * Spend one read from the turn's budget, whichever channel it came over.
+ * Refused at the hard limit; otherwise answered, and told to land the turn
+ * once the soft limit is spent or the planner asks the identical question
+ * again — a loop, not a read.
+ */
+function spendRead(reads: ReadBudget, signature: string): 'refused' | 'answer' | 'land' {
+  if (reads.answered >= MAX_TASK_QUERIES_HARD) return 'refused';
+  const land = reads.seen.has(signature) || reads.answered >= MAX_TASK_QUERIES;
+  reads.seen.add(signature);
+  reads.answered++;
+  return land ? 'land' : 'answer';
+}
+
+/**
+ * The planner turn (see CONTEXT.md): the one piece of planner work that holds
+ * the conversation, from its claim to its settled outcome. Its signal is what a
+ * stop aborts.
+ */
+export class PlannerTurn {
+  private readonly controller = new AbortController();
+  private dropped = false;
+
+  get signal(): AbortSignal { return this.controller.signal; }
+
+  /** The plan it was answering was dropped under it, so nothing it settles may land. */
+  get abandoned(): boolean { return this.dropped; }
+
+  stop(): void { this.controller.abort(); }
+
+  abandon(): void {
+    this.dropped = true;
+    this.controller.abort();
+  }
+}
+
+/**
+ * How a turn takes the conversation: a turn that continues the dialogue is
+ * refused while another is live, and one that starts a fresh plan supersedes
+ * it — the plan the live one was answering is being dropped anyway.
+ */
+type TurnAdmission = { refuseAs: string } | 'supersede';
+
 /** A turn with every read already drained — what the settle path actually commits. */
 type SettleableTurn = Exclude<ConversationTurn, { kind: 'task_query' }>;
 type CommitTurn = Exclude<SettleableTurn, { kind: 'task_ops' }>;
@@ -55,7 +98,10 @@ type CommitTurn = Exclude<SettleableTurn, { kind: 'task_ops' }>;
 /** One user turn, from the message to its settled outcome: every backend call it makes streams through `stream`. */
 interface UserTurn {
   stream: TurnStream;
-  signal?: AbortSignal;
+  planner: PlannerTurn;
+  signal: AbortSignal;
+  /** The plan the turn is answering; a settle that finds another one current lands nothing. */
+  plan: LegacyPlanState | null;
   reads: ReadBudget;
   /** Handed in since the backend last answered; see {@link PlannerConversation.submit}. */
   submitted?: PlannerSubmission;
@@ -114,6 +160,8 @@ export interface PlannerConversationHost {
   queueEdit(userMessage: string): number;
   /** Wake a scheduler an applied edit may have unblocked. */
   afterEdit(): Promise<void>;
+  /** The planner turn was stopped or abandoned: whatever it is waiting on (a parked approval) will never be answered. */
+  turnAborted(): void;
 }
 
 /**
@@ -138,6 +186,20 @@ export class ConversationBusyError extends ConversationEditError {
   constructor(operation: string) {
     super(`Cannot ${operation} while the planner is answering — wait for the reply, or stop it first.`);
     this.name = 'ConversationBusyError';
+  }
+}
+
+/**
+ * A planner turn that settled after the plan it was answering was dropped (a
+ * new plan, another session adopted, the session closed), or after its call
+ * was cut off by something other than its own stop. Nothing it produced was
+ * committed: landing it would write one session's reply into another's
+ * transcript.
+ */
+export class PlannerTurnDiscardedError extends Error {
+  constructor() {
+    super('The planner turn was discarded: the plan it was answering is no longer the current one.');
+    this.name = 'PlannerTurnDiscardedError';
   }
 }
 
@@ -203,8 +265,7 @@ export class PlannerConversation {
   private persisted = 0;
   /** Saves an execution event made while a turn may be in flight; see {@link restore}. */
   private savedInBackground = 0;
-  private turnsInFlight = 0;
-  private compacting = false;
+  private live: PlannerTurn | null = null;
   private openTurn: UserTurn | null = null;
 
   constructor(private readonly host: PlannerConversationHost) {}
@@ -213,9 +274,66 @@ export class PlannerConversation {
     return this.host.plan()?.conversationHistory ?? [];
   }
 
-  /** Whether a user turn is between its transcript append and its settled outcome. */
+  /** Whether a planner turn holds the conversation. */
   get isTurnInFlight(): boolean {
-    return this.turnsInFlight > 0;
+    return this.live !== null;
+  }
+
+  /** Stop the planner turn in flight; it settles as stopped. False when none is. */
+  stopTurn(): boolean {
+    if (!this.live) return false;
+    this.live.stop();
+    return true;
+  }
+
+  /**
+   * Drop the planner turn in flight together with the plan it was answering:
+   * it is stopped, whatever it settles is discarded, and the conversation is
+   * free at once rather than when the abandoned turn finishes unwinding.
+   */
+  abandonTurn(): void {
+    const turn = this.live;
+    if (!turn) return;
+    this.live = null;
+    turn.abandon();
+  }
+
+  /**
+   * Run planner work that is not a conversation turn — one-shot plan
+   * generation — as the planner turn, so it is stopped, refused and superseded
+   * like one. It starts a fresh plan, so it supersedes the turn in flight.
+   */
+  async hold<T>(signal: AbortSignal | undefined, body: (turn: PlannerTurn) => Promise<T>): Promise<T> {
+    const { turn, release } = this.claim('supersede', signal);
+    try {
+      return await body(turn);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Take the conversation for a new planner turn. A caller's own signal stops
+   * the turn too; the relay is detached on release because a caller may reuse
+   * that signal, and a stale listener would stop the next turn with it.
+   */
+  private claim(admission: TurnAdmission, callerSignal?: AbortSignal): { turn: PlannerTurn; release: () => void } {
+    if (admission === 'supersede') this.abandonTurn();
+    else if (this.live) throw new ConversationBusyError(admission.refuseAs);
+    const turn = new PlannerTurn();
+    this.live = turn;
+    turn.signal.addEventListener('abort', () => this.host.turnAborted(), { once: true });
+    const relay = () => turn.stop();
+    if (callerSignal?.aborted) turn.stop();
+    else callerSignal?.addEventListener('abort', relay, { once: true });
+    return {
+      turn,
+      release: () => {
+        callerSignal?.removeEventListener('abort', relay);
+        // An abandoned turn gave the slot up already, maybe to its successor.
+        if (this.live === turn) this.live = null;
+      },
+    };
   }
 
   /** The user turn being answered, for what the host raises during it — an approval the turn's research asks for. */
@@ -261,11 +379,9 @@ export class PlannerConversation {
   async read<T>(signature: string, answer: () => Promise<T>): Promise<ToolRead<T>> {
     const reads = this.openTurn?.reads;
     if (!reads) return { status: 'answered', value: await answer(), landNow: false };
-    if (reads.answered >= MAX_TASK_QUERIES_HARD) return { status: 'refused' };
-    const landNow = reads.seen.has(signature) || reads.answered >= MAX_TASK_QUERIES;
-    reads.seen.add(signature);
-    reads.answered++;
-    return { status: 'answered', value: await answer(), landNow };
+    const spent = spendRead(reads, signature);
+    if (spent === 'refused') return { status: 'refused' };
+    return { status: 'answered', value: await answer(), landNow: spent === 'land' };
   }
 
   /** Whether the model still holds this conversation in memory. */
@@ -375,46 +491,46 @@ export class PlannerConversation {
     if (!keptTail(this.transcript)) {
       throw new ConversationEditError('The conversation is too short to condense — it takes more than two exchanges before a summary saves anything.');
     }
-    return this.inTurn(async () => {
-      this.compacting = true;
-      try {
-        const summary = await this.summarize(signal);
-        const tail = keptTail(this.transcript);
-        if (this.host.plan() !== plan || !tail) throw new ConversationEditError('The conversation changed while it was being condensed — nothing was replaced.');
-        const now = new Date().toISOString();
-        const content = condensedNotice(summary);
-        this.host.mutate(() => {
-          plan.conversationHistory = [{ role: 'assistant', content, timestamp: now, kind: 'compaction' }, ...tail];
-          return true;
-        }, () => {
-          this.host.broadcast({ type: 'planner_message', content, timestamp: now });
-          this.host.broadcastPlan();
-        });
-        return { summary, keptMessages: tail.length };
-      } finally {
-        this.compacting = false;
-        // Success and failure alike: the live context either holds the
-        // conversation this replaced or a summary exchange nobody kept.
-        this.reset();
-      }
-    });
+    // A planner turn, so a message sent while it runs is refused: the reply
+    // would share the summary turn's live context, which the compaction resets
+    // as it lands, and its message would be condensed away or left dangling.
+    const { turn, release } = this.claim({ refuseAs: 'condense the conversation' }, signal);
+    try {
+      const summary = await this.summarize(turn.signal);
+      const tail = keptTail(this.transcript);
+      if (this.host.plan() !== plan || !tail) throw new ConversationEditError('The conversation changed while it was being condensed — nothing was replaced.');
+      const now = new Date().toISOString();
+      const content = condensedNotice(summary);
+      this.host.mutate(() => {
+        plan.conversationHistory = [{ role: 'assistant', content, timestamp: now, kind: 'compaction' }, ...tail];
+        return true;
+      }, () => {
+        this.host.broadcast({ type: 'planner_message', content, timestamp: now });
+        this.host.broadcastPlan();
+      });
+      return { summary, keptMessages: tail.length };
+    } finally {
+      // Success and failure alike: the live context either holds the
+      // conversation this replaced or a summary exchange nobody kept.
+      this.reset();
+      release();
+    }
   }
 
-  private async summarize(signal?: AbortSignal): Promise<string> {
+  private async summarize(signal: AbortSignal): Promise<string> {
     const ai = this.host.aiService();
     const request = summaryRequest(this.currentPlanLines());
     // Only liveness gets through: streamed prose or research steps from this
     // turn would land in the chat as if the planner had said them.
     const onProgress = (p: ResearchProgress) => { if (p.type === 'liveness') this.host.onProgress(p); };
-    const canContinueLive = ai.hasActiveConversation() && (ai.conversationMatchesConfig?.() ?? true);
     let turn: ConversationTurn;
-    if (canContinueLive) {
+    if (this.canContinueLive()) {
       ai.pruneContext?.();
       turn = await ai.continueConversation(request, onProgress, signal);
     } else {
       turn = await this.resume(request, [...this.transcript], signal, onProgress);
     }
-    if (signal?.aborted) throw new ConversationEditError('Condensing was stopped — the conversation is unchanged.');
+    if (signal.aborted) throw new ConversationEditError('Condensing was stopped — the conversation is unchanged.');
     const summary = extractSummary(turn.text);
     if (!summary) throw new ConversationEditError('The planner returned no summary, so the conversation is unchanged. Try again.');
     return summary;
@@ -487,17 +603,22 @@ export class PlannerConversation {
     ].join('\n'), { kind: 'system' });
   }
 
-  /** Open the conversation on a fresh plan: the goal is its first message. */
-  async start(goal: string, opening: ConversationOpening, signal?: AbortSignal): Promise<LegacyPlanState> {
-    return this.userTurn(goal, signal, async (userTurn) => {
+  /**
+   * Open the conversation on the host's fresh plan: the goal is its first
+   * message. `prepare` (discovery) runs inside the turn, so a stop reaches it.
+   */
+  async start(goal: string, prepare: () => Promise<ConversationOpening>, signal?: AbortSignal): Promise<LegacyPlanState> {
+    return this.userTurn('supersede', goal, signal, async (userTurn) => {
+      const opening = await prepare();
+      this.assertCurrent(userTurn);
       this.recordUser(goal, new Date().toISOString());
       const turn = await this.host.aiService().startConversation({
         ...opening,
         goal,
         onProgress: userTurn.stream.sink(),
-        signal,
+        signal: userTurn.signal,
       });
-      return this.settle(turn, userTurn);
+      return this.settle(await this.drainTaskQueries(turn, userTurn), userTurn);
     });
   }
 
@@ -507,15 +628,13 @@ export class PlannerConversation {
    * writes back out, so session memory never drifts from disk and the UI.
    */
   async reply(message: string, options: ReplyOptions = {}): Promise<LegacyPlanState> {
-    // A reply would share the summary turn's live context, which the
-    // compaction resets as it lands, and its message would be condensed away
-    // unanswered or left dangling after the summary.
-    if (this.compacting) throw new ConversationBusyError('send a message');
-    return this.userTurn(options.verbatim ?? message, options.signal, (userTurn) => this.replyTurn(message, options, userTurn));
+    // Refused while any turn is live: two would interleave their transcript
+    // appends, and each would settle on the other's open turn.
+    return this.userTurn({ refuseAs: 'send a message' }, options.verbatim ?? message, options.signal, (userTurn) => this.replyTurn(message, options, userTurn));
   }
 
   private async replyTurn(message: string, options: ReplyOptions, userTurn: UserTurn): Promise<SettledTurn> {
-    const { signal } = options;
+    const { signal } = userTurn;
     const plan = this.requirePlan();
     const priorHistory = plan.conversationHistory ?? [];
     const checkpoint = this.snapshot();
@@ -527,14 +646,9 @@ export class PlannerConversation {
     const contextBlock = [this.catalogBlock(), this.planContextBlock()].filter(Boolean).join('\n\n');
     const outgoing = contextBlock ? `${contextBlock}\n\n${message}` : message;
 
-    // A live conversation is only safe to continue in-place when it also
-    // matches the model/effort configured right now — a harness planner's
-    // running process was spawned with the old one baked in and cannot pick
-    // up a switch (ADR-0009). Both cases resume the same way.
     const ai = this.host.aiService();
-    const canContinueLive = ai.hasActiveConversation() && (ai.conversationMatchesConfig?.() ?? true);
     try {
-      const turn = canContinueLive
+      const turn = this.canContinueLive()
         ? await ai.continueConversation(outgoing, userTurn.stream.sink(), signal)
         : await this.resume(outgoing, priorHistory, signal, userTurn.stream.sink());
 
@@ -543,6 +657,7 @@ export class PlannerConversation {
       // batch boundary would strand the planner waiting on detail it needs to
       // write the very edit that gets queued.
       let settleable = await this.drainTaskQueries(turn, userTurn);
+      this.assertCurrent(userTurn, settleable);
 
       // Structural changes that reach a task a runner is executing are queued,
       // never applied live — the orchestrator must not have the plan mutated
@@ -561,7 +676,9 @@ export class PlannerConversation {
 
       return await this.settle(settleable, userTurn);
     } catch (err) {
-      if (checkpoint) this.restore(checkpoint);
+      // An abandoned turn gave the conversation up already, and a rollback now
+      // could take the next turn's message out along with its own.
+      if (checkpoint && !userTurn.planner.abandoned) this.restore(checkpoint);
       throw err;
     }
   }
@@ -585,13 +702,26 @@ export class PlannerConversation {
     if (this.isTurnInFlight) throw new ConversationBusyError(operation);
   }
 
-  private async inTurn<T>(turn: () => Promise<T>): Promise<T> {
-    this.turnsInFlight++;
-    try {
-      return await turn();
-    } finally {
-      this.turnsInFlight--;
-    }
+  /**
+   * Refuse to land a turn that no longer belongs here: it was abandoned, its
+   * plan is no longer the host's, or its call was cut off by something other
+   * than its own stop (`IAiService.reset` under a plan change) — what such a
+   * call hands back is a fragment of an answer to a dialogue that is gone.
+   */
+  private assertCurrent(userTurn: UserTurn, turn?: SettleableTurn): void {
+    const cutOff = turn?.kind === 'message' && turn.aborted === true && !userTurn.signal.aborted;
+    if (userTurn.planner.abandoned || this.host.plan() !== userTurn.plan || cutOff) throw new PlannerTurnDiscardedError();
+  }
+
+  /**
+   * A live conversation is only safe to continue in-place when it also
+   * matches the model/effort configured right now — a harness planner's
+   * running process was spawned with the old one baked in and cannot pick up
+   * a switch (ADR-0009). Otherwise the turn resumes from the transcript.
+   */
+  private canContinueLive(): boolean {
+    const ai = this.host.aiService();
+    return ai.hasActiveConversation() && (ai.conversationMatchesConfig?.() ?? true);
   }
 
   /**
@@ -599,22 +729,29 @@ export class PlannerConversation {
    * the turn is where the stream a surface draws begins and ends, and only the
    * conversation sees all of it — every backend call, read and retry.
    */
-  private async userTurn(prompt: string, signal: AbortSignal | undefined, run: (turn: UserTurn) => Promise<SettledTurn>): Promise<LegacyPlanState> {
+  private async userTurn(admission: TurnAdmission, prompt: string, signal: AbortSignal | undefined, run: (turn: UserTurn) => Promise<SettledTurn>): Promise<LegacyPlanState> {
+    const { turn: planner, release } = this.claim(admission, signal);
     const turnId = uuidv4();
     const stream = new TurnStream(turnId, (p) => this.host.onProgress(p));
-    const turn: UserTurn = { stream, signal, reads: freshReadBudget() };
+    const turn: UserTurn = { stream, planner, signal: planner.signal, plan: this.host.plan(), reads: freshReadBudget() };
     this.openTurn = turn;
     this.host.broadcast({ type: 'planner_turn_started', turnId, prompt });
     let outcome: PlannerTurnOutcome = 'error';
     try {
-      const settled = await this.inTurn(() => run(turn));
+      const settled = await run(turn);
       outcome = settled.outcome;
       return settled.plan;
+    } catch (err) {
+      if (err instanceof PlannerTurnDiscardedError) outcome = 'stopped';
+      throw err;
     } finally {
       if (this.openTurn === turn) this.openTurn = null;
+      // Released before the end is announced, so a surface that sends its
+      // next message on hearing it is not refused by the turn it heard end.
+      release();
       // A stop can still settle — a backend hands back what it had as a
       // message — but the user asked for it to end, and that is what it did.
-      this.host.broadcast({ type: 'planner_turn_ended', turnId, outcome: signal?.aborted ? 'stopped' : outcome });
+      this.host.broadcast({ type: 'planner_turn_ended', turnId, outcome: planner.signal.aborted ? 'stopped' : outcome });
     }
   }
 
@@ -643,7 +780,7 @@ export class PlannerConversation {
   private async resume(
     message: string,
     priorHistory: ConversationMessage[],
-    signal: AbortSignal | undefined,
+    signal: AbortSignal,
     onProgress: (progress: ResearchProgress) => void,
   ): Promise<ConversationTurn> {
     const runners = this.requirePlan().runners;
@@ -685,22 +822,17 @@ export class PlannerConversation {
     let current = this.claimSubmission(turn, userTurn);
     while (current.kind === 'task_query') {
       carried.push(...current.researchLog);
-      if (reads.answered >= MAX_TASK_QUERIES_HARD || !ai.hasActiveConversation() || signal?.aborted) {
+      const spent = ai.hasActiveConversation() && !signal.aborted ? spendRead(reads, taskQuerySignature(current.query)) : 'refused';
+      if (spent === 'refused') {
         return {
           kind: 'message',
           text: 'The planner kept asking to read tasks instead of answering. Nothing was changed — ask again, or be more specific about the edit you want.',
           researchLog: carried,
         };
       }
-      const signature = taskQuerySignature(current.query);
-      // Two reasons to stop being accommodating: the budget is spent, or the
-      // planner asked the identical question again — a loop, not a read.
-      const insist = reads.seen.has(signature) || reads.answered >= MAX_TASK_QUERIES;
-      reads.seen.add(signature);
-      reads.answered++;
       const answer = this.taskQueryAnswer(current.query);
       current = this.claimSubmission(await ai.continueConversation(
-        insist ? `${answer}\n\n${TASK_QUERY_ANSWER_OR_OPS}` : answer,
+        spent === 'land' ? `${answer}\n\n${TASK_QUERY_ANSWER_OR_OPS}` : answer,
         stream.sink(),
         signal,
       ), userTurn);
@@ -719,7 +851,7 @@ export class PlannerConversation {
   private claimSubmission(turn: ConversationTurn, userTurn: UserTurn): ConversationTurn {
     const submitted = userTurn.submitted;
     userTurn.submitted = undefined;
-    if (!submitted || userTurn.signal?.aborted) return turn;
+    if (!submitted || userTurn.signal.aborted) return turn;
     const { text, researchLog } = turn;
     return submitted.kind === 'plan'
       ? { kind: 'plan', tasks: submitted.tasks, text, researchLog }
@@ -736,12 +868,13 @@ export class PlannerConversation {
   }
 
   /**
-   * Drive a planner turn to a persisted, broadcast outcome. Task edits apply
-   * atomically; validation failures are fed back to the model for up to 2
-   * silent retries, then surfaced as a message with the plan untouched. The
-   * first turn and every later turn route through here — one path, not two.
+   * Drive a planner turn, its reads already drained, to a persisted, broadcast
+   * outcome. Task edits apply atomically; validation failures are fed back to
+   * the model for up to 2 silent retries, then surfaced as a message with the
+   * plan untouched. The first turn and every later turn route through here —
+   * one path, not two.
    */
-  private async settle(turn: ConversationTurn, userTurn: UserTurn): Promise<SettledTurn> {
+  private async settle(turn: SettleableTurn, userTurn: UserTurn): Promise<SettledTurn> {
     type Settled = { plan: LegacyPlanState } | { turn: CommitTurn };
     const { signal, stream } = userTurn;
     const ai = this.host.aiService();
@@ -754,18 +887,19 @@ export class PlannerConversation {
     });
 
     const settled = await repairLoop<SettleableTurn, Settled>({
-      first: () => this.drainTaskQueries(turn, userTurn),
+      first: async () => turn,
       resend: async (corrective) => {
         stream.retract();
         return this.drainTaskQueries(await ai.continueConversation(corrective, stream.sink(), signal), userTurn);
       },
       interpret: (t) => {
         if (t.kind !== 'task_ops') return { done: { turn: t } };
+        this.assertCurrent(userTurn, t);
         const applied = this.applyTaskOps(t, stream.turnId);
         if ('plan' in applied) return { done: { plan: applied.plan } };
         // No live conversation (or an abort) means no corrective re-send is
         // possible — surface the failure instead of retrying into the void.
-        if (!ai.hasActiveConversation() || signal?.aborted) {
+        if (!ai.hasActiveConversation() || signal.aborted) {
           return { done: invalidOps(applied.errors, t.researchLog) };
         }
         return { retry: { errors: applied.errors, corrective: taskOpsRejectedPrompt(applied.errors) } };
@@ -781,6 +915,7 @@ export class PlannerConversation {
       await this.host.afterEdit();
       return { plan: settled.plan, outcome: 'task_ops' };
     }
+    this.assertCurrent(userTurn, settled.turn);
     return { plan: this.commit(settled.turn, stream.turnId), outcome: settled.turn.kind };
   }
 

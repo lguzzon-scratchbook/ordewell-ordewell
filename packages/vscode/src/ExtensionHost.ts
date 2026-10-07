@@ -31,8 +31,6 @@ const PLAN_DOCK_HEIGHT_KEY = 'ordewell.planDockHeight';
 export interface HostState {
   plan: LegacyPlanState;
   goal: string;
-  generatingPlan: boolean;
-  researchAbort: AbortController | null;
   /** The runner set the webview last planned with, for the next plan started from chat. */
   pendingRunners: RunnerId[] | undefined;
 }
@@ -78,8 +76,6 @@ export function createExtension(services: ExtensionServices, vscodeApi: typeof v
   const state: HostState = {
     plan: createEmptyPlan(),
     goal: '',
-    generatingPlan: false,
-    researchAbort: null,
     pendingRunners: undefined,
   };
 
@@ -119,10 +115,7 @@ export function createExtension(services: ExtensionServices, vscodeApi: typeof v
     setCurrentPlan: (plan) => { state.plan = plan; },
     getCurrentGoal: () => state.goal,
     setCurrentGoal: (goal) => { state.goal = goal; },
-    isGeneratingPlan: () => state.generatingPlan,
-    setGeneratingPlan: (v) => { state.generatingPlan = v; },
-    getResearchAbort: () => state.researchAbort,
-    setResearchAbort: (c) => { state.researchAbort = c; },
+    isGeneratingPlan: () => requireSession().isPlannerBusy,
     persistState: persist,
     saveCurrentSession: saveSession,
     log,
@@ -268,7 +261,7 @@ export function createExtension(services: ExtensionServices, vscodeApi: typeof v
     // chat, not just the plan. restoreChat goes first: it clears any stale
     // stopped/busy state before the plan message arrives. A turn still
     // streaming has not been saved yet, so its live view is sent instead.
-    if (state.generatingPlan) services.chatProvider.conversation.resync();
+    if (managerDeps.isGeneratingPlan()) services.chatProvider.conversation.resync();
     else services.chatProvider.restoreChat(state.plan);
     // Pending plan edits outlive a webview reload: an edit parked at a batch
     // boundary must still be listed, and withdrawable, when the view returns.

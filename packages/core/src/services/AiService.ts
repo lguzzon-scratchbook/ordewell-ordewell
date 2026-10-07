@@ -70,7 +70,8 @@ export interface ConversationRequest {
  * parses them.
  */
 export type ConversationTurn =
-  | { kind: 'message'; text: string; researchLog: ResearchLogEntry[] }
+  /** `aborted`: the call was stopped, and `text` is only what it had by then. */
+  | { kind: 'message'; text: string; researchLog: ResearchLogEntry[]; aborted?: boolean }
   | { kind: 'plan'; tasks: Task[]; text: string; researchLog: ResearchLogEntry[] }
   | { kind: 'task_ops'; ops: import('./TaskOps').TaskOp[]; text: string; researchLog: ResearchLogEntry[] }
   | { kind: 'task_query'; query: import('./TaskQuery').TaskQuery; text: string; researchLog: ResearchLogEntry[] };

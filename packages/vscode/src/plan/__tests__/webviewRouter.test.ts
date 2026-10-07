@@ -35,7 +35,7 @@ function taskOf(session: Pick<Session, 'planTasks'>, taskId: string) {
   return flattenTasks(session.planTasks).find((t) => t.id === taskId);
 }
 
-function harness() {
+function harness(aiService: Partial<IAiService> = { hasActiveConversation: () => false }) {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'ordewell-router-'));
   const broadcasts: SessionMessage[] = [];
   const posts: HostToWebview[] = [];
@@ -52,15 +52,13 @@ function harness() {
     broadcast: (msg) => { broadcasts.push(msg); chatProvider.conversation.receive(msg); },
     modelResolver: { getCachedRunnerModels: () => [], modelsForRunners: vi.fn().mockResolvedValue({}) } as unknown as ModelResolver,
     settings: () => ({ tddEnabled: false }),
-    aiService: { hasActiveConversation: () => false, reset: () => {} } as unknown as IAiService,
+    aiService: { reset: () => {}, ...aiService } as unknown as IAiService,
     taskOutput: new BufferedTaskOutputSource({ transcripts: { finalAssistantText: async () => null } }),
   });
   session.loadPlan(plan(), 'build me a parser', workspace, { persist: false });
 
   let current = session.planState!;
   let goal = 'build me a parser';
-  let generating = false;
-  let abort: AbortController | null = null;
   let pending: string[] | undefined;
   const deps: WebviewRouterDeps = {
     session,
@@ -76,10 +74,7 @@ function harness() {
     setCurrentPlan: (p) => { current = p; },
     getCurrentGoal: () => goal,
     setCurrentGoal: (g) => { goal = g; },
-    isGeneratingPlan: () => generating,
-    setGeneratingPlan: (v) => { generating = v; },
-    getResearchAbort: () => abort,
-    setResearchAbort: (c) => { abort = c; },
+    isGeneratingPlan: () => session.isPlannerBusy,
     persistState: vi.fn(),
     saveCurrentSession: vi.fn(),
     log: () => {},
@@ -257,44 +252,56 @@ describe('webview messages reach the session through one entry point each', () =
       await h.route({ type: 'sendMessage', text: '/my-skill do it', typed: true });
 
       expect(h.deps.extension.runSlashCommand).toHaveBeenCalledWith('/refresh');
-      expect(converse).toHaveBeenCalledWith('/my-skill do it', expect.anything());
+      expect(converse).toHaveBeenCalledWith('/my-skill do it');
     });
+
+    /** A live planner whose replies the test hands back one at a time, keeping each call's message and signal. */
+    function heldPlanner() {
+      const calls: { message: string; signal?: AbortSignal; finish: (text: string) => void }[] = [];
+      const aiService: Partial<IAiService> = {
+        hasActiveConversation: () => true,
+        continueConversation: (message, _onProgress, signal) => new Promise((resolve) => {
+          calls.push({ message, signal, finish: (text) => resolve({ kind: 'message', text, researchLog: [] }) });
+        }),
+      };
+      return { aiService, calls };
+    }
 
     it('holds a prompt sent right after a stop until the stopped turn has unwound, then sends it', async () => {
-      let finishStopped: () => void = () => {};
-      const converse = vi.spyOn(h.session, 'continueConversation')
-        .mockImplementationOnce(() => new Promise((resolve) => { finishStopped = () => resolve(h.session.planState!); }))
-        .mockResolvedValue(h.session.planState!);
+      const { aiService, calls } = heldPlanner();
+      fs.rmSync(h.workspace, { recursive: true, force: true });
+      h = harness(aiService);
 
       const first = h.route({ type: 'sendMessage', text: 'add streaming', typed: true });
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
       await h.route({ type: 'stopResearch' });
+      expect(calls[0].signal?.aborted).toBe(true);
       await h.route({ type: 'sendMessage', text: 'actually, do this instead', typed: true });
 
-      expect(converse).toHaveBeenCalledTimes(1);
+      expect(calls).toHaveLength(1);
 
-      finishStopped();
+      calls[0].finish('Stopped.');
       await first;
-      await vi.waitFor(() => expect(converse).toHaveBeenCalledTimes(2));
-      expect(converse.mock.calls[1][0]).toBe('actually, do this instead');
+      await vi.waitFor(() => expect(calls).toHaveLength(2));
+      expect(calls[1].message).toContain('actually, do this instead');
     });
 
-    it('a stopped turn unwinding late does not clear the state of the turn after it', async () => {
-      let finishStopped: () => void = () => {};
-      let secondSignal: AbortSignal | undefined;
-      vi.spyOn(h.session, 'continueConversation')
-        .mockImplementationOnce(() => new Promise((resolve) => { finishStopped = () => resolve(h.session.planState!); }))
-        .mockImplementationOnce((_text, opts) => { secondSignal = opts?.signal; return new Promise(() => {}); });
+    it('a stopped turn unwinding late leaves the turn after it busy and stoppable', async () => {
+      const { aiService, calls } = heldPlanner();
+      fs.rmSync(h.workspace, { recursive: true, force: true });
+      h = harness(aiService);
 
       const first = h.route({ type: 'sendMessage', text: 'add streaming', typed: true });
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
       await h.route({ type: 'stopResearch' });
       await h.route({ type: 'sendMessage', text: 'next', typed: true });
-      finishStopped();
+      calls[0].finish('Stopped.');
       await first;
-      await vi.waitFor(() => expect(secondSignal).toBeDefined());
+      await vi.waitFor(() => expect(calls).toHaveLength(2));
 
       expect(h.deps.isGeneratingPlan()).toBe(true);
       await h.route({ type: 'stopResearch' });
-      expect(secondSignal?.aborted).toBe(true);
+      expect(calls[1].signal?.aborted).toBe(true);
     });
   });
 
