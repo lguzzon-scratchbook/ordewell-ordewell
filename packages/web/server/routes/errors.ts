@@ -6,6 +6,8 @@ import {
   ConversationEditError,
   NoPlanError,
   PlanEditError,
+  PlannerTurnDiscardedError,
+  PlannerTurnStoppedError,
   SessionNotFoundError,
   TaskControlError,
   WorkspaceNotAProjectError,
@@ -34,6 +36,10 @@ function classify(err: unknown): Classified | undefined {
   if (err instanceof AlreadyExecutingError) return { status: 409, code: 'already_executing' };
   if (err instanceof WorkspaceNotAProjectError) return { status: 400, code: 'workspace_not_a_project' };
   if (err instanceof WorkspaceNotFoundError) return { status: 400, code: 'workspace_not_found' };
+  // 409, not 5xx: the turn ending is what the user asked for (or a plan they
+  // dropped), and a 5xx would log a stack for every Stop.
+  if (err instanceof PlannerTurnStoppedError) return { status: 409, code: 'planner_turn_stopped' };
+  if (err instanceof PlannerTurnDiscardedError) return { status: 409, code: 'planner_turn_discarded' };
   if (err instanceof ConversationBusyError) return { status: 409, code: 'conversation_busy' };
   if (err instanceof ConversationEditError || err instanceof PlanEditError || err instanceof TaskControlError) {
     return { status: 400, code: 'refused' };

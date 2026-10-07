@@ -833,4 +833,57 @@ describe('PlannerConversation planner turn', () => {
     await expect(live).rejects.toThrow(PlannerTurnDiscardedError);
     expect(conversation.isTurnInFlight).toBe(false);
   });
+
+  it('settles one-shot work stopped by a thrown abort as stopped, keeping the backend error as its cause', async () => {
+    const { ai } = heldBackend();
+    const { conversation } = fakeHost(ai, threeTurnPlan());
+    const abort = new Error('Request was aborted.');
+
+    const generation = conversation.hold(undefined, (turn) => new Promise<void>((_resolve, reject) => {
+      turn.signal.addEventListener('abort', () => reject(abort));
+    }));
+    conversation.stopTurn();
+
+    const err = await generation.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PlannerTurnStoppedError);
+    expect(err).toMatchObject({ cause: abort });
+  });
+
+  it('settles one-shot work stopped through the caller\'s signal as stopped', async () => {
+    const { ai } = heldBackend();
+    const { conversation } = fakeHost(ai, threeTurnPlan());
+    const caller = new AbortController();
+
+    const generation = conversation.hold(caller.signal, (turn) => new Promise<void>((_resolve, reject) => {
+      turn.signal.addEventListener('abort', () => reject(new Error('Request was aborted.')));
+    }));
+    caller.abort();
+
+    await expect(generation).rejects.toThrow(PlannerTurnStoppedError);
+  });
+
+  it('still reports one-shot work that fails for real as the failure', async () => {
+    const { ai } = heldBackend();
+    const { conversation } = fakeHost(ai, threeTurnPlan());
+
+    await expect(conversation.hold(undefined, () => Promise.reject(new Error('503 upstream')))).rejects.toThrow('503 upstream');
+  });
+
+  it('keeps the error an abandoned turn threw as the discard\'s cause', async () => {
+    let fail: (err: Error) => void = () => {};
+    const ai = fakeAi({
+      continueConversation: vi.fn(() => new Promise<ConversationTurn>((_resolve, reject) => { fail = reject; })),
+    });
+    const { conversation } = fakeHost(ai, threeTurnPlan());
+    const boom = new Error('socket hang up');
+
+    const turn = conversation.reply('Also CSV');
+    await vi.waitFor(() => expect(ai.continueConversation).toHaveBeenCalled());
+    conversation.abandonTurn();
+    fail(boom);
+
+    const err = await turn.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PlannerTurnDiscardedError);
+    expect(err).toMatchObject({ cause: boom });
+  });
 });

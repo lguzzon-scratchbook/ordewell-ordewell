@@ -84,12 +84,10 @@ export function finishPlannerTurn(
 
 export function reportPlannerError(err: unknown, deps: PlanManagerDeps): void {
   // Message text is not evidence: a real failure can mention "aborted" (a
-  // runner's "transaction aborted"). Only an abort error's identity counts; a
-  // stop whose backend error is not named as one arrives as PlannerTurnStoppedError.
-  const isAbort = err instanceof PlannerTurnDiscardedError || err instanceof PlannerTurnStoppedError || (err instanceof Error && (
-    err.name === 'AbortError' ||
-    err.name === 'APIUserAbortError'
-  ));
+  // runner's "transaction aborted"). Core converts a stop, whatever the backend
+  // named its error, to PlannerTurnStoppedError; only that and a platform
+  // AbortError count.
+  const isAbort = err instanceof PlannerTurnDiscardedError || err instanceof PlannerTurnStoppedError || (err instanceof Error && err.name === 'AbortError');
   // The stop already ended the turn on screen; a discarded turn belonged to a
   // session the user has already left.
   if (isAbort) return;

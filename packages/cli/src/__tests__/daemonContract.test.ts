@@ -197,6 +197,23 @@ describe('the daemon contract: ApiClient against the real daemon', () => {
       expect(err.code).toBe('conversation_busy');
     });
 
+    it('answers a stopped turn with planner_turn_stopped, not a fault', async () => {
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      await client.startConversation('session-plan', 'Add a limiter', ['claude-code'], workspace);
+      vi.mocked(OpenAiService.prototype.startConversation).mockImplementation((req) => new Promise((_, reject) => {
+        req.signal?.addEventListener('abort', () => reject(new Error('Request was aborted.')));
+      }));
+
+      const inFlight = refusal(client.sendConversationMessage('session-plan', 'A token bucket'));
+      await vi.waitFor(() => expect(OpenAiService.prototype.startConversation).toHaveBeenCalledTimes(2));
+      await expect(client.cancelPlanning('session-plan')).resolves.toEqual({ cancelled: true });
+      const err = await inFlight;
+
+      expect(err.status).toBe(409);
+      expect(err.code).toBe('planner_turn_stopped');
+      expect(log).not.toHaveBeenCalled();
+    });
+
     it('asks to initialize a directory with no project marker, carrying the directory', async () => {
       const bare = join(dir, 'bare');
       mkdirSync(bare);

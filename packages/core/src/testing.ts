@@ -17,7 +17,7 @@ import type {
   RepairEvidence,
   TreeSnapshot,
 } from './interfaces/IWorktreeIsolation';
-import type { Task } from './models/Task';
+import { DEFAULT_RUNNERS, type Task } from './models/Task';
 import { handoffOf, integrationBranchFor, noRemoval, SELF_REPO } from './services/isolationRecord';
 
 /**
@@ -34,7 +34,7 @@ export function fakeConfig(overrides: Partial<IConfig> = {}): IConfig {
     aiProvider: 'openrouter',
     apiKey: 'sk-test',
     planningModel: 'test-model',
-    enabledRunners: ['claude-code'],
+    enabledRunners: [...DEFAULT_RUNNERS],
     maxParallelSessions: 3,
     researchEnabled: false,
     researchMaxSteps: 10,

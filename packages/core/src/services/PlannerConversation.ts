@@ -197,8 +197,8 @@ export class ConversationBusyError extends ConversationEditError {
  * transcript.
  */
 export class PlannerTurnDiscardedError extends Error {
-  constructor() {
-    super('The planner turn was discarded: the plan it was answering is no longer the current one.');
+  constructor(options?: ErrorOptions) {
+    super('The planner turn was discarded: the plan it was answering is no longer the current one.', options);
     this.name = 'PlannerTurnDiscardedError';
   }
 }
@@ -214,6 +214,18 @@ export class PlannerTurnStoppedError extends Error {
     super('The planner turn was stopped.', options);
     this.name = 'PlannerTurnStoppedError';
   }
+}
+
+/**
+ * What a turn that threw should surface. Its own stop or abandonment is why it
+ * ended, whatever the backend called the error it threw on the way out; the
+ * original is kept as the cause, since the turn may also have failed for real.
+ */
+function interrupted(planner: PlannerTurn, err: unknown): unknown {
+  if (err instanceof PlannerTurnDiscardedError) return err;
+  if (planner.abandoned) return new PlannerTurnDiscardedError({ cause: err });
+  if (planner.signal.aborted) return new PlannerTurnStoppedError({ cause: err });
+  return err;
 }
 
 /** Width of a rewind target's preview — one picker row, not the whole message. */
@@ -320,6 +332,8 @@ export class PlannerConversation {
     const { turn, release } = this.claim('supersede', signal);
     try {
       return await body(turn);
+    } catch (err) {
+      throw interrupted(turn, err);
     } finally {
       release();
     }
@@ -761,9 +775,7 @@ export class PlannerConversation {
         outcome = 'stopped';
         throw err;
       }
-      if (planner.abandoned) throw new PlannerTurnDiscardedError();
-      if (planner.signal.aborted) throw new PlannerTurnStoppedError({ cause: err });
-      throw err;
+      throw interrupted(planner, err);
     } finally {
       if (this.openTurn === turn) this.openTurn = null;
       // Released before the end is announced, so a surface that sends its

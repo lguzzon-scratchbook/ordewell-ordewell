@@ -179,7 +179,7 @@ describe('execution', () => {
     expect(lastMessage(s)?.text).toContain('2/2');
   });
 
-  it('stops showing tasks as running when the execution stream is lost', () => {
+  it('stops following the run when the execution stream is lost, leaving task statuses as last reported', () => {
     const live = initialState({
       ...withTasks,
       status: 'executing',
@@ -189,7 +189,7 @@ describe('execution', () => {
     const s = send(live, { type: 'executionLost' });
     expect(s.status).toBe('idle');
     expect(s.busyLabel).toBe('');
-    expect(s.tasks.map((t) => t.status)).toEqual(['completed', 'pending']);
+    expect(s.tasks.map((t) => t.status)).toEqual(['completed', 'in_progress']);
     expect(lastMessage(s)?.text).toContain('Lost the connection');
     expect(lastMessage(s)?.text).not.toContain('Restart the daemon');
     expect(lastMessage(s)?.text).toContain('/load');
