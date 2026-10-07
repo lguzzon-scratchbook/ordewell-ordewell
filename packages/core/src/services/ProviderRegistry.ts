@@ -488,6 +488,67 @@ export function providerForRunner(runner: string): AiProvider | null {
   return CLI_PROVIDERS.find((p) => ALL_PROVIDERS[p].runnerId === runner) ?? null;
 }
 
+/** One runner's planner usability, as `RunnerInstallation.plannerUsability` reports it. */
+export interface PlannerUsability {
+  usable: boolean;
+  reason?: string;
+}
+
+/**
+ * One entry of the planner backend list (ADR-0009). `id` is the `AiProvider`
+ * either way; `runner` is set only for a harness planner, whose model catalog
+ * comes from that runner, and `reason` is the second line a surface renders —
+ * the block detail for a harness planner, the API-key variable for a vendor.
+ */
+export interface PlannerBackendEntry {
+  id: AiProvider;
+  label: string;
+  kind: 'harness' | 'vendor';
+  runner?: string;
+  usable: boolean;
+  reason?: string;
+}
+
+/** The detail a usable harness planner is always shown with. */
+export const HARNESS_PLANNER_REASON = 'coding agent · no API key needed';
+
+/**
+ * The planner backends every surface offers, in order: the harness planners
+ * first, always listed so a missing CLI is greyed with its reason rather than
+ * hidden, then the configured vendors in `PROVIDER_PRIORITY` order. Pure: the
+ * caller supplies what it knows of each runner (VS Code its `plannerUsability`
+ * results, the TUI its installed set) and maps the entries to its own item
+ * type, keeping surface-specific affordances — e.g. the CLI's empty-vendor
+ * placeholder — to itself.
+ */
+export function plannerBackendEntries(
+  usability: Readonly<Record<string, PlannerUsability>>,
+  configured: readonly AiProvider[],
+): PlannerBackendEntry[] {
+  const harness: PlannerBackendEntry[] = CLI_PROVIDERS.map((id) => {
+    const runner = runnerForProvider(id)!;
+    const status = usability[runner];
+    return {
+      id,
+      label: getProviderMeta(id).label,
+      kind: 'harness' as const,
+      runner,
+      usable: status?.usable ?? false,
+      reason: status?.reason ?? HARNESS_PLANNER_REASON,
+    };
+  });
+  const vendors: PlannerBackendEntry[] = PROVIDER_PRIORITY
+    .filter((id) => configured.includes(id))
+    .map((id) => ({
+      id,
+      label: getProviderMeta(id).label,
+      kind: 'vendor' as const,
+      usable: true,
+      reason: getProviderMeta(id).apiKeyEnvVar,
+    }));
+  return [...harness, ...vendors];
+}
+
 /**
  * The single definition of which providers count as "configured" — one API
  * key each, or (for `openai_compatible`) an explicit base URL. Every surface
