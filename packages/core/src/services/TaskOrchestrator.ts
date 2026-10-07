@@ -1,5 +1,5 @@
 import * as path from 'path';
-import { Task, TaskSnapshot, Verdict, QueuedMessage, RunnerId, flattenTasksWithParents, taskOrderLabel } from '../models/Task';
+import { Task, TaskSnapshot, Verdict, QueuedMessage, RunnerId, DEFAULT_RUNNERS, flattenTasksWithParents, taskOrderLabel } from '../models/Task';
 import { IConfig } from '../interfaces/IConfig';
 import { INotification } from '../interfaces/INotification';
 import { isStructuredSession, type ITerminalRunner, type ITerminalSession, type QueuedTaskMessage, type RunnerTransport, type StructuredSessionCapability } from '../interfaces/ITerminalRunner';
@@ -675,7 +675,7 @@ export class TaskOrchestrator {
     this.messageQueue.clear();
   }
 
-  loadPlan(tasks: readonly Task[], planRunners: RunnerId[] = ['claude-code']): void {
+  loadPlan(tasks: readonly Task[], planRunners: RunnerId[] = [...DEFAULT_RUNNERS]): void {
     this.store.load(tasks, planRunners);
     const repairs = this.endAllAttempts('load').filter((a) => a.kind.kind === 'repair' && a.worktree);
     for (const a of repairs) this.unawaited(this.runs.release(a.taskId, { keep: true }, a.integration), `Could not keep the worktree of task "${this.store.get(a.taskId)?.title ?? a.taskId}"`);
@@ -701,7 +701,7 @@ export class TaskOrchestrator {
    * the snapshot predates is put back to `in_progress` — adopting the snapshot's
    * "pending" would offer the scheduler work a runner is already doing.
    */
-  reconcilePlan(newTasks: Task[], planRunners: RunnerId[] = ['claude-code']): void {
+  reconcilePlan(newTasks: Task[], planRunners: RunnerId[] = [...DEFAULT_RUNNERS]): void {
     const adopted = [...newTasks];
     for (const taskId of this.attempts.keys()) {
       const task = this.store.get(taskId);

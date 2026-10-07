@@ -38,7 +38,7 @@ only through the host interface Session hands it.
 (`config`, `runner`, `registry`, `fsAdapter`, `broadcast`, `modelResolver`,
 `settings`, and optionally `aiService`/`planner`/`isolation`/`taskOutput`/
 `saveSession`) and it builds every collaborator — PlanStore, the
-TaskOrchestrator, the approval chain, the web fetcher, the
+TaskOrchestrator, the **SessionCatalog**, the approval chain, the web fetcher, the
 **SessionEventRelay**, the live planner transport — and wires them, so the
 Session constructor only receives them. The deps are the test seam
 (`makeSession` builds through `createSession` with a persistence fake); no test
@@ -99,6 +99,24 @@ one) otherwise presents the previous session's tasks to the planner as the
 current plan.
 *Avoid:* "the pool" (that's the web transport host), "the session manager" —
 Session is the lifecycle owner, not a registry.
+
+**SessionCatalog** (`services/SessionCatalog.ts`) — what one session may
+assign, behind one interface: the enabled runners, their manifest modes, the
+models discovery found for them, and the allowlist narrowing those. Built in
+`createSession` and handed to the Session and the *PlanEditor*, so the
+planner's per-turn block (`queryCatalog`), its tools (`live`), a user's direct
+edit (`edit`, `runner`) and planning (`planning`) all read the same state —
+settings are read live at each call, never captured, so a runner enabled or an
+allowlist edited mid-session counts (#69). The per-runner discovered models are
+**merged into, never replaced**: discovering one runner must not forget
+another's, because coercion clamps thinking efforts against whatever was last
+found. `admit(runner, models)` is how an admitted runner keeps its models there
+(an empty discovery never displaces what is known), which `PlanEditor.admitRunner`
+calls alongside adding the runner to the plan. `reset()` drops it all at a
+session boundary. The default runner set (`DEFAULT_RUNNERS`, `models/Task.ts`)
+is defined once for the store, the orchestrator and the Session.
+*Avoid:* "model cache" for the whole thing — the cache is one part of it, and
+the *ModelResolver*'s own cache is a different one that this overlays.
 
 **SessionEventRelay** — the one place a surface's view of a Session is made:
 it turns orchestrator events (task changes, ticks, review, checkpoints,

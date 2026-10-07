@@ -1,5 +1,5 @@
 import {
-  Task, TaskSnapshot, TaskStatus, RunnerId, AwaitingReason, flattenTasks,
+  Task, TaskSnapshot, TaskStatus, RunnerId, AwaitingReason, DEFAULT_RUNNERS, flattenTasks,
   addTaskToPlan, removeTaskFromPlan, updateTaskInPlan,
   createTask, renumberTasks, opsFlag, inheritedOps,
 } from '../models/Task';
@@ -33,7 +33,7 @@ export class PlanStore {
   private _taskMap = new Map<string, Task>();
   /** Task id → the top-level task it hangs under, itself for a top-level task. */
   private _rootMap = new Map<string, Task>();
-  private _planRunners: RunnerId[] = ['claude-code'];
+  private _planRunners: RunnerId[] = [...DEFAULT_RUNNERS];
   private _onMutate: (() => void) | null = null;
   private _executionLog: TaskSnapshot[] = [];
 
@@ -377,7 +377,7 @@ export class PlanStore {
 
   resolveTaskRunner(task: Readonly<Task>): RunnerId {
     if (task.assignedRunner && this._planRunners.includes(task.assignedRunner)) return task.assignedRunner;
-    const fallback = this._planRunners[0] ?? 'claude-code';
+    const fallback = this._planRunners[0] ?? DEFAULT_RUNNERS[0];
     if (task.assignedRunner) {
       console.warn(
         `[PlanStore] Task "${task.title}" is assigned to "${task.assignedRunner}", which is not in this plan's ` +

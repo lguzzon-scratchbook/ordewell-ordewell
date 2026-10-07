@@ -47,9 +47,9 @@ function setup(opts: { plan?: boolean; allowlist?: Partial<Record<RunnerId, stri
   const catalog: PlanEditCatalog = {
     edit: () => ({ modelsByRunner: { 'claude-code': CATALOGS['claude-code'].models }, runnerModes: { 'claude-code': CATALOGS['claude-code'].modes } }),
     runner: vi.fn(async (runner: RunnerId) => catalogs[runner] ?? { models: [], modes: [] }),
-    allowlist: (runner) => opts.allowlist?.[runner],
+    allowlistFor: (runner) => opts.allowlist?.[runner],
     models: () => ({ ...remembered }),
-    remember: vi.fn((runner: RunnerId, models: DiscoveredModel[]) => { remembered[runner] = models; }),
+    admit: vi.fn((runner: RunnerId, models: DiscoveredModel[]) => { if (models.length > 0) remembered[runner] = models; }),
   };
   const mutate = vi.fn((op: () => boolean, notify?: () => void) => {
     if (!plan) return null;
@@ -165,7 +165,7 @@ describe('PlanEditor.setTaskRunner', () => {
     expect(task('t1')).toMatchObject({ assignedRunner: 'codex', assignedModel: { modelId: 'gpt-5-codex' }, taskMode: 'fullAccess' });
     expect(plan!.runners).toEqual(['claude-code', 'codex']);
     expect(store.planRunners).toContain('codex');
-    expect(catalog.remember).toHaveBeenCalledWith('codex', CATALOGS.codex.models);
+    expect(catalog.admit).toHaveBeenCalledWith('codex', CATALOGS.codex.models);
     expect(events).toEqual(['saved', 'plan announced', 'tick']);
   });
 
@@ -175,7 +175,7 @@ describe('PlanEditor.setTaskRunner', () => {
     await editor.setTaskRunner('t1', 'codex');
 
     expect(task('t1')!.assignedModel!.modelId).toBe('gpt-5-mini');
-    expect(catalog.remember).toHaveBeenCalledWith('codex', CATALOGS.codex.models);
+    expect(catalog.admit).toHaveBeenCalledWith('codex', CATALOGS.codex.models);
   });
 
   it('ignores an allowlist that names nothing the runner offers', async () => {
@@ -203,7 +203,7 @@ describe('PlanEditor.setTaskRunner', () => {
     await editor.setTaskRunner('t1', 'codex');
 
     expect(task('t1')).toMatchObject({ assignedRunner: 'codex', assignedModel: { modelId: 'claude-sonnet-4-5' } });
-    expect(catalog.remember).not.toHaveBeenCalled();
+    expect(catalog.models()).toEqual({});
   });
 
   it('answers null for a task not in the plan, or without a plan', async () => {
@@ -346,6 +346,6 @@ describe('PlanEditor.admitRunner', () => {
     editor.admitRunner('codex', CATALOGS.codex.models);
 
     expect(plan!.runners).toEqual(['claude-code', 'codex']);
-    expect(catalog.remember).toHaveBeenCalledTimes(1);
+    expect(catalog.models()).toEqual({ codex: CATALOGS.codex.models });
   });
 });
