@@ -524,8 +524,10 @@ export class PlannerConversation {
       return { summary, keptMessages: tail.length };
     } finally {
       // Success and failure alike: the live context either holds the
-      // conversation this replaced or a summary exchange nobody kept.
-      this.reset();
+      // conversation this replaced or a summary exchange nobody kept. An
+      // abandoned compaction's context was dropped by whatever abandoned it,
+      // and a reset now would cut off the turn that has the backend since.
+      if (!turn.abandoned) this.reset();
       release();
     }
   }

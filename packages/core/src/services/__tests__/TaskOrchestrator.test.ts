@@ -1340,6 +1340,75 @@ describe('task attempts', () => {
     expect(orchestrator.storeInstance.get('t1')!.status).toBe('pending');
     expectNoAttemptState(orchestrator);
   });
+  describe('a start the scheduler resumes after an in-flight spawn', () => {
+    function plan() {
+      return [
+        createTask({ id: 't1', order: 1, title: 'First', prompt: 'do first' }),
+        createTask({ id: 't2', order: 2, title: 'Second', prompt: 'do second' }),
+        createTask({ id: 't3', order: 3, title: 'Third', prompt: 'do third' }),
+      ];
+    }
+
+    async function heldAtFirstSpawn(maxParallelSessions: number) {
+      const held = heldSpawns();
+      const orchestrator = makeOrchestrator({ terminalRunner: { spawn: held.spawn }, config: { maxParallelSessions } });
+      orchestrator.loadPlan(plan());
+      void orchestrator.approveReview();
+      await vi.waitFor(() => expect(held.spawned()).toBe(1));
+      return { orchestrator, ...held };
+    }
+
+    const spawnedIds = (spawn: ReturnType<typeof heldSpawns>['spawn']) =>
+      spawn.mock.calls.map((call: unknown[]) => (call[0] as { taskId: string }).taskId);
+
+    it('does not start a task the user put on hold meanwhile', async () => {
+      const { orchestrator, spawn, settle, spawned } = await heldAtFirstSpawn(3);
+
+      void orchestrator.markTaskComplete('t2');
+      await vi.waitFor(() => expect(spawned()).toBe(2));
+      await orchestrator.markTaskIncomplete('t2');
+      await settle(0, new FakeTerminalSession('s1', 't1'));
+
+      expect(orchestrator.storeInstance.get('t2')!.status).toBe('pending');
+      expect(orchestrator.getAttempt('t2')).toBeUndefined();
+      expect(spawnedIds(spawn)).not.toContain('t2');
+    });
+
+    it('does not reopen a task the user marked complete meanwhile, nor run more than the parallel limit', async () => {
+      const { orchestrator, spawn, settle, spawned } = await heldAtFirstSpawn(2);
+
+      void orchestrator.markTaskComplete('t2');
+      await vi.waitFor(() => expect(spawned()).toBe(2));
+      await settle(0, new FakeTerminalSession('s1', 't1'));
+      await settle(1, new FakeTerminalSession('s3', 't3'));
+
+      expect(orchestrator.storeInstance.get('t2')!.status).toBe('completed');
+      expect(spawnedIds(spawn)).toEqual(['t1', 't3']);
+      expect(orchestrator.activeSessionMap.size).toBe(2);
+    });
+
+    it('does not take a slot a force start filled meanwhile', async () => {
+      const { orchestrator, spawn, settle, spawned } = await heldAtFirstSpawn(2);
+
+      void orchestrator.forceStartTask('t3');
+      await vi.waitFor(() => expect(spawned()).toBe(2));
+      await settle(0, new FakeTerminalSession('s1', 't1'));
+      await settle(1, new FakeTerminalSession('s3', 't3'));
+
+      expect(spawnedIds(spawn)).toEqual(['t1', 't3']);
+      expect(orchestrator.storeInstance.get('t2')!.status).toBe('pending');
+    });
+
+    it('does not start a task a reconcile gave an unmet dependency meanwhile', async () => {
+      const { orchestrator, spawn, settle } = await heldAtFirstSpawn(2);
+
+      orchestrator.reconcilePlan(plan().map((t) => (t.id === 't2' ? { ...t, dependencies: ['t3'] } : t)));
+      await settle(0, new FakeTerminalSession('s1', 't1'));
+
+      expect(spawnedIds(spawn)).not.toContain('t2');
+      expect(orchestrator.storeInstance.get('t2')!.status).toBe('pending');
+    });
+  });
 
   it('a verdict ends the attempt and a retry runs the task as a fresh one', async () => {
     const { sessions, spawn } = sessionRunner();

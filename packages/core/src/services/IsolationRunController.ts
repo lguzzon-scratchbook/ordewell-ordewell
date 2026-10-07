@@ -297,13 +297,15 @@ export class IsolationRunController {
     const resume = this.blockedStart;
     if (!resume) return null;
     if (how === 'stash') {
+      const repos = this.blockedRepos;
       // Parked until the stash succeeds: one that throws leaves the user their choice.
       await this.isolation.stash(this.workspaceRoot());
+      // Said even when an interrupt came meanwhile: the changes are stashed either way.
+      this.tell('info', repos.length > 0
+        ? `Stashed your uncommitted changes in ${repos.join(', ')} — \`git stash pop\` in each brings them back.`
+        : 'Stashed your uncommitted changes — `git stash pop` brings them back.');
       if (this.blockedStart !== resume) return null;
       this.blockedStart = null;
-      this.tell('info', this.blockedRepos.length > 0
-        ? `Stashed your uncommitted changes in ${this.blockedRepos.join(', ')} — \`git stash pop\` in each brings them back.`
-        : 'Stashed your uncommitted changes — `git stash pop` brings them back.');
     } else {
       this.blockedStart = null;
       this.begin('shared');
@@ -635,7 +637,7 @@ export class IsolationRunController {
     }
     if (!decision.continuing) {
       try {
-        await this.mint(root);
+        if (!(await this.mint(root, interrupted))) return false;
       } catch (err) {
         if (interrupted()) return false;
         // Git can still refuse every repo of the group once a run is minted — the one check `isActive` cannot make.
@@ -644,7 +646,6 @@ export class IsolationRunController {
         this.begin('shared');
         return true;
       }
-      if (interrupted()) return false;
     }
     this.begin('isolated');
     await this.sweep();
@@ -683,8 +684,12 @@ export class IsolationRunController {
    * whole. One that cannot be continued for another reason — it ran from a
    * different workspace path — keeps its integration branch in each repo that
    * has not merged it: only the user gives landed work up.
+   *
+   * False when `interrupted` came while git was minting: a newer activation
+   * may be minting its own run, so this one is never installed over it, and
+   * is discarded rather than left as branches no record names.
    */
-  private async mint(root: string): Promise<void> {
+  private async mint(root: string, interrupted: () => boolean): Promise<boolean> {
     const previous = this.run;
     const live = previous ? this.liveRecords(previous) : [];
     if (previous && live.length > 0) {
@@ -694,13 +699,20 @@ export class IsolationRunController {
       const removal = await this.isolation.discard(previous, { integration: landed ? 'delete-merged' : 'delete' }).catch(() => null);
       if (removal) this.report(removal);
     }
-    this.run = null;
-    this.run = await this.isolation.startRun(root);
+    if (this.run === previous) this.run = null;
+    if (interrupted()) return false;
+    const run = await this.isolation.startRun(root);
+    if (interrupted()) {
+      await this.isolation.discard(run, { integration: 'delete' }).catch(() => null);
+      return false;
+    }
+    this.run = run;
     this.resolvers = {};
     this.reportedCopies.clear();
     this.listener.changed();
-    const shared = sharedPathsNotice(this.run);
+    const shared = sharedPathsNotice(run);
     if (shared) this.tell('info', shared);
+    return true;
   }
 
   private reportCopies(copied: string[]): void {

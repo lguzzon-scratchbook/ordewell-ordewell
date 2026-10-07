@@ -838,26 +838,38 @@ export class TaskOrchestrator {
     try {
       await this.onVerdict(taskId, verdict);
     } catch (err) {
-      const title = this.store.get(taskId)?.title ?? taskId;
       const reason = err instanceof Error ? err.message : String(err);
-      const unsettled = attempt !== undefined && this.attempts.get(taskId) === attempt;
-      if (unsettled) {
-        this.endAttempt(taskId, 'verdict');
-        if (attempt.kind.kind === 'repair') this.store.markAwaitingUser(taskId, 'conflict');
-        else this.store.markFailed(taskId);
-        this.store.setTaskOutputSummary(taskId, summarizeOutput(reason, ''));
-        // Its landing may be what threw, so the release does not wait on it.
-        if (attempt.worktree) this.unawaited(this.runs.release(taskId, { keep: true }), `Could not keep the worktree of task "${title}"`);
+      try {
+        const title = this.store.get(taskId)?.title ?? taskId;
+        const unsettled = attempt !== undefined && this.attempts.get(taskId) === attempt;
+        if (unsettled) {
+          this.endAttempt(taskId, 'verdict');
+          if (attempt.kind.kind === 'repair') this.store.markAwaitingUser(taskId, 'conflict');
+          else this.store.markFailed(taskId);
+          this.store.setTaskOutputSummary(taskId, summarizeOutput(reason, ''));
+          // Its landing may be what threw, so the release does not wait on it.
+          if (attempt.worktree) this.unawaited(this.runs.release(taskId, { keep: true }), `Could not keep the worktree of task "${title}"`);
+        }
+        this.haltOnFailure();
+        this.tell('error', unsettled ? `Task "${title}" could not be settled: ${reason}` : `Task "${title}" settled, but the run could not go on: ${reason}`);
+        this.unawaited(this.afterVerdict(taskId), 'The run could not be closed');
+      } catch (cleanupErr) {
+        // Nothing awaits a verdict, so this is the last place its failure can surface.
+        console.error(`[TaskOrchestrator] verdict for ${taskId} failed (${reason}) and so did handling it:`, cleanupErr);
       }
-      this.haltOnFailure();
-      this.tell('error', unsettled ? `Task "${title}" could not be settled: ${reason}` : `Task "${title}" settled, but the run could not go on: ${reason}`);
-      this.unawaited(this.afterVerdict(taskId), 'The run could not be closed');
     }
   }
 
   /** Work nothing awaits: a rejection is said, not left unhandled. */
   private unawaited(work: Promise<unknown>, failure: string): void {
-    work.catch((err: unknown) => this.tell('error', `${failure}: ${err instanceof Error ? err.message : String(err)}`));
+    work.catch((err: unknown) => {
+      const message = `${failure}: ${err instanceof Error ? err.message : String(err)}`;
+      try {
+        this.tell('error', message);
+      } catch (tellErr) {
+        console.error(`[TaskOrchestrator] ${message}; saying so failed:`, tellErr);
+      }
+    });
   }
 
   private async onVerdict(taskId: string, verdict: Verdict): Promise<void> {
@@ -1344,17 +1356,34 @@ export class TaskOrchestrator {
 
     for (const { id } of ready) {
       // Readiness was read before this loop awaited any start: a stop, a plan
-      // load or a Merge all may have come since.
+      // load, a Merge all, a user control or a concurrent tick may have come
+      // since, so each id is judged again — and last with nothing awaited
+      // between that and the slot startTask claims.
       if (!this.running) return;
-      if (!this.store.get(id)) continue;
+      if (!this.stillReady(id)) continue;
       const kind = this.nextAttemptKind(id);
       if (this.merging && mergeExcludes(kind)) continue;
       if (decidesIsolation(kind) && !(await this.runs.decide(() => this.tick()))) continue;
       if (!this.running) return;
+      if (!this.stillReady(id)) continue;
       const task = this.store.get(id);
       if (task) await this.startTask(task);
     }
     this.emit('onTick');
+  }
+
+  /** Whether the scheduler may start `id` now: it passes every readiness gate and a slot is free. */
+  private stillReady(id: string): boolean {
+    if (this.attempts.has(id) || this.attempts.size >= this.config.maxParallelSessions) return false;
+    const { ready } = selectReadyTasks({
+      store: this.store,
+      onHold: this.onHold,
+      runs: this.runs,
+      active: 0,
+      maxParallel: Number.POSITIVE_INFINITY,
+      merging: this.merging,
+    });
+    return ready.some((t) => t.id === id);
   }
 
   /**

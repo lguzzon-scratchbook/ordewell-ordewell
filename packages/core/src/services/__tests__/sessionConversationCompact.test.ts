@@ -184,6 +184,61 @@ describe('Session.compactConversation', () => {
     expect(session.planState!.conversationHistory).toEqual(plannedDialogue().conversationHistory);
   });
 
+  /**
+   * A live planner whose calls the test settles, and whose reset cuts off the
+   * call in flight as a harness backend killing its process does. A call
+   * already stopped by its own signal is left to unwind on its own.
+   */
+  function cuttablePlanner() {
+    const calls: { finish: (turn: ConversationTurn) => void; signal?: AbortSignal; settled: boolean }[] = [];
+    const call = (_m: unknown, _p: unknown, signal?: AbortSignal) => new Promise<ConversationTurn>((resolve) => {
+      const entry = { finish: (turn: ConversationTurn) => { entry.settled = true; resolve(turn); }, signal, settled: false };
+      calls.push(entry);
+    });
+    const planner: PlannerFake = {
+      hasActiveConversation: () => true,
+      continueConversation: vi.fn(call),
+      startConversation: vi.fn((req) => call(req, undefined, req.signal)),
+      reset: vi.fn(() => {
+        for (const c of calls) if (!c.settled && !c.signal?.aborted) c.finish({ kind: 'message', text: '', researchLog: [], aborted: true });
+      }),
+    };
+    return { planner, calls };
+  }
+
+  it('stops through abortPlannerTurn, leaving the transcript alone and the conversation free', async () => {
+    const { planner, calls } = cuttablePlanner();
+    const session = sessionWith(planner);
+
+    const compaction = session.compactConversation();
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    expect(session.abortPlannerTurn()).toBe(true);
+    expect(calls[0].signal?.aborted).toBe(true);
+    calls[0].finish(summary('half done'));
+
+    await expect(compaction).rejects.toThrow(/stopped/i);
+    expect(session.planState!.conversationHistory).toEqual(plannedDialogue().conversationHistory);
+    expect(session.isPlannerBusy).toBe(false);
+    expect(planner.reset).toHaveBeenCalled();
+  });
+
+  it('does not cut off the turn that superseded a compaction abandoned with its plan', async () => {
+    const { planner, calls } = cuttablePlanner();
+    const session = sessionWith(planner);
+
+    const compaction = session.compactConversation();
+    await vi.waitFor(() => expect(calls).toHaveLength(1));
+    session.loadPlan(plannedDialogue(), GOAL, testWorkspace, { persist: false });
+    const successor = session.continueConversation('and CSV');
+    await vi.waitFor(() => expect(calls).toHaveLength(2));
+    calls[0].finish(summary(SUMMARY_TEXT));
+    await expect(compaction).rejects.toThrow();
+
+    calls[1].finish(reply('CSV it is.'));
+    await successor;
+    expect(session.planState!.conversationHistory!.map((m) => m.content)).toContain('CSV it is.');
+  });
+
   it('refuses while a planner turn is in flight', async () => {
     let finish: (turn: ConversationTurn) => void = () => {};
     const session = makeSession({

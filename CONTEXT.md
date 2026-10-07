@@ -62,14 +62,18 @@ settled conversation turn* (plan commit, task-ops apply, planner message) runs
 one `mutatePlan` ritual (store op → persist → broadcast), and so does the
 between-batch drain of queued edits. The ritual covers plan
 edits only. User controls that change task state through the orchestrator
-(execute, stop, retry, cancel, mark complete or not done, force start, run one
-task, continue a task, the two ways past a dirty tree, clean up or discard a
-run, a task message, a checkpoint answer) are saved before any surface hears
-of them too: a synchronous one holds its `status_update` until the save, and
-an asynchronous one (`withSave`) saves before each `status_update` announced
-while it runs, and once more when it ends — a hold across its spawns and git
-work would stall every task's status and let an `execution_complete` it
-causes overtake the update held back. `generatePlan` and `loadPlan` persist
+(execute, approve the review, reschedule, stop, retry, cancel, mark complete or
+not done, force start, run one task, continue a task, the two ways past a dirty
+tree, Merge all, clean up or discard a run, a task message, force sending or
+withdrawing a queued one, interrupting a structured turn, a checkpoint answer)
+are saved before any surface hears of them too: a synchronous one holds its
+`status_update` until the save, and an asynchronous one (`withSave`) saves
+before each `status_update` announced while it runs, and once more when it
+ends — a hold across its spawns and git work would stall every task's status
+and let an `execution_complete` it causes overtake the update held back. The
+saves made while it runs are background saves, as are a task control's own;
+so is the run going on after a drain of **Pending plan edits**, which is
+saved before its statuses go out the same way. `generatePlan` and `loadPlan` persist
 the plan they adopt directly. Direct (non-planner) edits go one step further
 through `editPlan`, which adds the reschedule they owe an armed scheduler:
 nothing else wakes one after a hand edit, because a direct edit never queues,
@@ -285,7 +289,9 @@ the whole transcript is replayed into the turn when no live context matches. The
 transcript then becomes a `compaction` entry — the summary, visible, always
 first — followed by the last two user messages and their replies verbatim, and
 the live context is reset so the next message replays from that shorter record
-on every backend alike. The summary must arrive inside `<conversation_summary>`
+on every backend alike — unless the compaction was abandoned with its plan,
+whose drop already reset it, and a second reset would cut off the turn that
+has the backend since. The summary must arrive inside `<conversation_summary>`
 tags: a harness planner reports a failure as an ordinary reply, and the tags are
 how a dead agent is told apart from a summary. Anything else the turn emits —
 task ops included — is discarded, so the task list is untouched, and nothing is
@@ -650,7 +656,12 @@ and it takes back only its own claim — a task marked complete meanwhile stays
 complete. A verdict obeys the same identity rule: the attempt stays live while
 its summary is read, and the verdict lands only if that attempt is still the
 task's current one, so a cancel, retry, mark complete, stop or plan load in that
-window is never overwritten by a stale verdict.
+window is never overwritten by a stale verdict. A verdict whose settling throws
+fails its attempt and says why; nothing it raises goes unhandled. The scheduler
+judges each task again right before claiming it — every readiness gate and a
+free slot — because a start it awaited, a user control or a concurrent tick may
+have changed either, so it never starts held, finished or newly blocked work,
+nor more than `maxParallelSessions` at once.
 The working directory is decided in one place (`attemptKind.attemptCwd`): the
 workspace root for an attempt that acts from the checkout, else what the
 `IsolationRunController` gives it — the workspace root when the run does not
@@ -932,7 +943,9 @@ worktree once any landing in flight settles; closing the run with its
 parked start of a blocked run and the resolver links, and reports through a
 listener (changed, blocked, handoff, notice, worktrees about to go) — it never
 emits orchestrator events or schedules work itself. A blocked start is handed
-back to the caller to replay. The scheduler reads isolation state only through
+back to the caller to replay. An activation a Stop interrupts opens nothing: one
+interrupted while git mints its run never installs that run over a newer
+activation's, and discards it. The scheduler reads isolation state only through
 it (`openRecord`, `isolating`, `current`). Session and the event relay reach its
 Merge all, review, clean-up and discard directly — there is no pass-through on
 the orchestrator — and its `requireRun` is the one guard for "no isolated run
@@ -976,7 +989,8 @@ branch, only in the expanded detail.
 modified (in any repo of the group, under ADR-0014, which the notice names). The daemon parks the start until it hears `continueWithStash` or
 `continueWithoutIsolation`, so the run's execution stream stays open through the block, showing the ops
 tasks still running, and the choice's own stream replaces it. Cancelling is `stopExecution`, not a dismissal: a
-parked start swallows a re-run. The TUI asks with a three-way picker (Stash and
+parked start swallows a re-run. A stash that succeeded is always said, with
+how to get the changes back, even when a Stop came while it ran. The TUI asks with a three-way picker (Stash and
 continue / Run without isolation / Cancel); `ordewell run` takes `--stash` and
 `--without-isolation`, and without either releases the run and says so. The block
 is broadcast from inside the call that starts the run, so every surface opens its
@@ -1543,7 +1557,9 @@ concept from a queued prompt, which is why the surfaces name it apart. An edit
 stays queued until the planner's answer is applied, so the run starts nothing
 while the drain is out; once the planner has it, it can no longer be
 withdrawn. One drain runs at a time: an edit sent during it is drained after,
-before the run goes on.
+before the run goes on. Like a planner turn, a drain answers the plan it was
+asked about: one that settles after that plan was swapped out is dropped, not
+reconciled into its successor, and wakes no run.
 *Avoid:* "queued message" or "queued prompt" in UI text for it.
 
 ---
