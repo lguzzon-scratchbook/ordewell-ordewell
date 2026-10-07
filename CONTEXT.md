@@ -1478,7 +1478,11 @@ the Session's run-time edit queue (`getQueuedMessages`, drained by
 `processQueuedMessages` at the next batch boundary), which VS Code lists above
 the input with a way to withdraw each one. It waits on a run, not on a planner
 turn, and is applied to the plan rather than sent as a prompt — a different
-concept from a queued prompt, which is why the surfaces name it apart.
+concept from a queued prompt, which is why the surfaces name it apart. An edit
+stays queued until the planner's answer is applied, so the run starts nothing
+while the drain is out; once the planner has it, it can no longer be
+withdrawn. One drain runs at a time: an edit sent during it is drained after,
+before the run goes on.
 *Avoid:* "queued message" or "queued prompt" in UI text for it.
 
 ---

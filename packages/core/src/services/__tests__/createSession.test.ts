@@ -10,6 +10,7 @@ import type { SessionMessage } from '../SessionMessage';
 import { BufferedTaskOutputSource } from '../BufferedTaskOutputSource';
 import type { TranscriptQuery } from '../../interfaces/TaskOutputSource';
 import { reduceConversation, EMPTY_CONVERSATION } from '../../conversation';
+import { flushMicrotasks } from '../../testing';
 
 describe('model allowlist wiring', () => {
   function smallPlan(): LegacyPlanState {
@@ -197,6 +198,18 @@ describe('removing a queued message', () => {
     expect(session.getQueuedMessages().length).toBe(2);
   });
 
+  it('saves the queue without the removed message, so a reload cannot bring it back', () => {
+    const session = loadedSession();
+    queue(session, 'keep', 'drop');
+    const savedQueues: string[][] = [];
+    saves(session).mockImplementation((plan) => { savedQueues.push((plan.queuedMessages ?? []).map((m) => m.text)); });
+
+    const drop = session.getQueuedMessages().find((m) => m.text === 'drop')!;
+    session.removeQueuedMessage(drop.id);
+
+    expect(savedQueues.at(-1)).toEqual(['keep']);
+  });
+
   it('reports false for an id that is not queued', () => {
     const session = loadedSession();
     queue(session, 'only');
@@ -378,6 +391,115 @@ describe('processQueuedMessages', () => {
 
     expect(session.getQueuedMessages().length).toBe(0);
     expect((runner.spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[1][0].taskId).toBe('t2');
+  });
+});
+
+describe('processQueuedMessages while it drains', () => {
+  function held<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((r) => { resolve = r; });
+    return { promise, resolve };
+  }
+
+  function recordingRunner() {
+    const sessions: FakeTerminalSession[] = [];
+    const runner = {
+      spawn: vi.fn().mockImplementation((opts: { taskId: string }) => {
+        const s = new FakeTerminalSession(`s${sessions.length + 1}`, opts.taskId);
+        sessions.push(s);
+        return Promise.resolve(s);
+      }),
+      stop: vi.fn(),
+      stopAll: vi.fn(),
+      activeCount: 0,
+    } as unknown as ITerminalRunner;
+    const spawnedIds = () => (runner.spawn as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) => (c[0] as { taskId: string }).taskId);
+    return { runner, sessions, spawnedIds };
+  }
+
+  const plan = (tasks: LegacyPlanState['tasks']): LegacyPlanState => ({
+    tasks,
+    generatedAt: new Date().toISOString(),
+    status: 'approved',
+    runners: ['claude-code'],
+    lastUpdated: new Date().toISOString(),
+  });
+
+  it('keeps the scheduler paused until the planner has answered', async () => {
+    const { runner, sessions, spawnedIds } = recordingRunner();
+    const t1 = createTask({ id: 't1', order: 1, title: 'First', prompt: 'do first', completionMarker: 'mk-1' });
+    const u1 = createTask({ id: 'u1', order: 2, title: 'Sign off', type: 'user', userSteps: [{ order: 1, instruction: 'look', completed: false }] });
+    const t2 = createTask({ id: 't2', order: 3, title: 'Second', prompt: 'do second', dependencies: ['t1'], completionMarker: 'mk-2' });
+    const answer = held<{ pendingTasks: LegacyPlanState['tasks']; message: string }>();
+    const planner = { modifyDuringExecution: vi.fn().mockReturnValue(answer.promise) };
+    const session = makeSession({ runner, planner });
+    session.loadPlan(plan([t1, u1, t2]), 'Test', '/repo');
+    await session.executePlan();
+    queue(session, 'rename the second task');
+    sessions[0].emitOutput('<<<ORDEWELL_DONE_mk-1>>>');
+    await vi.waitFor(() => expect(taskOf(session, 't1')!.status).toBe('completed'));
+
+    const draining = session.processQueuedMessages();
+    await vi.waitFor(() => expect(planner.modifyDuringExecution).toHaveBeenCalledTimes(1));
+    await session.markTaskComplete('u1');
+
+    expect(spawnedIds()).toEqual(['t1']);
+
+    answer.resolve({ pendingTasks: [{ ...t1, status: 'completed' }, { ...u1, status: 'completed' }, { ...t2, title: 'Renamed' }], message: 'ok' });
+    await draining;
+    await vi.waitFor(() => expect(spawnedIds()).toEqual(['t1', 't2']));
+    expect(taskOf(session, 't2')!.title).toBe('Renamed');
+  });
+
+  it('runs one drain at a time: a second call joins it, and what was queued meanwhile is drained after', async () => {
+    const answers = [held<{ pendingTasks: LegacyPlanState['tasks']; message: string }>(), held<{ pendingTasks: LegacyPlanState['tasks']; message: string }>()];
+    let inFlight = 0;
+    let most = 0;
+    const planner = {
+      modifyDuringExecution: vi.fn().mockImplementation(async () => {
+        const answer = answers[planner.modifyDuringExecution.mock.calls.length - 1];
+        most = Math.max(most, ++inFlight);
+        try { return await answer.promise; } finally { inFlight--; }
+      }),
+    };
+    const t1 = createTask({ id: 't1', order: 1, title: 'Task 1', prompt: 'do it' });
+    const session = makeSession({ planner });
+    session.loadPlan(plan([t1]), 'Test', '/repo');
+    queue(session, 'first edit');
+
+    const first = session.processQueuedMessages();
+    await vi.waitFor(() => expect(planner.modifyDuringExecution).toHaveBeenCalledTimes(1));
+    queue(session, 'second edit');
+    const second = session.processQueuedMessages();
+    await flushMicrotasks();
+    expect(planner.modifyDuringExecution).toHaveBeenCalledTimes(1);
+
+    answers[0].resolve({ pendingTasks: [{ ...t1, title: 'After first' }], message: 'ok' });
+    await vi.waitFor(() => expect(planner.modifyDuringExecution).toHaveBeenCalledTimes(2));
+    answers[1].resolve({ pendingTasks: [{ ...t1, title: 'After second' }], message: 'ok' });
+    await Promise.all([first, second]);
+
+    expect(most).toBe(1);
+    expect(planner.modifyDuringExecution.mock.calls.map((c) => (c[0] as { userMessage: string }).userMessage)).toEqual(['first edit', 'second edit']);
+    expect(taskOf(session, 't1')!.title).toBe('After second');
+    expect(session.getQueuedMessages()).toEqual([]);
+  });
+
+  it('will not take back a message the planner already has', async () => {
+    const answer = held<{ pendingTasks: LegacyPlanState['tasks']; message: string }>();
+    const planner = { modifyDuringExecution: vi.fn().mockReturnValue(answer.promise) };
+    const t1 = createTask({ id: 't1', order: 1, title: 'Task 1', prompt: 'do it' });
+    const session = makeSession({ planner });
+    session.loadPlan(plan([t1]), 'Test', '/repo');
+    queue(session, 'an edit');
+    const [sent] = session.getQueuedMessages();
+
+    const draining = session.processQueuedMessages();
+    await vi.waitFor(() => expect(planner.modifyDuringExecution).toHaveBeenCalledTimes(1));
+
+    expect(session.removeQueuedMessage(sent.id)).toBe(false);
+    answer.resolve({ pendingTasks: [t1], message: 'ok' });
+    await draining;
   });
 });
 

@@ -1506,6 +1506,61 @@ describe('task attempts', () => {
     expect(orchestrator.isRunning).toBe(false);
   });
 
+  const threeReady = () => [
+    createTask({ id: 't1', order: 1, title: 'First', prompt: 'do first' }),
+    createTask({ id: 't2', order: 2, title: 'Second', prompt: 'do second' }),
+    createTask({ id: 't3', order: 3, title: 'Third', prompt: 'do third' }),
+  ];
+
+  it('stop during the first spawn of a tick starts none of the tasks after it', async () => {
+    const { spawn, settle, spawned } = heldSpawns();
+    const orchestrator = makeOrchestrator({ terminalRunner: { spawn } });
+    orchestrator.loadPlan(threeReady());
+    void orchestrator.approveReview();
+    await vi.waitFor(() => expect(spawned()).toBe(1));
+
+    orchestrator.stop();
+    await settle(0, new FakeTerminalSession('late', 't1'));
+    await flushMicrotasks();
+
+    expect(spawned()).toBe(1);
+    expect(orchestrator.hasLiveWork).toBe(false);
+    expect(orchestrator.storeInstance.allTasks.map((t) => t.status)).toEqual(['pending', 'pending', 'pending']);
+  });
+
+  it('a plan loaded during a tick\'s spawn is not handed tasks the old plan had ready', async () => {
+    const { spawn, settle, spawned } = heldSpawns();
+    const orchestrator = makeOrchestrator({ terminalRunner: { spawn } });
+    orchestrator.loadPlan(threeReady());
+    void orchestrator.approveReview();
+    await vi.waitFor(() => expect(spawned()).toBe(1));
+
+    orchestrator.loadPlan([createTask({ id: 'n1', order: 1, title: 'New', prompt: 'do new' })]);
+    await settle(0, new FakeTerminalSession('late', 't1'));
+    await flushMicrotasks();
+
+    const started = spawn.mock.calls.map((call) => (call as unknown as [{ taskId: string }])[0].taskId);
+    expect(started).not.toContain('t2');
+    expect(started).not.toContain('t3');
+    expect(orchestrator.storeInstance.get('t2')).toBeUndefined();
+  });
+
+  it('a verdict whose output cannot be read fails the task instead of leaving it live', async () => {
+    const { sessions, spawn } = sessionRunner();
+    const output = new BufferedTaskOutputSource({ transcripts: fakeTranscripts() });
+    output.finalText = async () => { throw new Error('transcript unreadable'); };
+    const notifications = fakeNotification();
+    const orchestrator = makeOrchestrator({ terminalRunner: { spawn }, output, notifications });
+    orchestrator.loadPlan([createTask({ id: 't1', order: 1, title: 'First', prompt: 'do first', completionMarker: 'mk-1' })]);
+    await orchestrator.approveReview();
+
+    sessions[0].emitOutput('<<<ORDEWELL_DONE_mk-1>>>');
+
+    await vi.waitFor(() => expect(orchestrator.storeInstance.get('t1')!.status).toBe('failed'));
+    expect(orchestrator.hasLiveWork).toBe(false);
+    expect(notifications.error).toHaveBeenCalledWith(expect.stringContaining('transcript unreadable'));
+  });
+
   it('marking a task complete while its spawn is in flight keeps it completed when the spawn lands', async () => {
     const { spawn, settle, spawned } = heldSpawns();
     const orchestrator = makeOrchestrator({ terminalRunner: { spawn } });

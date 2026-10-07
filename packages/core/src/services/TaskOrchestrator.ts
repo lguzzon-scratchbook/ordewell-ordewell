@@ -285,7 +285,7 @@ export class TaskOrchestrator {
     this.previousAttemptFromLog = deps.previousAttemptFromLog;
 
     this.store.onMutate = () => this.emit('onTaskChanged');
-    this.verifier.onVerdict((taskId, verdict) => this.onVerdict(taskId, verdict));
+    this.verifier.onVerdict((taskId, verdict) => { void this.deliverVerdict(taskId, verdict); });
     this.verifier.onCheckpoint((taskId, summary) => {
       const task = this.store.get(taskId);
       if (!task) return;
@@ -684,7 +684,7 @@ export class TaskOrchestrator {
   loadPlan(tasks: readonly Task[], planRunners: RunnerId[] = ['claude-code']): void {
     this.store.load(tasks, planRunners);
     const repairs = this.endAllAttempts('load').filter((a) => a.kind.kind === 'repair' && a.worktree);
-    for (const a of repairs) void this.runs.release(a.taskId, { keep: true }, a.integration);
+    for (const a of repairs) this.unawaited(this.runs.release(a.taskId, { keep: true }, a.integration), `Could not keep the worktree of task "${this.store.get(a.taskId)?.title ?? a.taskId}"`);
     // A plan committed while the scheduler runs keeps that run, and its mode
     // with it; otherwise the next start decides afresh.
     this.runs.interrupt({ keepOpen: this.running });
@@ -770,7 +770,7 @@ export class TaskOrchestrator {
         this.store.markPending(a.taskId);
         stopped.push(a);
       }
-      if (a.worktree) void this.runs.release(a.taskId, { keep: true }, a.integration);
+      if (a.worktree) this.unawaited(this.runs.release(a.taskId, { keep: true }, a.integration), `Could not keep the worktree of task "${this.store.get(a.taskId)?.title ?? a.taskId}"`);
     }
     this.runs.interrupt();
     this.onHold.clear();
@@ -834,6 +834,40 @@ export class TaskOrchestrator {
 
   async onUserTaskComplete(taskId: string): Promise<void> {
     return this.markTaskComplete(taskId);
+  }
+
+  /**
+   * The boundary a verdict crosses: nothing awaits the verifier's listener, so
+   * a throw from reading the output, landing, releasing a worktree or the tick
+   * after would be an unhandled rejection — and an attempt left integrating is
+   * live work forever. One that never settled fails (a repair waits on the
+   * user, as its conflict did); either way the run halts and says why.
+   */
+  private async deliverVerdict(taskId: string, verdict: Verdict): Promise<void> {
+    const attempt = this.attempts.get(taskId);
+    try {
+      await this.onVerdict(taskId, verdict);
+    } catch (err) {
+      const title = this.store.get(taskId)?.title ?? taskId;
+      const reason = err instanceof Error ? err.message : String(err);
+      const unsettled = attempt !== undefined && this.attempts.get(taskId) === attempt;
+      if (unsettled) {
+        this.endAttempt(taskId, 'verdict');
+        if (attempt.kind.kind === 'repair') this.store.markAwaitingUser(taskId, 'conflict');
+        else this.store.markFailed(taskId);
+        this.store.setTaskOutputSummary(taskId, summarizeOutput(reason, ''));
+        // Its landing may be what threw, so the release does not wait on it.
+        if (attempt.worktree) this.unawaited(this.runs.release(taskId, { keep: true }), `Could not keep the worktree of task "${title}"`);
+      }
+      this.haltOnFailure();
+      this.tell('error', unsettled ? `Task "${title}" could not be settled: ${reason}` : `Task "${title}" settled, but the run could not go on: ${reason}`);
+      this.unawaited(this.afterVerdict(taskId), 'The run could not be closed');
+    }
+  }
+
+  /** Work nothing awaits: a rejection is said, not left unhandled. */
+  private unawaited(work: Promise<unknown>, failure: string): void {
+    work.catch((err: unknown) => this.tell('error', `${failure}: ${err instanceof Error ? err.message : String(err)}`));
   }
 
   private async onVerdict(taskId: string, verdict: Verdict): Promise<void> {
@@ -958,7 +992,7 @@ export class TaskOrchestrator {
     this.store.markAwaitingUser(task.id, 'conflict');
     this.say(outcome.messages);
     if (outcome.kind !== 'repair-needed') return;
-    if (this.attempts.size < this.config.maxParallelSessions) void this.startTask(task);
+    if (this.attempts.size < this.config.maxParallelSessions) this.unawaited(this.startTask(task), `Could not start the repair of task "${task.title}"`);
     else {
       this.store.markPending(task.id);
       this.tell('info', `Task "${task.title}" is repaired once a slot is free.`);
@@ -1324,13 +1358,17 @@ export class TaskOrchestrator {
       return;
     }
 
-    for (const task of ready) {
-      const kind = this.nextAttemptKind(task.id);
-      // Readiness was read before this loop awaited any start: a Merge all
-      // may have begun since.
+    for (const { id } of ready) {
+      // Readiness was read before this loop awaited any start: a stop, a plan
+      // load or a Merge all may have come since.
+      if (!this.running) return;
+      if (!this.store.get(id)) continue;
+      const kind = this.nextAttemptKind(id);
       if (this.merging && mergeExcludes(kind)) continue;
       if (decidesIsolation(kind) && !(await this.runs.decide(() => this.tick()))) continue;
-      await this.startTask(task);
+      if (!this.running) return;
+      const task = this.store.get(id);
+      if (task) await this.startTask(task);
     }
     this.emit('onTick');
   }
@@ -1350,7 +1388,7 @@ export class TaskOrchestrator {
   }
 
   private async startTask(task: Task, continuation: Continuation | null = null): Promise<void> {
-    if (this.attempts.has(task.id)) return;
+    if (this.attempts.has(task.id) || !this.store.get(task.id)) return;
     const attempt: TaskAttempt = {
       taskId: task.id,
       attempt: (this.spawnCounts.get(task.id) ?? 0) + 1,
