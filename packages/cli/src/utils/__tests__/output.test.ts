@@ -18,6 +18,11 @@ describe('iconFor', () => {
     expect(iconFor('blocked')).toContain('33m');
   });
 
+  it('returns a yellow question mark for awaiting_user, not the pending circle', () => {
+    expect(iconFor('awaiting_user')).toContain('33m');
+    expect(iconFor('awaiting_user')).toContain('?');
+  });
+
   it('returns gray circle for unknown', () => {
     const result = iconFor('something_else');
     expect(result).toContain('90m');

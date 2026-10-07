@@ -24,7 +24,7 @@ import {
   type OrchestratorOption,
   type RunnerModeInfo,
   runnerModesFrom,
-  PROVIDER_PRIORITY,
+  configuredProviders,
   assertWorkspaceExists,
   assertWorkspaceIsProject,
   WorkspaceNotAProjectError,
@@ -324,7 +324,11 @@ export class OrchestratorPool {
       // The scheduler reads the limit on every tick, but a raised one would
       // only be seen at the next verdict; the runs waiting for a slot start now.
       if (envChanges.ORDEWELL_MAX_PARALLEL !== undefined) {
-        for (const session of this.sessions.values()) void session.reschedule();
+        for (const [id, session] of this.sessions) {
+          session.reschedule().catch((err) => {
+            console.error(`[web] reschedule failed for session ${id}: ${err instanceof Error ? err.message : err}`);
+          });
+        }
       }
       // A new/changed provider key or base URL must re-probe the catalog;
       // without this the picker keeps serving the pre-key cache until restart.
@@ -433,18 +437,7 @@ export class OrchestratorPool {
       }
     }
 
-    const providers: string[] = [];
-    for (const provider of PROVIDER_PRIORITY) {
-      if (provider === 'openai_compatible') {
-        if (config.openaiCompatibleBaseUrl) providers.push(provider);
-      } else if (provider === 'openrouter') {
-        if (config.openrouterKey) providers.push(provider);
-      } else if (provider === 'google') {
-        if (config.geminiKey) providers.push(provider);
-      } else if (config.getProviderApiKey(provider)) {
-        providers.push(provider);
-      }
-    }
+    const providers = configuredProviders(config);
 
     return {
       models: allModels,
@@ -485,6 +478,9 @@ export class OrchestratorPool {
 
   async generatePlan(sessionId: string, goal: string, runners: RunnerId[], workspace: string, modelOverride?: string, options?: { allowInit?: boolean }): Promise<PlanState> {
     const session = this.createSessionFor(sessionId, workspace, modelOverride, options);
+    // After the new session is built, so a refusal above leaves the live one
+    // alone; before the set, so its runners and planner turn stop broadcasting.
+    this.destroy(sessionId);
     // Registered before the blocking call, not after: research inside
     // generatePlan can raise an approval and await the answer, and that
     // answer arrives over POST /api/approvals/:sessionId — which 404s until
@@ -509,6 +505,7 @@ export class OrchestratorPool {
    */
   async startPlanning(sessionId: string, goal: string, runners: RunnerId[], workspace: string, modelOverride?: string, options?: { allowInit?: boolean }): Promise<LegacyPlanState> {
     const session = this.createSessionFor(sessionId, workspace, modelOverride, options);
+    this.destroy(sessionId);
     // See generatePlan: must be registered before the blocking call so a
     // mid-research approval is answerable rather than 404ing until timeout.
     this.sessions.set(sessionId, session);
@@ -602,6 +599,8 @@ export class OrchestratorPool {
     // The saved id is adopted too, so later persists rewrite the same file
     // instead of forking the session under a fresh identity.
     session.loadPlan(saved.plan, saved.meta.goal, workspace, { sessionId: saved.meta.id });
+    // A live session with no plan yet is mid-planning; replacing it must stop that turn.
+    this.destroy(sessionId);
     this.sessions.set(sessionId, session);
 
     return session.planState ?? saved.plan;

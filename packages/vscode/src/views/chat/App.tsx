@@ -107,6 +107,7 @@ export default function App() {
 
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const dockBodyRef = useRef<HTMLDivElement>(null);
+  const helpTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const processingRef = useRef(false);
   const stoppedRef = useRef(false);
   const sessionClearedRef = useRef(false);
@@ -446,7 +447,8 @@ export default function App() {
     }
     if (text === '/help') {
       setSlashOutput(slashHelp());
-      setTimeout(() => setSlashOutput(''), 6000);
+      clearTimeout(helpTimerRef.current);
+      helpTimerRef.current = setTimeout(() => setSlashOutput(''), 6000);
       return;
     }
 
@@ -462,6 +464,7 @@ export default function App() {
 
     setShowModelInfo(false);
     setSlashOutput('');
+    clearTimeout(helpTimerRef.current);
     setShowNewSessionConfirm(false);
     stoppedRef.current = false;
     sessionClearedRef.current = false;

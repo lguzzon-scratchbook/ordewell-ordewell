@@ -117,6 +117,23 @@ describe('handleTui', () => {
     expect(frame.join('\n')).toContain('Ordewell');
   });
 
+  it('leaves the alternate screen before printing a fatal error, so the message survives', async () => {
+    void handleTui([]);
+    await vi.waitFor(() => expect(fakeTerminal.draw).toHaveBeenCalled());
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const order: string[] = [];
+    fakeTerminal.close.mockImplementation(() => { order.push('close'); });
+    error.mockImplementation(() => { order.push('print'); });
+
+    const added = listenersFor('uncaughtException').filter((l) => !priorListeners.get('uncaughtException')!.includes(l));
+    (added[0] as (err: Error) => void)(new Error('boom'));
+
+    expect(order[0]).toBe('close');
+    expect(order).toContain('print');
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('boom'));
+    error.mockRestore();
+  });
+
   it('picks a private free port by default, so two unflagged sessions never share a daemon', async () => {
     void handleTui([]);
 

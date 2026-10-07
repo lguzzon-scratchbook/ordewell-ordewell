@@ -86,12 +86,14 @@ export function finishPlannerTurn(
   deps.saveCurrentSession();
 }
 
-export function reportPlannerError(err: unknown, deps: PlanManagerDeps): void {
-  const isAbort = err instanceof Error && (
+export function reportPlannerError(err: unknown, deps: PlanManagerDeps, signal?: AbortSignal): void {
+  // Message text is not evidence: a real failure can mention "aborted" (a
+  // runner's "transaction aborted"). Only the stop's own signal or an abort
+  // error's identity counts.
+  const isAbort = signal?.aborted === true || (err instanceof Error && (
     err.name === 'AbortError' ||
-    err.name === 'APIUserAbortError' ||
-    /aborted/i.test(err.message)
-  );
+    err.name === 'APIUserAbortError'
+  ));
   // The stop already ended the turn on screen.
   if (isAbort) return;
   const message = err instanceof Error ? err.message : String(err);
@@ -142,7 +144,7 @@ async function inPlannerTurn(deps: PlanManagerDeps, run: (signal: AbortSignal) =
   try {
     await run(controller.signal);
   } catch (err) {
-    reportPlannerError(err, deps);
+    reportPlannerError(err, deps, controller.signal);
   } finally {
     if (deps.getResearchAbort() === controller) {
       deps.setGeneratingPlan(false);

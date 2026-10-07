@@ -179,6 +179,20 @@ describe('execution', () => {
     expect(lastMessage(s)?.text).toContain('2/2');
   });
 
+  it('stops showing tasks as running when the execution stream is lost', () => {
+    const live = initialState({
+      ...withTasks,
+      status: 'executing',
+      busyLabel: 'Running a',
+      tasks: [{ ...withTasks.tasks![0], status: 'completed' }, { ...withTasks.tasks![1], status: 'in_progress' }],
+    });
+    const s = send(live, { type: 'executionLost' });
+    expect(s.status).toBe('idle');
+    expect(s.busyLabel).toBe('');
+    expect(s.tasks.map((t) => t.status)).toEqual(['completed', 'pending']);
+    expect(lastMessage(s)?.text).toContain('Lost the connection');
+  });
+
   // A run whose last live task is cancelled or marked done can never restart if
   // the indicator stays "executing": the daemon refuses the next Execute as
   // "already executing". The tasks are the truth, not the stream.

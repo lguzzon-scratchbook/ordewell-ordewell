@@ -246,6 +246,19 @@ function reduceAction(state: TuiState, action: Action): Step {
       });
     }
 
+    case 'executionLost': {
+      if (stale(state, action.sessionId)) return step(state);
+      // 'pending' is what a reloaded plan would show for these anyway; the
+      // daemon's own record is the truth once the user reconnects.
+      const tasks = state.tasks.map((t) => isTaskRunning(t) ? { ...t, status: 'pending', idleSince: null } : t);
+      return step({
+        ...say(state, 'error', 'Lost the connection to the daemon — the run is no longer being followed. Restart the daemon and reload the session to see where it stands.'),
+        tasks,
+        status: 'idle',
+        busyLabel: '',
+      });
+    }
+
     case 'settingsLoaded':
       return step(applySettings(state, action.settings));
 

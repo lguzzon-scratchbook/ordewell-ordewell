@@ -659,11 +659,15 @@ export class ApiClient {
     return socket;
   }
 
+  closeExecutionStream(sessionId: string): void {
+    this.executionStreams.get(sessionId)?.();
+  }
+
   streamExecution(
     sessionId: string,
     onEvent: (event: WsEvent) => void,
     onReady?: (error?: Error) => void,
-  ): Promise<void> {
+  ): Promise<'lost' | void> {
     return new Promise((resolve, reject) => {
       this.executionStreams.get(sessionId)?.();
       const socket = this.openSessionSocket(sessionId);
@@ -710,7 +714,8 @@ export class ApiClient {
         if (!opened) onReady?.(new Error('Execution stream closed before connecting'));
         if (!resolved) {
           resolved = true;
-          resolve();
+          // Neither a completion event nor a caller ended this: the daemon went away.
+          resolve('lost');
         }
       });
     });

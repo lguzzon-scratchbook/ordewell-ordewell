@@ -63,7 +63,8 @@ export interface OrdewellApi {
   streamPlanning(sessionId: string, onEvent: (event: WsEvent) => void): { ready: Promise<void>; close: () => void };
   respondToApproval(sessionId: string, approvalId: string, answer: ApprovalAnswer): Promise<{ ok: boolean }>;
   /** Opens the execution stream. `onReady` runs only once the subscription is live. */
-  streamExecution(sessionId: string, onEvent: (event: WsEvent) => void, onReady?: (error?: Error) => void): Promise<void>;
+  streamExecution(sessionId: string, onEvent: (event: WsEvent) => void, onReady?: (error?: Error) => void): Promise<'lost' | void>;
+  closeExecutionStream(sessionId: string): void;
 }
 
 export interface EffectDeps {
@@ -715,9 +716,15 @@ async function withExecutionStream(
   const stream = deps.api.streamExecution(sessionId, inbound.execution(), settleReady);
   // Surface a failed connection while it is still being established.
   void stream.catch(settleReady);
-  await streamReady;
-  await request();
-  await stream;
+  try {
+    await streamReady;
+    await request();
+  } catch (err) {
+    // Nothing else holds this socket; left open it outlives the failed run.
+    deps.api.closeExecutionStream(sessionId);
+    throw err;
+  }
+  if (await stream === 'lost') deps.dispatch({ type: 'executionLost', sessionId });
 }
 
 /**

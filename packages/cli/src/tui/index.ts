@@ -144,6 +144,9 @@ export async function handleTui(subArgs: string[]): Promise<void> {
     app.dispatch({ type: 'resize', rows: r, cols: c });
   });
   process.on('uncaughtException', (err) => {
+    // Printed on the alternate screen the message would be wiped by the
+    // ALT_SCREEN_OFF that close() sends; leave the screen first.
+    terminal?.close();
     console.error(`Fatal: ${err.message}`);
     shutdown(1);
   });

@@ -127,6 +127,8 @@ export type Action =
   /** The scheduled expiry of an armed stop; the arm simply lapses. */
   | { type: 'stopDisarmed'; arm: number }
   | { type: 'executionComplete'; summary?: { total: number; completed: number; failed: number }; stopped?: boolean; sessionId?: string }
+  /** The execution socket dropped before the run reported an end; whatever the pane shows as running no longer has a feed. */
+  | { type: 'executionLost'; sessionId?: string }
   | { type: 'settingsLoaded'; settings: Record<string, unknown> }
   | { type: 'modelsLoaded'; models: ModelView[]; orchestratorModels?: ModelView[]; providers?: string[]; providerErrors?: Record<string, string>; modesByRunner?: Record<string, ModeView[]> }
   | { type: 'sessionsLoaded'; sessions: SessionView[] }

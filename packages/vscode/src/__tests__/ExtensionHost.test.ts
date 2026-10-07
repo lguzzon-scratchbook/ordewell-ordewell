@@ -335,6 +335,16 @@ describe('the extension host wires one state, one deps bag and one lifecycle', (
     await vi.waitFor(() => expect(h.resolver.refreshRunnerModels).toHaveBeenCalled());
   });
 
+  it('logs a failed reschedule on a config change instead of leaving the rejection unhandled', async () => {
+    await h.host.start();
+    h.session.spies.reschedule.mockRejectedValueOnce(new Error('tick exploded'));
+
+    for (const listener of h.config.listeners) listener();
+
+    const appendLine = h.services.outputChannel.appendLine as unknown as ReturnType<typeof vi.fn>;
+    await vi.waitFor(() => expect(appendLine).toHaveBeenCalledWith(expect.stringContaining('Reschedule failed: tick exploded')));
+  });
+
   it('warns once when an installed runner discovers no models, and throttles repeats', async () => {
     const resolver = fakeResolver({});
     const local = harness({ modelResolver: resolver });

@@ -66,6 +66,12 @@ async function shutdown(): Promise<void> {
   process.exit(0);
 }
 
+// A stray rejection in one session's background work must not take every
+// session's runners down with the daemon.
+process.on('unhandledRejection', (reason) => {
+  console.error(`[web] unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
+});
+
 process.on('SIGINT', () => { shutdown(); });
 process.on('SIGTERM', () => { shutdown(); });
 process.on('SIGHUP', () => { shutdown(); });

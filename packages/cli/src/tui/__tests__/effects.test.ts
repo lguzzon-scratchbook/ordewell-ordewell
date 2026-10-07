@@ -48,6 +48,7 @@ function harness(api: Partial<OrdewellApi> = {}, over: Partial<EffectDeps> = {})
         onReady?.();
         return Promise.resolve();
       }),
+      closeExecutionStream: vi.fn(),
       ...api,
     } as OrdewellApi,
     workspace: '/ws',
@@ -486,6 +487,28 @@ describe('execution', () => {
       summary: { total: 1, completed: 1, failed: 0 },
       sessionId: 's1',
     });
+  });
+
+  it('tells the user when the stream closes before the run reported an end', async () => {
+    const h = harness({
+      streamExecution: vi.fn().mockImplementation((_id: string, _cb: unknown, onReady?: (error?: Error) => void) => {
+        onReady?.();
+        return Promise.resolve('lost');
+      }),
+    });
+    await runEffect({ type: 'execute', sessionId: 's1' }, h.deps);
+
+    expect(h.actions).toContainEqual({ type: 'executionLost', sessionId: 's1' });
+  });
+
+  it('closes the already-open stream when the request that follows it fails', async () => {
+    const h = harness({
+      executePlan: vi.fn().mockRejectedValue(new Error('No plan to execute')),
+    });
+    await runEffect({ type: 'execute', sessionId: 's1' }, h.deps);
+
+    expect(h.api.closeExecutionStream).toHaveBeenCalledWith('s1');
+    expect(types(h.actions)).not.toContain('executionLost');
   });
 
   it('reports a stopped run too, without inventing a tally it was not sent', async () => {
