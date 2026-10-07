@@ -6,7 +6,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
-## [Unreleased]
+## [0.7.2] — 2026-10-07
+
+### Security
+
+Planner research runs shell commands under a command policy: some are run
+without asking, some ask, and some are refused outright. These inputs slipped
+past the refusal tier, so a command that should have been refused asked for
+approval or ran. Each is now refused.
+
+- **A `!`-prefixed command is refused.** `!` is a shell keyword that negates the
+  pipeline after it, and the command behind it was not judged as the command
+  it is.
+- **A line with more than 32 substitutions is refused**, instead of being
+  judged on the first 32 and letting the rest through.
+- **An interpreter fed through stdin counts as piped.** `bash <<< '…'`, a
+  here-document, `sh < file` and `<&` hand an interpreter code exactly as
+  `… | sh` does, and are refused the same way.
+- **Every spelling of an inline-code flag is read.** Combined and glued flags
+  (`bash -lc`, `perl -lne`, `perl -e'…'`), `node -p` and `--print`, `php -r`,
+  PowerShell's `-EncodedCommand` and any abbreviation of its code parameters,
+  `cmd /q/c`, `deno eval`, a `data:` URL handed to `node`, `deno` or `bun`, and
+  PowerShell's positional command. A versioned or suffixed interpreter name
+  (`python3.12`, `node22`, `nodejs`, `pwsh-preview`) is the interpreter too.
+- **Quoting and escaping no longer hide a command inside a substitution.** A
+  quoted or escaped `)` ended `$( )` early, `` \` `` inside backticks was not a
+  nested substitution, a `${…}` holding a quote, paren or escape could close a
+  `$( )` at the wrong place, and `$'…'` was lexed as plain single quotes, so a
+  `\'` inside it let the rest of the line pass unread. A substitution the
+  policy cannot read to its end now refuses the line.
+- **A `<<` that is not a here-document no longer hides the lines after it.**
+  Inside a comment, a `${…}` or `$[…]` expansion, or `(( ))` arithmetic, `<<`
+  is not a here-document, but it was treated as one and the following lines
+  were skipped as data. They are now read as commands; `(( ))` and an
+  unreadable `${…}` refuse the line. A here-document body is still skipped to
+  its delimiter, and an unclosed one refuses the line.
+- **Command names are matched case-insensitively for refusal.** `DEL`, `Rd`,
+  `RM` and `CMD /c` run on Windows and on case-insensitive filesystems, but a
+  re-cased name was not recognised as the refused command. The permitted tier
+  stays exact-case, so a re-cased name never gains the no-prompt tier.
+- **`NAME+=value` is an assignment prefix**, and `env` takes any word holding
+  `=`, so neither hides the command that follows from the refusal checks.
+- **Windows `cmd` forms are read the way `cmd.exe` reads them.** `cmd/c del x`
+  is `cmd /c`, `,del x` is `del`, and `cmd;/c del x` is refused. A command word
+  still holding a `/` or `=` — `cmd"/c"`, `del=x` — is refused rather than read
+  wrong, a drive-absolute path such as `C:/Git/usr/bin/rm.exe` can no longer
+  scope to the bare drive, `call` is unwrapped to the command it runs, and
+  `start` is refused.
+
+### Changed
+
+- **In the cmd dialect, a program path written with forward slashes is refused
+  during planner research.** Use backslashes. A forward-slash path is read
+  wrong by the policy — as a switch, or as the wrong program name — so it is
+  refused instead.
+- **A runner starts in its own process group without a controlling
+  terminal.** A prompt that reads `/dev/tty` now fails instead of waiting on
+  the terminal Ordewell runs in.
+- **Stopping a planner turn is reported as a stop, not an error.** However the
+  planner's backend names the error it throws on the way out, the TUI, the CLI
+  and VS Code stay quiet for a stop, and the daemon answers 409
+  (`planner_turn_stopped`) without logging a fault. A real failure whose
+  message mentions "aborted" is still reported as one.
 
 ### Fixed
 
@@ -29,6 +90,56 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 - **Terminal-transport runners no longer inherit `CLAUDECODE` or Node debugging
   flags** from the process that started Ordewell, matching the structured
   transport. A workspace that sets one on purpose still passes it.
+- **A second interrupt no longer overwrites the first** on Codex when it is
+  asked for before Codex has named the turn.
+- **OpenCode no longer accumulates listeners and buffer.** A retry delay left
+  its abort listener behind, and the server banner was read without a bound
+  on the pending line.
+- **The scheduler no longer starts what it should not.** A task could be
+  started after Stop, after it stopped being ready, or after the plan changed,
+  and a start could push the run past the parallel limit. Each task is judged
+  again just before it starts.
+- **A failure while settling a verdict no longer leaves a task integrating
+  forever.** The task now fails (a conflict repair waits on you, as its
+  conflict did), the run halts, and the error is shown instead of being lost
+  as an unhandled rejection.
+- **Isolated-run start-up is safer.** A stash that fails keeps your choice open
+  instead of dropping it, a stash that succeeds is always announced, and a run
+  stopped while it was being set up no longer opens afterwards.
+- **Queued plan edits are applied once, and to the plan they were meant for.**
+  An edit could be applied twice after a reload, the run could go on before the
+  planner's answer was applied, and an answer arriving for a plan you had
+  since replaced could land in the new one. One drain runs at a time, and an
+  edit sent during it is drained after.
+- **A queued message you removed stays removed.** It could come back after a
+  reload; a message the planner already has can no longer be removed.
+- **Merging a task with itself no longer counts as two tasks.** Naming the
+  same task twice in a merge now leaves one task, which a merge refuses.
+- **Changes are saved before they are shown.** Approving a review,
+  rescheduling, interrupting a task, controlling a queued task message and
+  Merge all announced the change before saving it.
+- **A planner turn that outlives its plan no longer writes into the next
+  one.** A turn that settles after a new plan, another session or a closed
+  session replaced its own is discarded; a superseded compaction no longer
+  ends the planner turn that followed it; a second planner message sent while
+  a turn is in flight is refused as busy.
+- **Worktree landing cannot be undone mid-merge.** Hand-off, discard and
+  orphan pruning now wait for a landing in flight instead of rolling back the
+  merge it was making.
+- **A git command can no longer hang forever.** One stuck on a hook is stopped
+  after ten minutes and the error names the git subcommand that timed out.
+- **A fatal error in the TUI stays on screen.** It was printed on the
+  alternate screen and wiped when the screen was left.
+- **A lost daemon connection is noticed.** The TUI used to show a run as still
+  going, and `ordewell run` exited 0; the TUI now says the connection was lost
+  (task statuses stay as last reported, since the daemon may still be running
+  them), and `ordewell run` exits 1.
+- **A stray rejection no longer takes the daemon down** with every session's
+  runners. Starting a plan or loading a session over a live one now stops the
+  old session's runners and planner turn instead of leaving them running.
+- **OpenRouter is no longer reported as configured** when only
+  `OPENAI_API_KEY` is set.
+- **A task awaiting you shows as awaiting, not pending,** in CLI output.
 
 ## [0.7.1] — 2026-10-06
 
