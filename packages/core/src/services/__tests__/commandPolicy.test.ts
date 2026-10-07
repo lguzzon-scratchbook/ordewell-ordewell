@@ -1375,3 +1375,140 @@ describe('bypasses of the refusal tier', () => {
     expect(classifyCommand('PATH+=:/tmp rm -rf src').reason).toContain('"rm"');
   });
 });
+
+// Each of these reached `ask` while the shell would run something the refusal
+// tier exists to stop.
+describe('remaining lexer gaps', () => {
+  it.each([
+    'echo "$(ls ${x%)}; rm -rf ~)"',
+    'echo $(ls ${x%)}; rm -rf ~)',
+    'echo "$(ls ${x#"}"}; rm -rf ~)"',
+  ])('does not close a substitution at a ) inside a parameter expansion: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it('still reads a substitution holding a plain parameter expansion', () => {
+    expect(classifyCommand('echo "$(basename ${PWD})"').tier).toBe('ask');
+    expect(classifyCommand('echo $(echo ${x%.ts})').tier).toBe('ask');
+  });
+
+  it.each([
+    "echo $'\\''; rm -rf ~ #'",
+    "echo $'\\'' && rm -rf ~ #'",
+    "echo \"$(echo $'\\''; rm -rf ~ #')\"",
+  ])('reads an ANSI-C quoted string with its escapes: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it('refuses an ANSI-C quoted string left open', () => {
+    expect(classifyCommand("echo $'abc").tier).toBe('refuse');
+    expect(classifyCommand("echo $'abc\\'").tier).toBe('refuse');
+  });
+
+  it('still asks for a closed ANSI-C quoted argument', () => {
+    expect(classifyCommand("cat $'/etc/passwd'").tier).toBe('ask');
+    expect(classifyCommand("echo $'a\\'b' | head -1").tier).toBe('ask');
+  });
+
+  it.each([
+    "python3.12 -c 'import os'",
+    "python3.11 -c 'import os'",
+    "/usr/bin/python3.12 -c 'import os'",
+    "node22 -e 'process.exit()'",
+    "nodejs -e 'process.exit()'",
+    "ruby3.2 -e 'puts 1'",
+    "perl5.36 -e 'unlink q(x)'",
+    "php8.2 -r 'unlink(\"x\");'",
+    "bash5 -c 'rm -rf ~'",
+    'cat x.py | python3.12',
+    'python3.12 < x.py',
+  ])('refuses inline code under a versioned interpreter name: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it.each([
+    "deno eval 'Deno.removeSync(\"x\")'",
+    "deno -q eval 'Deno.removeSync(\"x\")'",
+    "node --import 'data:text/javascript,process.exit()' x.js",
+    "node --import='data:text/javascript,process.exit()' x.js",
+    "node --require 'data:text/javascript,process.exit()' x.js",
+    "node -r 'data:text/javascript,process.exit()' x.js",
+    "node --loader 'data:text/javascript,process.exit()' x.js",
+    "node --experimental-loader 'DATA:text/javascript,process.exit()' x.js",
+    "deno run 'data:text/javascript,Deno.exit()'",
+  ])('refuses inline code in a JavaScript runtime: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it.each([
+    'powershell Remove-Item x',
+    'pwsh Remove-Item x',
+    'pwsh -NoProfile Remove-Item x',
+    'pwsh -ExecutionPolicy Bypass Remove-Item x',
+    'pwsh -wd . Remove-Item x',
+    'pwsh -',
+    'pwsh -NoProfile "rm x; ./x.ps1"',
+    'powershell x.ps1 "; Remove-Item y"',
+    'pwsh -Unknown x.ps1',
+    'pwsh -i x.ps1',
+  ])('refuses PowerShell given a command positionally: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+    expect(classifyCommand(cmd, { dialect: 'cmd' }).tier).toBe('refuse');
+  });
+
+  it('still asks for PowerShell running a script file', () => {
+    expect(classifyCommand('pwsh x.ps1').tier).toBe('ask');
+    expect(classifyCommand('pwsh -NoProfile ./scripts/x.ps1 -Verbose').tier).toBe('ask');
+    expect(classifyCommand('powershell -ExecutionPolicy Bypass -File x.ps1').tier).toBe('ask');
+    expect(classifyCommand('powershell.exe -NoProfile x.ps1', { dialect: 'cmd' }).tier).toBe('ask');
+    expect(classifyCommand('pwsh -NoProfile').tier).toBe('ask');
+  });
+
+  it.each([
+    'cmd/c del x',
+    'cmd/C del x',
+    'cmd^/c del x',
+    'C:\\Windows\\System32\\cmd.exe/c del x',
+    'cmd,/c del x',
+    ',del x',
+    'cmd;/c del x',
+    'cmd ,/c del x',
+  ])('reads a cmd.exe command name where cmd.exe ends it: %s', (cmd) => {
+    expect(classifyCommand(cmd, { dialect: 'cmd' }).tier).toBe('refuse');
+  });
+
+  it('names the inline-code switch when the name ends at it', () => {
+    expect(classifyCommand('cmd/c del x', { dialect: 'cmd' }).reason).toContain('Inline code via "cmd /c"');
+  });
+
+  it('keeps a quoted forward-slash path whole', () => {
+    expect(classifyCommand('"C:/Git/bin/bash.exe" -c "rm x"', { dialect: 'cmd' }).tier).toBe('refuse');
+  });
+
+  it.each([
+    "cat <<EOF\n'\nEOF\nrm -rf ~ #'",
+    'cat <<EOF\n"\nEOF\nrm -rf ~ #"',
+    "cat <<'EOF'\n'\nEOF\nrm -rf ~ #'",
+    "cat <<-EOF\n\t'\n\tEOF\nrm -rf ~ #'",
+    "cat <<A <<B\n'\nA\n'\nB\nrm -rf ~ #'",
+    'cat <<EOF\n$(rm -rf ~)\nEOF',
+    'cat <<EOF\n`rm -rf ~`\nEOF',
+    'cat <<EOF\nhello',
+  ])('reads a top-level here-document body as data, not commands: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it('leaves a here-document body alone once it ends', () => {
+    expect(classifyCommand("cat <<'EOF'\n$(rm -rf ~); rm x\nEOF").tier).toBe('auto');
+    expect(classifyCommand('cat <<EOF\nrm -rf ~\nEOF').tier).toBe('auto');
+    expect(classifyCommand('cat <<EOF\n$(npm test)\nEOF\ngit status')).toEqual({ tier: 'ask', scope: 'npm test' });
+  });
+
+  it('says why a here-document or comment inside a substitution is refused', () => {
+    for (const cmd of ['echo "$(echo # )\nrm -rf ~)"', 'echo "$(cat <<EOF\n(\nEOF\n)"']) {
+      const { reason } = classifyCommand(cmd);
+      expect(reason).not.toContain('Unterminated');
+      expect(reason).toMatch(/here-document|comment/);
+    }
+  });
+});
