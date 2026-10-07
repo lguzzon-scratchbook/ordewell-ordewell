@@ -496,6 +496,35 @@ describe('processQueuedMessages while it drains', () => {
     answer.resolve({ pendingTasks: [t1], message: 'ok' });
     await draining;
   });
+
+  it.each([
+    ['answers', (answer: ReturnType<typeof held<{ pendingTasks: LegacyPlanState['tasks']; message: string }>>, t1: LegacyPlanState['tasks'][number]) => answer.resolve({ pendingTasks: [{ ...t1, title: 'Edited for the old plan' }], message: 'ok' })],
+    ['fails', (answer: ReturnType<typeof held<{ pendingTasks: LegacyPlanState['tasks']; message: string }>>) => answer.resolve(Promise.reject(new Error('planner down')) as never)],
+  ] as const)('discards what the planner %s for a plan swapped out while it drained', async (_what, settle) => {
+    const { runner, spawnedIds } = recordingRunner();
+    const answer = held<{ pendingTasks: LegacyPlanState['tasks']; message: string }>();
+    const planner = { modifyDuringExecution: vi.fn().mockReturnValue(answer.promise) };
+    const onNotice = vi.fn();
+    const t1 = createTask({ id: 't1', order: 1, title: 'Task 1', prompt: 'do it' });
+    const session = makeSession({ runner, planner, onNotice });
+    session.loadPlan(plan([t1]), 'Test', '/repo');
+    queue(session, 'an edit');
+
+    const draining = session.processQueuedMessages();
+    await vi.waitFor(() => expect(planner.modifyDuringExecution).toHaveBeenCalledTimes(1));
+    const adopted = plan([createTask({ id: 't1', order: 1, title: 'Other plan', prompt: 'other' })]);
+    session.loadPlan(adopted, 'Other', '/repo');
+    saves(session).mockClear();
+    settle(answer, t1);
+    await draining;
+
+    expect(taskOf(session, 't1')!.title).toBe('Other plan');
+    expect(session.planState).toBe(adopted);
+    expect(adopted.conversationHistory ?? []).toEqual([]);
+    expect(saves(session)).not.toHaveBeenCalled();
+    expect(onNotice).not.toHaveBeenCalled();
+    expect(spawnedIds()).toEqual([]);
+  });
 });
 
 describe('Session phase transitions', () => {

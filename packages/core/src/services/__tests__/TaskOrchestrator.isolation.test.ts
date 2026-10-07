@@ -1487,4 +1487,29 @@ describe('TaskOrchestrator — a verdict whose settling throws', () => {
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(orchestrator.hasLiveWork).toBe(false);
   });
+
+  it('leaves no unhandled rejection when saying the failure throws too', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const isolation = new FakeWorktreeIsolation();
+      const { orchestrator, notifications, pass } = setup({ isolation });
+      const deploy = task('o1', 1, { ops: true });
+      orchestrator.loadPlan([deploy, task('t2', 2, { dependencies: ['o1'] })]);
+      await orchestrator.approveReview();
+      isolation.isActive = async () => { throw new Error('git exploded'); };
+      vi.mocked(notifications.error).mockImplementation(() => { throw new Error('surface gone'); });
+
+      pass(deploy);
+
+      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('git exploded'), expect.anything()));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      errorSpy.mockRestore();
+    }
+  });
 });

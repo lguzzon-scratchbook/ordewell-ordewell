@@ -1031,8 +1031,9 @@ export class Session {
 
   async approveReview(): Promise<LegacyPlanState> {
     if (!this.plan) throw new NoPlanError('review');
-    await this.orchestrator.approveReview();
-    return this.plan;
+    const plan = this.plan;
+    await this.withSave(() => this.orchestrator.approveReview());
+    return plan;
   }
 
   async forceStartTask(taskId: string): Promise<void> {
@@ -1053,7 +1054,7 @@ export class Session {
 
   /** Start whatever the scheduler can now fit — after the parallel limit was raised mid-run, say. */
   async reschedule(): Promise<void> {
-    await this.orchestrator.tick();
+    await this.withSave(() => this.orchestrator.tick());
   }
 
   async retryTask(taskId: string): Promise<void> {
@@ -1092,39 +1093,45 @@ export class Session {
   async processQueuedMessages(): Promise<void> {
     if (this.queueDrain) return this.queueDrain;
     if (this.orchestrator.getQueuedMessages().length === 0) return;
+    const plan = this.plan;
     this.queueDrain = this.drainQueue();
     try {
       await this.queueDrain;
     } finally {
       this.queueDrain = null;
     }
+    // The run it parked belonged to the plan that was swapped out.
+    if (this.plan !== plan) return;
 
     // Re-schedule. `onQueueReady` only fires when no task is active, so a paused
     // run still has `running === true` — `start()` would no-op (it early-returns
     // when already running). Ticking directly spawns the dependents that became
     // ready after reconcile. `start()` covers the halted case (`running === false`,
     // e.g. a retry that cleared the queue), re-entering approval-free.
-    if (this.orchestrator.isRunning) {
-      await this.orchestrator.tick();
-    } else {
-      await this.orchestrator.start();
-    }
+    await this.withSave(() => (this.orchestrator.isRunning ? this.orchestrator.tick() : this.orchestrator.start()), { background: true });
   }
 
   private async drainQueue(): Promise<void> {
-    for (let messages = this.orchestrator.getQueuedMessages(); messages.length > 0; messages = this.orchestrator.getQueuedMessages()) {
+    const plan = this.plan;
+    for (let messages = this.orchestrator.getQueuedMessages(); messages.length > 0 && this.plan === plan; messages = this.orchestrator.getQueuedMessages()) {
       for (const m of messages) this.drainingIds.add(m.id);
       try {
         await this.applyQueuedEdits(messages);
       } finally {
-        // Already gone unless no plan was left to apply them to; never drained twice.
-        for (const m of messages) this.orchestrator.removeQueuedMessage(m.id);
+        // Already gone unless no plan was left to apply them to; never drained
+        // twice. A successor plan's queue is its own, even under the same ids.
+        if (this.plan === plan) for (const m of messages) this.orchestrator.removeQueuedMessage(m.id);
         this.drainingIds.clear();
       }
     }
   }
 
   private async applyQueuedEdits(messages: QueuedMessage[]): Promise<void> {
+    const plan = this.plan;
+    // Like a planner turn's, the answer is to the plan it was asked about: one
+    // that settles after that plan was swapped out is dropped, not reconciled
+    // into its successor.
+    const stale = () => this.plan !== plan;
     // Taken off with the plan change they made, so the saved queue goes with
     // the live one — or a reload restores the edit and it is applied twice.
     const dequeue = () => {
@@ -1161,6 +1168,7 @@ export class Session {
         perRunnerAllowlist: modelAllowlist,
         isolatedExecution: await this.runs.plannerLayout(),
       });
+      if (stale()) return;
 
       this.mutatePlan(() => {
         dequeue();
@@ -1170,6 +1178,7 @@ export class Session {
         return true;
       });
     } catch (err) {
+      if (stale()) return;
       // The edit is lost either way; the run must not be. Left unticked, a run
       // parked behind the queue stays parked with nothing left to wake it.
       const reason = err instanceof Error ? err.message : String(err);
@@ -1228,15 +1237,15 @@ export class Session {
   }
 
   forceSendQueuedTaskMessage(taskId: string, id: string): boolean {
-    return this.orchestrator.forceSendQueuedTaskMessage(taskId, id);
+    return this.saved(() => this.orchestrator.forceSendQueuedTaskMessage(taskId, id), { background: true });
   }
 
   removeQueuedTaskMessage(taskId: string, id: string): boolean {
-    return this.orchestrator.removeQueuedTaskMessage(taskId, id);
+    return this.saved(() => this.orchestrator.removeQueuedTaskMessage(taskId, id), { background: true });
   }
 
   async interruptTask(taskId: string): Promise<void> {
-    await this.orchestrator.interruptTask(taskId);
+    await this.withSave(() => this.orchestrator.interruptTask(taskId), { background: true });
   }
 
   getQueuedMessages(): QueuedMessage[] { return this.orchestrator.getQueuedMessages(); }
@@ -1299,7 +1308,7 @@ export class Session {
   async mergeRun(): Promise<IsolationMergeResult> {
     // Ahead of the ops refusal: with no run there is nothing to merge once the ops task ends either.
     this.runs.requireRun();
-    const result = await this.orchestrator.mergeRun();
+    const result = await this.withSave(() => this.orchestrator.mergeRun());
     this.broadcast({ type: 'isolation_merge', result });
     return result;
   }
@@ -1341,13 +1350,16 @@ export class Session {
    * a hold would stall every task's status for as long, and an
    * `execution_complete` the control triggers would overtake the status held
    * back — which a surface treats as the end of the stream. Instead each status
-   * announced while one runs is saved first (see {@link observer}).
+   * announced while one runs is saved first (see {@link observer}), as the
+   * background save of an execution event: it may land mid planner turn. So
+   * is the last one where the control is itself execution, not the user's
+   * word on the plan (`background`).
    */
-  private async withSave<T>(op: () => Promise<T>): Promise<T> {
+  private async withSave<T>(op: () => Promise<T>, opts: { background?: boolean } = {}): Promise<T> {
     this.controlsInFlight++;
     try {
       const result = await op();
-      this.persist();
+      this.persist(opts);
       return result;
     } finally {
       this.controlsInFlight--;
@@ -1355,7 +1367,7 @@ export class Session {
   }
 
   private saveForControl(): void {
-    if (this.controlsInFlight > 0) this.persist();
+    if (this.controlsInFlight > 0) this.persist({ background: true });
   }
 
   /** A control that finishes synchronously: its status is held until it is saved. */

@@ -180,6 +180,24 @@ describe('IsolationRunController', () => {
       expect(await runs.continueBlocked('stash')).toBeNull();
     });
 
+    it('says how to get stashed changes back when an interrupt lands while the stash runs', async () => {
+      const isolation = new FakeWorktreeIsolation();
+      isolation.availability = { active: false, reason: 'dirty', repos: ['api'] };
+      const { runs, listener } = setup(isolation);
+      await runs.decide(async () => undefined);
+      let stashed!: () => void;
+      const gate = new Promise<void>((resolve) => { stashed = resolve; });
+      const stash = isolation.stash.bind(isolation);
+      isolation.stash = async (root) => { await gate; return stash(root); };
+
+      const continuing = runs.continueBlocked('stash');
+      runs.interrupt();
+      stashed();
+
+      expect(await continuing).toBeNull();
+      expect(listener.notice).toHaveBeenCalledWith('info', expect.stringContaining('`git stash pop` in each brings them back'));
+    });
+
     it('drops the parked start on an interrupt', async () => {
       const isolation = new FakeWorktreeIsolation();
       isolation.availability = { active: false, reason: 'dirty' };
@@ -263,6 +281,35 @@ describe('IsolationRunController', () => {
       expect(await stale).toBe(false);
       expect(await next).toBe(true);
       expect(runs.isolating).toBe(true);
+    });
+
+    it('an activation interrupted while minting neither installs its run nor leaves it behind', async () => {
+      const isolation = new FakeWorktreeIsolation();
+      let minted!: () => void;
+      const gate = new Promise<void>((resolve) => { minted = resolve; });
+      const startRun = isolation.startRun.bind(isolation);
+      let mints = 0;
+      isolation.startRun = async (root) => {
+        const run = await startRun(root);
+        if (++mints === 1) await gate;
+        return run;
+      };
+      const discarded: string[] = [];
+      const discard = isolation.discard.bind(isolation);
+      isolation.discard = async (run, opts) => { discarded.push(run.id); return discard(run, opts); };
+      const { runs } = setup(isolation);
+
+      const stale = runs.decide(async () => undefined);
+      await vi.waitFor(() => expect(mints).toBe(1));
+      runs.interrupt();
+      expect(await runs.decide(async () => undefined)).toBe(true);
+      expect(runs.current?.id).toBe('run2');
+      minted();
+
+      expect(await stale).toBe(false);
+      expect(runs.current?.id).toBe('run2');
+      expect(runs.isolating).toBe(true);
+      expect(discarded).toEqual(['run1']);
     });
 
     it('forgets a settled run once everything merged into the checked-out branch', async () => {
