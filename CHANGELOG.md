@@ -8,6 +8,24 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stop ends everything a task started.** On Linux and macOS, stopping a task
+  used to signal only the runner's own process, so the shells, MCP servers,
+  test runs and dev servers it had started kept running. A runner now gets a
+  process group of its own and Stop signals the whole group; quitting
+  Ordewell, or pressing Ctrl-C in the terminal it runs in, does the same.
+- **A runner that fails to start no longer stays running.** A Codex app-server
+  whose handshake failed or timed out, or an OpenCode server that never
+  became ready, was left running with nothing attached to it.
+- **Non-ASCII output survives.** A character split across two reads of a
+  runner's output turned into `�` in the task log and in error messages.
+- **A reply to a runner that just exited no longer crashes the daemon** on the
+  terminal transport.
+- **Terminal-transport runners no longer inherit `CLAUDECODE` or Node debugging
+  flags** from the process that started Ordewell, matching the structured
+  transport. A workspace that sets one on purpose still passes it.
+
 ## [0.7.1] — 2026-10-06
 
 ### Added

@@ -149,7 +149,7 @@ describe('CodexAdapter task start', () => {
     await expect(adapter.start(taskStart('agent', { resumeSessionId: 'thr-codex-1' }))).rejects.toThrow('thread thr-codex-1 not found');
     expect(sentNamed(spawned.processes[0].written, 'thread/start')).toHaveLength(0);
     expect(adapter.nativeSessionId()).toBeNull();
-    adapter.dispose();
+    expect(spawned.processes[0].killed).toBe(true);
   });
 });
 
@@ -187,7 +187,8 @@ describe('CodexAdapter task sandbox', () => {
     await expect(started).rejects.toThrow(/run the task again/);
     await expect(started).rejects.not.toThrow(/plan/i);
     expect(sentNamed(spawned.processes[0]?.written ?? [], 'thread/start')).toHaveLength(0);
-    adapter.dispose();
+    // Refused before any thread existed, the app-server is no use to anyone.
+    expect(spawned.processes[0].killed).toBe(true);
   });
 
   it('runs a full-access task anyway, since it asks for no sandbox', async () => {

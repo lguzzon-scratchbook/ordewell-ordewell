@@ -1,9 +1,10 @@
 import type { ChildProcess } from 'child_process';
 import { randomBytes } from 'crypto';
+import { StringDecoder } from 'string_decoder';
 import { augmentedPath } from '../../utils/shellPath';
 import { planDirectLaunch, isExecutableResolved, ExecutableNotFoundError } from '../../utils/launch';
 import { assertWorkspaceExists } from '../../utils/workspace';
-import { killTree } from '../../utils/processTree';
+import { killTree, spawnInOwnGroup } from '../../utils/processTree';
 import { workspaceEnvOf } from '../workspaceEnv';
 import { runnerEnv } from './runnerEnv';
 import { OpenCodeV2 } from './OpenCodeV2';
@@ -20,6 +21,8 @@ import type { AgentEvent, AgentProcessDeps, AgentStartOptions, PlannerStartOptio
 
 const SERVER_READY_TIMEOUT_MS = 30000;
 const STDERR_TAIL_CHARS = 4000;
+/** The banner is one short line; a longer unterminated one is not it, and is not kept growing. */
+const BANNER_LINE_CHARS = 4000;
 /** See {@link OpenCodeAdapter.recoverReply}. */
 const RECOVERY_POLL_INTERVAL_MS = 2000;
 const RECOVERY_TIMEOUT_MS = 900000;
@@ -286,6 +289,18 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
   constructor(private deps: AgentProcessDeps) {}
 
   async start(opts: AgentStartOptions): Promise<void> {
+    try {
+      await this.launch(opts);
+    } catch (err) {
+      // Neither caller keeps an adapter whose start threw, so a server left
+      // running here — one that never announced itself, or would not open a
+      // session — has no owner.
+      this.dispose();
+      throw err;
+    }
+  }
+
+  private async launch(opts: AgentStartOptions): Promise<void> {
     if (opts.kind === 'task') this.task = opts;
     else this.planner = opts;
     // Checked before anything else: a workspace deleted out from under a
@@ -318,7 +333,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
       console.error('[opencode] OPENCODE_CONFIG_CONTENT is not a JSON object, so the Ordewell tools were not injected.');
     }
     this.ordewell = ordewellConfig === null ? null : opts.mcp ?? null;
-    this.process = this.deps.spawn(launch.file, launch.args, {
+    this.process = spawnInOwnGroup((detached) => this.deps.spawn(launch.file, launch.args, {
       env: runnerEnv(PATH, {
         ...workspaceEnv,
         ...(ordewellConfig === null ? {} : { OPENCODE_CONFIG_CONTENT: ordewellConfig }),
@@ -328,37 +343,51 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd: opts.cwd,
       windowsVerbatimArguments: launch.verbatim,
-    });
+      detached,
+    }), this.deps.platform);
     this.authorization = `Basic ${Buffer.from(`${SERVER_USERNAME}:${password}`).toString('base64')}`;
     // Nothing is written here today, but an EPIPE on an unheard pipe crashes
     // the host, and the exit path already reports a dead server.
     this.process.stdin?.on('error', () => {});
 
+    const proc = this.process;
     const banner = new Promise<string | null>((resolve) => {
-      let seen = '';
+      // Stdout only: that is where `serve` prints its address, and stderr can
+      // carry another URL — a warning about a provider it could not reach.
+      // Read a line at a time, and only until the address is known.
+      const stdoutText = new StringDecoder('utf8');
+      let partial = '';
+      const settle = (url: string | null) => {
+        proc.stdout?.removeListener('data', scan);
+        clearTimeout(timer);
+        resolve(url);
+      };
       const scan = (chunk: Buffer) => {
-        seen += chunk.toString();
-        const match = seen.match(/https?:\/\/[^\s]+/);
-        if (match) resolve(match[0].replace(/[.,)]$/, ''));
+        const lines = (partial + stdoutText.write(chunk)).split('\n');
+        partial = lines.pop()!.slice(-BANNER_LINE_CHARS);
+        for (const line of lines) {
+          const match = line.match(/https?:\/\/[^\s]+/);
+          if (match) return settle(match[0].replace(/[.,)]$/, ''));
+        }
       };
       const ended = (code: number) => {
         if (this.exited) return;
         this.exited = true;
         this.exitCode = code;
         this.markEnded();
-        resolve(null);
+        settle(null);
       };
-      this.process!.stdout?.on('data', scan);
-      this.process!.stderr?.on('data', (chunk: Buffer) => {
-        this.stderrTail = (this.stderrTail + chunk.toString()).slice(-STDERR_TAIL_CHARS);
-        scan(chunk);
+      const stderrText = new StringDecoder('utf8');
+      proc.stdout?.on('data', scan);
+      proc.stderr?.on('data', (chunk: Buffer) => {
+        this.stderrTail = (this.stderrTail + stderrText.write(chunk)).slice(-STDERR_TAIL_CHARS);
       });
-      this.process!.on('exit', (code) => ended(code ?? -1));
-      this.process!.on('error', (err) => {
+      proc.on('exit', (code) => ended(code ?? -1));
+      proc.on('error', (err) => {
         this.stderrTail = (this.stderrTail + `\n${err.message}`).slice(-STDERR_TAIL_CHARS);
         ended(-1);
       });
-      const timer = setTimeout(() => resolve(null), SERVER_READY_TIMEOUT_MS);
+      const timer = setTimeout(() => settle(null), SERVER_READY_TIMEOUT_MS);
       timer.unref?.();
     });
 
@@ -376,12 +405,7 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
         isExited: () => this.exited,
         exitMessage: () => this.exitMessage(),
       }, { ...opts, mcp: this.ordewell ?? undefined }, this.role());
-      try {
-        await this.v2.start();
-      } catch (err) {
-        this.dispose();
-        throw err;
-      }
+      await this.v2.start();
       this.sessionId = this.v2.nativeSessionId();
       return;
     }
@@ -404,7 +428,6 @@ export class OpenCodeAdapter implements TaskModeAgentAdapter {
       // without its session would run the message against none of the work
       // it continues, so it fails instead.
       if (opts.kind === 'task') {
-        this.dispose();
         throw new Error(`OpenCode could not resume session ${opts.resumeSessionId}: the server does not know it.`);
       }
     }

@@ -329,16 +329,6 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
     this.mcpConfig = null;
   }
 
-  async start(opts: AgentStartOptions): Promise<void> {
-    try {
-      await super.start(opts);
-    } catch (err) {
-      // No process was spawned, so none will end and take the file with it.
-      this.removeMcpConfig();
-      throw err;
-    }
-  }
-
   /** Asks the CLI itself, which reports `pending` until its connection attempt settles. */
   async mcpAttached(): Promise<boolean> {
     if (!this.mcpConfig) return false;

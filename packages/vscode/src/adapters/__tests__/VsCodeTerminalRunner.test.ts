@@ -23,7 +23,8 @@ function manifest(overrides: Partial<RunnerPluginManifest['runner']> = {}): Runn
 class FakeChildProcess extends EventEmitter {
   stdout = new EventEmitter();
   stderr = new EventEmitter();
-  stdin = { write: vi.fn() };
+  // An emitter, as a real pipe is: the session listens for its EPIPE.
+  stdin = Object.assign(new EventEmitter(), { write: vi.fn() });
   /** fd 3: the PTY control channel, present when the spawn used a 4th pipe. */
   stdio: Array<unknown> = [
     this.stdin,

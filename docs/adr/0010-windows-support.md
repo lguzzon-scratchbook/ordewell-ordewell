@@ -169,7 +169,8 @@ nothing there.
   shim rather than the agent — so terminating it left the agent running, holding
   the workspace and the subscription, invisible to the surface that thought it
   had stopped. `taskkill /T` walks the tree; POSIX keeps its SIGTERM → SIGKILL
-  escalation unchanged. Every dispose path means `ModelDiscovery`'s too: its
+  escalation, sent to the runner's process group (see CONTEXT.md, *Kill
+  tree*). Every dispose path means `ModelDiscovery`'s too: its
   Codex app-server probe held the one remaining bare `kill()`, so a discovery
   call against a shim install left the app-server holding its port after the
   call that started it had returned.
@@ -247,3 +248,4 @@ measured on a Windows host; the rest has not been run on one.
 ## History
 
 - 2026-07-31 — accepted, with an amendment from the first run on a Windows host (OpenCode installed by npm): the batch route's line-break truncation found and routed around, PowerShell `-File` fidelity measured.
+- 2026-10-07 — POSIX stop signals the runner's process group rather than the direct child.

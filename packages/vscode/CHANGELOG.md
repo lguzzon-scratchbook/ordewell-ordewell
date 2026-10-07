@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stop ends everything a task started.** On Linux and macOS, closing or
+  stopping a task used to signal only the runner's own process, so the shells,
+  MCP servers, test runs and dev servers it had started kept running. The whole
+  process group is now signalled.
+- **A runner that fails to start no longer stays running**, and non-ASCII
+  output split across two reads no longer turns into `�`.
+
 ## [0.7.1] — 2026-10-06
 
 ### Added

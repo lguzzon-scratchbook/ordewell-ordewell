@@ -130,6 +130,18 @@ describe('TmuxRunner', () => {
     expect(shellCmd).toContain(`CLAUDE_CONFIG_DIR='/home/me/it'\\''s work'`);
   });
 
+  // The window inherits the tmux server's environment, which is the daemon's:
+  // a daemon started from inside Claude Code would otherwise hand its runner
+  // `CLAUDECODE`, which `claude` reads as being nested in that session.
+  it("unsets the host's nesting and debugging variables, then applies the workspace's", async () => {
+    const runner = makeRunner();
+    await runner.spawn({ ...baseOpts(manifest()), env: { NODE_OPTIONS: '--max-old-space-size=8192' } });
+
+    const shellCmd = tmuxCalls().find(([, args]) => args[0] === 'new-window')![1][7];
+    expect(shellCmd.startsWith(`env -u CLAUDECODE -u NODE_OPTIONS -u NODE_INSPECT -u NODE_DEBUG `)).toBe(true);
+    expect(shellCmd).toContain(`NODE_OPTIONS='--max-old-space-size=8192'`);
+  });
+
   it('marks its session interactive so resume tokens submit with Enter, not just type', async () => {
     const session = await makeRunner().spawn(baseOpts(manifest()));
     expect(session.interactive).toBe(true);
