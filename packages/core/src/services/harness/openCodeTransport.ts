@@ -4,6 +4,7 @@ import type { ApprovalDecision } from '../../interfaces/IApproval';
 import type { McpClientConfig } from '../mcp';
 import { LineBuffer, type AgentEvent, type TaskStartOptions } from './AgentAdapter';
 import { OPENCODE_ORDEWELL } from './openCodeOrdewell';
+import { settleWithin } from './settleWithin';
 
 /**
  * The HTTP protocol work OpenCode's two server APIs share: 1.x (`/event`,
@@ -407,11 +408,7 @@ export async function settleTurn(turn: TurnLatch, how: TurnSettlement, onEvent: 
 
 /** Whether a posted interrupt is acknowledged: the turn ends before the server does and before `timeoutMs`. */
 export async function interruptAcknowledged(turn: TurnLatch, processEnded: Promise<void>, timeoutMs: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timedOut = new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); timer.unref?.(); });
-  const acknowledged = await Promise.race([turn.ended.then(() => true), processEnded.then(() => false), timedOut]);
-  clearTimeout(timer);
-  return acknowledged;
+  return settleWithin(turn.ended.then(() => true), { timeoutMs, ended: processEnded, onTimeout: () => false, onEnded: () => false });
 }
 
 /**
@@ -430,7 +427,7 @@ export async function openEventStream<F>(
   let connected: () => void = () => {};
   const ready = new Promise<void>((resolve) => { connected = resolve; });
   const live = streamEvents(connect, streamAbort.signal, onFrame, connected, onActivity);
-  await Promise.race([ready, new Promise<void>((r) => { const t = setTimeout(r, STREAM_CONNECT_TIMEOUT_MS); t.unref?.(); })]);
+  await settleWithin(ready, { timeoutMs: STREAM_CONNECT_TIMEOUT_MS, onTimeout: () => undefined });
   return async () => {
     streamAbort.abort();
     await live.catch(() => { /* the stream is best-effort */ });

@@ -17,6 +17,7 @@ import { AbstractRunner, AbstractTerminalSession, type RunnerSpawnOptions } from
 import type { AgentEvent, AgentProcessDeps, TaskModeAgentAdapter, TaskStartOptions } from './harness/AgentAdapter';
 import { mapAgentTool, normalizeAgentArgs } from './harness/agentTools';
 import { createTaskAdapter, takesOrdewellTools } from './harness/connectors';
+import { settleWithin } from './harness/settleWithin';
 
 /** How long a soft interrupt may take before the runner is killed and resumed instead. */
 const DEFAULT_INTERRUPT_GRACE_MS = 5000;
@@ -428,10 +429,7 @@ export class StructuredSession extends AbstractTerminalSession implements Struct
     const ended = new Promise<void>((resolve) => this.structuredEmitter.once('turnEnd', () => resolve()));
     if (await adapter.interrupt(grace)) {
       // Acknowledged, but the turn only ends with its result line.
-      const settled = await Promise.race([
-        ended.then(() => true),
-        new Promise<boolean>((resolve) => { const t = setTimeout(() => resolve(false), grace); t.unref?.(); }),
-      ]);
+      const settled = await settleWithin(ended.then(() => true), { timeoutMs: grace, onTimeout: () => false });
       if (settled) return;
     }
     if (turn.ended || this.exited) return;

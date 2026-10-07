@@ -833,7 +833,8 @@ describe('CliAgentAiService — Codex', () => {
       () => { controller.abort(); },
       fixture('codex', 'handshake'),
       fixture('codex', 'resume-rejected'),
-      fixture('codex', 'new-conversation'),
+      // The fallback is the connection's third request, so Codex answers it under id 3.
+      fixture('codex', 'new-conversation').replace('"id":2,', '"id":3,'),
       fixture('codex', 'tools'),
     ]);
     await svc.startConversation(request({ runners: ['codex'], signal: controller.signal }));

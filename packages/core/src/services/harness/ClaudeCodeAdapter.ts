@@ -8,6 +8,7 @@ import { StdioAgentAdapter, type SpawnSpec } from './StdioAgentAdapter';
 import { markedLines, structuredPatchText } from './fileDiff';
 import { ORDEWELL_MCP_SERVER_NAME, type McpClientConfig, type OwnerOnlyFile } from '../mcp';
 import { CLAUDE_ORDEWELL } from './claudeOrdewell';
+import { settleWithin } from './settleWithin';
 import { awaitAttach, type OrdewellToolRole } from './ordewellBinding';
 
 /**
@@ -371,18 +372,10 @@ export class ClaudeCodeAdapter extends StdioAgentAdapter implements TaskModeAgen
     if (!this.process) return Promise.resolve(null);
     this.controlCount += 1;
     const requestId = `ordewell-${request.subtype}-${this.controlCount}`;
-    return new Promise<ControlResponse | null>((resolve) => {
-      const settle = (response: ControlResponse | null) => {
-        if (!this.pendingControl.delete(requestId)) return;
-        clearTimeout(timer);
-        resolve(response);
-      };
-      const timer = setTimeout(() => settle(null), timeoutMs);
-      timer.unref?.();
-      this.pendingControl.set(requestId, settle);
-      void this.processEnded.then(() => settle(null));
-      this.writeLine({ type: 'control_request', request_id: requestId, request });
-    });
+    const answered = new Promise<ControlResponse | null>((resolve) => { this.pendingControl.set(requestId, resolve); });
+    this.writeLine({ type: 'control_request', request_id: requestId, request });
+    return settleWithin(answered, { timeoutMs, ended: this.processEnded, onTimeout: () => null, onEnded: () => null })
+      .finally(() => { this.pendingControl.delete(requestId); });
   }
 
   /**
