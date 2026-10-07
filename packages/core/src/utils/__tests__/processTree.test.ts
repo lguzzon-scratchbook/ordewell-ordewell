@@ -171,7 +171,23 @@ describe('killTree on a runner that leads its own process group', () => {
 
     expect(h.isScheduled()).toBe(true);
     h.fireHardKill();
-    expect(signals).toEqual([[-UNUSED_PID, 'SIGTERM'], [-UNUSED_PID, 'SIGKILL']]);
+    expect(signals).toEqual([[-UNUSED_PID, 'SIGTERM'], [-UNUSED_PID, 0], [-UNUSED_PID, 'SIGKILL']]);
+  });
+
+  it('drops the escalation when the leader exits and nothing is left in its group', () => {
+    const { child, signals } = leader();
+    const h = harness({
+      platform: 'linux',
+      killImpl: (pid, signal) => {
+        signals.push([pid, signal]);
+        if (signal === 0) throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+      },
+    });
+    killTree(child as unknown as ChildProcess, h.deps);
+    child.emit('exit', null, 'SIGTERM');
+
+    expect(h.isScheduled()).toBe(false);
+    expect(signals).toEqual([[-UNUSED_PID, 'SIGTERM'], [-UNUSED_PID, 0]]);
   });
 
   it('falls back to the direct child when the group cannot be signalled', () => {

@@ -12,6 +12,7 @@ vi.mock('openai', () => ({
 }));
 
 import { OpenAiService } from '../OpenAiService';
+import { PlannerTurnStoppedError } from '../PlannerConversation';
 
 /**
  * The OpenAI-compatible planner streaming a turn to the surfaces (#48), end to
@@ -185,7 +186,7 @@ describe('OpenAI planner reply stream', () => {
     await session.startPlanning('add persistence', ['claude-code']);
     const firstTurn = streamed().length;
 
-    await expect(session.continueConversation('postgres', { signal: stop.signal })).rejects.toThrow('aborted');
+    await expect(session.continueConversation('postgres', { signal: stop.signal })).rejects.toThrow(PlannerTurnStoppedError);
 
     const sent = streamed().slice(firstTurn);
     const turnId = turnIdOf(sent);

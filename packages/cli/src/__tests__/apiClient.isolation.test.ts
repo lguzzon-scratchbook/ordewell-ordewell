@@ -117,4 +117,36 @@ describe('ApiClient.streamExecution and a blocked run', () => {
     expect(second).toEqual(['notice', 'execution_complete']);
     wss.close();
   });
+
+  it('resolves lost, not rejects, when the socket errors after it opened', async () => {
+    const { wss, client } = await server((ws) => {
+      setTimeout(() => ws.terminate(), 20);
+    });
+    const ready = vi.fn();
+
+    await expect(client.streamExecution('s1', () => {}, ready)).resolves.toBe('lost');
+
+    expect(ready).toHaveBeenCalledWith();
+    wss.close();
+  });
+
+  it('closes only the stream it is handed, not a newer one on the same session', async () => {
+    const sockets: import('ws').WebSocket[] = [];
+    const { wss, client } = await server((ws) => { sockets.push(ws); });
+    const first = client.streamExecution('s1', () => {});
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    const second = client.streamExecution('s1', () => {});
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    await first;
+
+    client.closeExecutionStream(first);
+    let secondSettled = false;
+    void second.then(() => { secondSettled = true; });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(secondSettled).toBe(false);
+
+    client.closeExecutionStream(second);
+    await second;
+    wss.close();
+  });
 });

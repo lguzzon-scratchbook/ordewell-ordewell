@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import {
   Session, LegacyPlanState, Task, flattenTasks, RunnerId, DiscoveredModel, enabledRunners,
   saveState, clearState, ModelResolver, RunnerRegistry, isCliProvider, taskStartedNotice,
-  createEmptyPlan, markRequestFor, pastGateConfirmation, titledRefs, PlannerTurnDiscardedError, type INotification, type ITerminalRunner, type TaskRowAction,
+  createEmptyPlan, markRequestFor, pastGateConfirmation, titledRefs, PlannerTurnDiscardedError, PlannerTurnStoppedError, type INotification, type ITerminalRunner, type TaskRowAction,
 } from '@ordewell/core';
 import type { TaskDraft, TaskEdit } from '../shared/protocol';
 import type { ChatViewProvider } from '../providers/ChatViewProvider';
@@ -86,8 +86,9 @@ export function finishPlannerTurn(
 
 export function reportPlannerError(err: unknown, deps: PlanManagerDeps): void {
   // Message text is not evidence: a real failure can mention "aborted" (a
-  // runner's "transaction aborted"). Only an abort error's identity counts.
-  const isAbort = err instanceof PlannerTurnDiscardedError || (err instanceof Error && (
+  // runner's "transaction aborted"). Only an abort error's identity counts; a
+  // stop whose backend error is not named as one arrives as PlannerTurnStoppedError.
+  const isAbort = err instanceof PlannerTurnDiscardedError || err instanceof PlannerTurnStoppedError || (err instanceof Error && (
     err.name === 'AbortError' ||
     err.name === 'APIUserAbortError'
   ));

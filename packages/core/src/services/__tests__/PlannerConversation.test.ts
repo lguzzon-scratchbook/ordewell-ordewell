@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { createTask, type LegacyPlanState } from '../../models/Task';
 import type { SessionMessage } from '../SessionMessage';
 import type { ConversationTurn, IAiService } from '../AiService';
-import { ConversationBusyError, ConversationEditError, PlannerConversation, PlannerTurnDiscardedError, type PlannerConversationHost } from '../PlannerConversation';
+import { ConversationBusyError, ConversationEditError, PlannerConversation, PlannerTurnDiscardedError, PlannerTurnStoppedError, type PlannerConversationHost } from '../PlannerConversation';
 import type { SaveSession } from '../createSession';
 import { makeSession, testWorkspace, queue } from './sessionTestKit';
 
@@ -754,6 +754,39 @@ describe('PlannerConversation planner turn', () => {
     await turn;
 
     expect(state.plan!.conversationHistory!.at(-1)?.content).toBe('Stopped here.');
+  });
+
+  // The OpenAI SDK's abort error is a plain `Error` by name, so a surface cannot
+  // tell it from a real failure; the turn knows its own stop was the cause.
+  it('settles a stop that the backend reports as a thrown error as stopped, not as a failure', async () => {
+    let fail: (err: Error) => void = () => {};
+    const ai = fakeAi({
+      continueConversation: vi.fn(() => new Promise<ConversationTurn>((_resolve, reject) => { fail = reject; })),
+    });
+    const { conversation, host } = fakeHost(ai, threeTurnPlan());
+
+    const turn = conversation.reply('Also CSV');
+    await vi.waitFor(() => expect(ai.continueConversation).toHaveBeenCalled());
+    conversation.stopTurn();
+    fail(new Error('Request was aborted.'));
+
+    await expect(turn).rejects.toThrow(PlannerTurnStoppedError);
+    expect(ended(host).at(-1)?.outcome).toBe('stopped');
+  });
+
+  it('still reports a real failure when no stop was asked for', async () => {
+    let fail: (err: Error) => void = () => {};
+    const ai = fakeAi({
+      continueConversation: vi.fn(() => new Promise<ConversationTurn>((_resolve, reject) => { fail = reject; })),
+    });
+    const { conversation, host } = fakeHost(ai, threeTurnPlan());
+
+    const turn = conversation.reply('Also CSV');
+    await vi.waitFor(() => expect(ai.continueConversation).toHaveBeenCalled());
+    fail(new Error('Request was aborted.'));
+
+    await expect(turn).rejects.toThrow('Request was aborted.');
+    expect(ended(host).at(-1)?.outcome).toBe('error');
   });
 
   it('frees the conversation the moment a turn is abandoned, and discards the abandoned one when it settles', async () => {

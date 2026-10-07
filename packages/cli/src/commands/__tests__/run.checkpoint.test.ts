@@ -31,3 +31,27 @@ describe('ordewell run when a task asks a checkpoint', () => {
     expect(written.join('')).toContain('· Checkpoint — Migrate the schema: Drop the users table? — `ordewell checkpoint <id> approve|reject [reason]` answers it');
   });
 });
+
+describe('ordewell run when the daemon drops mid-run', () => {
+  it('reports the lost connection and exits non-zero', async () => {
+    const api = {
+      streamExecution: vi.fn((_id: string, _onEvent: unknown, onReady?: (error?: Error) => void) => new Promise<'lost'>((resolve) => {
+        setTimeout(() => onReady?.(), 0);
+        setTimeout(() => resolve('lost'), 5);
+      })),
+      executePlan: vi.fn().mockResolvedValue({ status: 'running' }),
+    } as unknown as ApiClient;
+    const errors: string[] = [];
+    const error = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => { errors.push(args.join(' ')); });
+    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { throw new Error(`exit ${code}`); }) as never);
+
+    try {
+      await expect(handleRun(['--session-id', 's1'], api)).rejects.toThrow('exit 1');
+    } finally {
+      error.mockRestore();
+      exit.mockRestore();
+    }
+
+    expect(errors.join('\n')).toContain('Lost the connection to the daemon');
+  });
+});

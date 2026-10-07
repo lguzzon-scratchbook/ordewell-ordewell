@@ -191,6 +191,8 @@ describe('execution', () => {
     expect(s.busyLabel).toBe('');
     expect(s.tasks.map((t) => t.status)).toEqual(['completed', 'pending']);
     expect(lastMessage(s)?.text).toContain('Lost the connection');
+    expect(lastMessage(s)?.text).not.toContain('Restart the daemon');
+    expect(lastMessage(s)?.text).toContain('/load');
   });
 
   // A run whose last live task is cancelled or marked done can never restart if

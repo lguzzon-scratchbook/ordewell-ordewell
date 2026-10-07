@@ -1758,7 +1758,16 @@ runner no longer hears Ctrl-C, so the host passes SIGINT/SIGTERM/SIGHUP and its
 own exit on to the groups it leads. Windows has no signals and the direct child
 may be a cmd.exe shim rather than the agent, so `taskkill /T` walks the tree;
 without it "stop" terminated the shim and left the agent running, still holding
-the workspace and the subscription.
+the workspace and the subscription. Two limits follow from how a runner is
+started. A detached runner is a session leader (`setsid`) with no controlling
+tty, so anything it does that opens `/dev/tty` — a password or confirmation
+prompt — fails rather than prompting. And an interactive runner wrapped in a
+pty (`wrapWithPty`, via `script`) is a session leader *under* `script`, in a
+group the host never learns the id of: the group signal reaches `script`, and
+the agent's end relies on the pty hangup (SIGHUP to its foreground group), so a
+background job the agent detached can outlive Stop. After the leader exits, the
+SIGKILL follow-up is sent only while the group still has members, since an
+empty group's id may have been recycled.
 *Avoid:* `proc.kill('SIGTERM')` at a dispose site — or a bare `proc.kill()`,
 which was the last one left, in `ModelDiscovery`'s Codex app-server probe.
 

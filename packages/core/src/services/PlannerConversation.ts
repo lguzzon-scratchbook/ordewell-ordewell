@@ -203,6 +203,19 @@ export class PlannerTurnDiscardedError extends Error {
   }
 }
 
+/**
+ * The user stopped the turn and the backend reported that as a thrown error
+ * rather than a settled reply. Typed so a surface can stay quiet for it without
+ * reading the message: some SDKs' abort errors are plain `Error`s by name, and
+ * a real failure can mention "aborted" too.
+ */
+export class PlannerTurnStoppedError extends Error {
+  constructor(options?: ErrorOptions) {
+    super('The planner turn was stopped.', options);
+    this.name = 'PlannerTurnStoppedError';
+  }
+}
+
 /** Width of a rewind target's preview — one picker row, not the whole message. */
 const REWIND_PREVIEW_WIDTH = 80;
 
@@ -742,7 +755,12 @@ export class PlannerConversation {
       outcome = settled.outcome;
       return settled.plan;
     } catch (err) {
-      if (err instanceof PlannerTurnDiscardedError) outcome = 'stopped';
+      if (err instanceof PlannerTurnDiscardedError) {
+        outcome = 'stopped';
+        throw err;
+      }
+      if (planner.abandoned) throw new PlannerTurnDiscardedError();
+      if (planner.signal.aborted) throw new PlannerTurnStoppedError({ cause: err });
       throw err;
     } finally {
       if (this.openTurn === turn) this.openTurn = null;

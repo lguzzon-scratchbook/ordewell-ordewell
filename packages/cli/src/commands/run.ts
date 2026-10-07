@@ -126,7 +126,11 @@ export async function followExecution(
   await start();
   // The stream outlives a block, which has no completion coming; the choice
   // below opens the next one, and that ends this.
-  await Promise.race([stream, blockedSeen]).catch(streamFailed);
+  const outcome = await Promise.race([stream, blockedSeen]).catch(streamFailed);
+  if (outcome === 'lost') {
+    console.error('Lost the connection to the daemon — the run is no longer being followed, but the daemon may still be running it. `ordewell status` shows where it stands.');
+    process.exit(1);
+  }
 
   if (blocked === null) return;
 

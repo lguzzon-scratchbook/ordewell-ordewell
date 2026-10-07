@@ -14,7 +14,11 @@ While Ordewell is pre-1.0, minor versions may contain breaking changes.
   used to signal only the runner's own process, so the shells, MCP servers,
   test runs and dev servers it had started kept running. A runner now gets a
   process group of its own and Stop signals the whole group; quitting
-  Ordewell, or pressing Ctrl-C in the terminal it runs in, does the same.
+  Ordewell, or pressing Ctrl-C in the terminal it runs in, does the same. An
+  interactive (pty-wrapped) task is the exception: its agent runs in a session
+  of its own under `script`, so Stop reaches `script` and relies on the pty
+  hangup to end the agent and its foreground children. A process the agent
+  deliberately detached can outlive Stop.
 - **A runner that fails to start no longer stays running.** A Codex app-server
   whose handshake failed or timed out, or an OpenCode server that never
   became ready, was left running with nothing attached to it.
