@@ -1,5 +1,3 @@
-import { execFile, exec } from 'child_process';
-import { promisify } from 'util';
 import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -26,17 +24,16 @@ import type {
   TreeSnapshot,
 } from '../interfaces/IWorktreeIsolation';
 import type { Task } from '../models/Task';
-import { augmentedPath, withPath } from '../utils/shellPath';
+import { augmentedPath } from '../utils/shellPath';
 import { ensureStateDirIgnored, STATE_DIR } from '../utils/fsHelpers';
 import { sanitizeSlug } from '../utils/prdStore';
 import { absorbRemoval, handoffOf, integrationBranchFor, noRemoval, repoRootOf, SELF_REPO } from './isolationRecord';
-import { linkPath, mirrorDir } from './worktreeLink';
+import { defaultExecFile, git, tryGit, type GitExecFn, type GitInvoker, type GitResult } from './gitExec';
+import { IsolationLocks } from './isolationLocks';
+import { bootstrap, installDirs, isEnvFile, lexists, LINKED_ARTIFACTS, listDir, NEVER_SCANNED } from './worktreeBootstrap';
+import { linkPath } from './worktreeLink';
 
-export type GitExecFn = (
-  file: string,
-  args: string[],
-  opts: { cwd?: string; env: NodeJS.ProcessEnv },
-) => Promise<{ stdout: string; stderr: string }>;
+export type { GitExecFn } from './gitExec';
 
 export interface WorktreeIsolationDeps {
   config: Pick<IConfig, 'worktreeIsolation' | 'worktreeSetupCommand' | 'workspaceRepos' | 'worktreeLinks'>;
@@ -46,31 +43,6 @@ export interface WorktreeIsolationDeps {
   platform?: NodeJS.Platform;
   mintRunId?: () => string;
 }
-
-const execFileAsync = promisify(execFile);
-const execAsync = promisify(exec);
-
-// Generous on purpose: `reviewDiff` returns the whole run's diff in one buffer.
-const MAX_BUFFER = 64 * 1024 * 1024;
-const SETUP_TIMEOUT_MS = 10 * 60 * 1000;
-
-const defaultExecFile: GitExecFn = async (file, args, opts) => {
-  const { stdout, stderr } = await execFileAsync(file, args, { cwd: opts.cwd, env: opts.env, maxBuffer: MAX_BUFFER, windowsHide: true });
-  return { stdout: String(stdout), stderr: String(stderr) };
-};
-
-// A hook or wrapper that runs Ordewell can export these, and they would point
-// every git call at the outer repository instead of the workspace's.
-const INHERITED_GIT_VARS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX', 'GIT_OBJECT_DIRECTORY'];
-
-/**
- * Ignored artifacts worth sharing with a task worktree so it is runnable at
- * once. `.ordewell/` is deliberately not here and never will be: session and
- * skills state stays at the main root where Ordewell owns it, and a runner
- * that could reach it could corrupt it.
- */
-const LINKED_ARTIFACTS = new Set(['node_modules', 'vendor', '.venv', '.claude', '.opencode', '.codegraph', '.envrc']);
-const isEnvFile = (name: string) => name.startsWith('.env');
 
 const INTEGRATION_DIR = 'integration';
 
@@ -87,10 +59,7 @@ const PRESERVED_BRANCHES = 'ordewell-preserved';
 // How far below the workspace root a repository is looked for. Deeper ones are
 // not scanned for: a walk of the whole tree would visit every dependency folder.
 const NESTED_REPO_DEPTH = 2;
-const NEVER_SCANNED = new Set(['.git', STATE_DIR, 'node_modules']);
 const GITLINK_MODE = '160000';
-
-interface GitResult { ok: boolean; stdout: string; stderr: string; code?: string | number }
 
 /** One repo's share of a worktree about to be removed, as {@link GitWorktreeIsolation.preserve} reads it. */
 interface RemovalTarget {
@@ -180,16 +149,8 @@ function sameDir(a: string, b: string): boolean {
   return real(a) === real(b);
 }
 
-function lexists(target: string): boolean {
-  try { fs.lstatSync(target); return true; } catch { return false; }
-}
-
 function resolves(target: string): boolean {
   try { fs.statSync(target); return true; } catch { return false; }
-}
-
-function listDir(dir: string): string[] {
-  try { return fs.readdirSync(dir).sort(); } catch { return []; }
 }
 
 /** An inactive availability naming `repos`; `.` is not a name, so a group of one names none. */
@@ -207,39 +168,6 @@ function groupPathOf(listed: string): string | null {
 }
 
 /**
- * The `worktreeLinks` entries present under `root`, relative to it. `*` and
- * `?` match within one path segment; there is no `**`, so a pattern never
- * walks a whole tree.
- */
-function matchLinks(root: string, patterns: string[]): string[] {
-  const found = new Set<string>();
-  for (const pattern of patterns) {
-    const segments = pattern.replace(/\\/g, '/').split('/').filter((seg) => seg !== '' && seg !== '.');
-    if (segments.length === 0 || segments.includes('..')) continue;
-    let matches = [''];
-    for (const segment of segments) matches = matches.flatMap((base) => segmentMatches(root, base, segment));
-    for (const match of matches) found.add(match);
-  }
-  return [...found];
-}
-
-function segmentMatches(root: string, base: string, segment: string): string[] {
-  const under = (name: string) => (base ? `${base}/${name}` : name);
-  if (!/[*?]/.test(segment)) return lexists(path.join(root, base, segment)) ? [under(segment)] : [];
-  const pattern = new RegExp(`^${segment.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
-  return listDir(path.join(root, base)).filter((name) => !NEVER_SCANNED.has(name) && pattern.test(name)).map(under);
-}
-
-/**
- * The `node_modules` directories under `root`, relative to it: its own and
- * those of the workspace packages its package.json lists.
- */
-function installDirs(root: string): string[] {
-  const packages = matchLinks(root, workspaceGlobs(root)).map((pkg) => `${pkg}/node_modules`);
-  return ['node_modules', ...packages].filter((dir) => lexists(path.join(root, dir)));
-}
-
-/**
  * What a task workspace has linked in, read off the directory when no record
  * says: its links, the artifacts linked into every workspace, and the install
  * directories mirrored there.
@@ -253,34 +181,19 @@ function isLink(target: string): boolean {
   try { return fs.lstatSync(target).isSymbolicLink(); } catch { return false; }
 }
 
-function workspaceGlobs(root: string): string[] {
-  let manifest: unknown;
-  try { manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')); } catch { return []; }
-  if (typeof manifest !== 'object' || manifest === null || !('workspaces' in manifest)) return [];
-  // An array (npm, yarn) or yarn classic's `{ packages: [...] }`.
-  const { workspaces } = manifest;
-  const listed: unknown = typeof workspaces === 'object' && workspaces !== null && 'packages' in workspaces ? workspaces.packages : workspaces;
-  if (!Array.isArray(listed)) return [];
-  return listed.filter((glob): glob is string => typeof glob === 'string' && !glob.startsWith('!'));
-}
-
 class GitWorktreeIsolation implements IWorktreeIsolation {
-  private readonly execFileImpl: GitExecFn;
   private readonly resolvePath: () => Promise<string>;
   private readonly platform: NodeJS.Platform;
   private readonly mintRunId: () => string;
 
-  // Worktree and branch bookkeeping serialised per repository: concurrent
-  // `git worktree add`s race on the shared admin files.
-  private readonly adminChains = new Map<string, Promise<unknown>>();
+  private readonly gitInvoker: GitInvoker;
+  private readonly locks = new IsolationLocks();
   private waiting: QueuedMerge[] = [];
   private draining = false;
-  /** Landings and Merge all take turns on this, so a merge never reads an integration branch mid-landing. */
-  private turns: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly deps: WorktreeIsolationDeps) {
-    this.execFileImpl = deps.execFileImpl ?? defaultExecFile;
     this.resolvePath = deps.resolvePath ?? (() => augmentedPath());
+    this.gitInvoker = { exec: deps.execFileImpl ?? defaultExecFile, resolvePath: this.resolvePath };
     this.platform = deps.platform ?? process.platform;
     this.mintRunId = deps.mintRunId ?? (() => randomBytes(4).toString('hex'));
   }
@@ -520,7 +433,12 @@ class GitWorktreeIsolation implements IWorktreeIsolation {
           const entry = record.repos[repo.path];
           const inRepo = await this.inWorkspacePlace(repo, entry.worktree);
           if (repo.path === SELF_REPO) cwd = inRepo;
-          const boot = await this.bootstrap(repo, inRepo);
+          const boot = await bootstrap(repo, inRepo, {
+          setupCommand: this.deps.config.worktreeSetupCommand,
+          links: this.deps.config.worktreeLinks,
+          platform: this.platform,
+          resolvePath: this.resolvePath,
+        });
           entry.linked = boot.linked;
           copied.push(...boot.copied.map((name) => path.posix.join(repo.path, name)));
         }
@@ -644,17 +562,17 @@ class GitWorktreeIsolation implements IWorktreeIsolation {
   }
 
   handoff(run: IsolationRun): Promise<IsolationHandoff> {
-    return this.admin(run.workspaceRoot, async () => {
+    return this.inTurn(() => this.admin(run.workspaceRoot, async () => {
       // A branch checked out in a worktree cannot be checked out in the main
       // one, and the user is about to review it.
       await this.removeIntegrationWorktrees(run);
       await this.settleLanding(run);
       return handoffOf(run);
-    });
+    }));
   }
 
   pruneOrphans(run: IsolationRun): Promise<IsolationPruneResult> {
-    return this.admin(run.workspaceRoot, async () => {
+    return this.inTurn(() => this.admin(run.workspaceRoot, async () => {
       // A half-finished merge from a crash is easier to drop than to repair;
       // the branch refs are the only state that matters. What a landing had
       // merged goes back too, since the run was saved as not having it.
@@ -681,7 +599,7 @@ class GitWorktreeIsolation implements IWorktreeIsolation {
       absorbRemoval(removal, await this.removeUnowned(run));
       for (const repo of run.repos) await this.tryGit(repo.root, ['worktree', 'prune']);
       return { kept, ...removal };
-    });
+    }));
   }
 
   /**
@@ -881,7 +799,7 @@ class GitWorktreeIsolation implements IWorktreeIsolation {
   }
 
   discard(run: IsolationRun, opts: { integration: IntegrationDisposal }): Promise<IsolationRemoval> {
-    return this.admin(run.workspaceRoot, async () => {
+    return this.inTurn(() => this.admin(run.workspaceRoot, async () => {
       await this.removeIntegrationWorktrees(run);
       const removal = noRemoval();
       for (const record of Object.values(run.tasks)) {
@@ -900,7 +818,7 @@ class GitWorktreeIsolation implements IWorktreeIsolation {
       }
       for (const repo of run.repos) await this.tryGit(repo.root, ['worktree', 'prune']);
       return removal;
-    });
+    }));
   }
 
   sweep(run: IsolationRun): Promise<void> {
@@ -1365,64 +1283,6 @@ class GitWorktreeIsolation implements IWorktreeIsolation {
     return { branch: `ordewell/${run.id}/${name}`, dir: path.join(this.runRoot(run), name) };
   }
 
-  /**
-   * Make one repo's worktree runnable: the default artifacts, unless a setup
-   * command replaces them, then the `worktreeLinks` matches, then the setup
-   * command, which can rely on those. Returns what it linked and, of that,
-   * what had to be copied.
-   */
-  private async bootstrap(repo: IsolationRepo, cwd: string): Promise<{ linked: string[]; copied: string[] }> {
-    const setup = this.deps.config.worktreeSetupCommand?.trim();
-    const linked: string[] = [];
-    const copied: string[] = [];
-    const link = (name: string): void => {
-      const target = path.join(cwd, name);
-      // Present already means it is tracked: the checkout is the truth, not a link to the main tree's copy.
-      if (lexists(target)) return;
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-      if (linkPath(path.join(repo.root, name), target, this.platform) === 'copy') copied.push(name);
-      linked.push(name);
-    };
-
-    // A whole-folder link would resolve a workspace link such as
-    // node_modules/@scope/pkg -> ../../packages/pkg from the main checkout,
-    // so the task would build against the main checkout's copy of the code it
-    // is changing. Mirroring entry by entry lets those links land in the worktree.
-    const mirror = (name: string): void => {
-      const target = path.join(cwd, name);
-      if (lexists(target) || !fs.existsSync(path.dirname(target))) return;
-      const source = path.join(repo.root, name);
-      if (!fs.lstatSync(source).isDirectory()) return link(name);
-      const mirrored = mirrorDir(source, target, { platform: this.platform, from: repo.root, to: cwd });
-      copied.push(...mirrored.map((entry) => path.join(name, entry)));
-      linked.push(name);
-    };
-
-    if (!setup) {
-      for (const name of fs.readdirSync(repo.root)) {
-        if (name !== STATE_DIR && name !== 'node_modules' && (LINKED_ARTIFACTS.has(name) || isEnvFile(name))) link(name);
-      }
-      for (const dir of installDirs(repo.root)) mirror(dir);
-    }
-    for (const name of matchLinks(repo.root, this.deps.config.worktreeLinks)) link(name);
-    if (setup) await this.runSetup(setup, repo, cwd);
-    return { linked, copied };
-  }
-
-  private async runSetup(command: string, repo: IsolationRepo, cwd: string): Promise<void> {
-    const env = withPath(this.cleanEnv(), await this.resolvePath(), {
-      ORDEWELL_REPO: repo.path,
-      ORDEWELL_MAIN_REPO: repo.root,
-      ORDEWELL_MAIN_WORKTREE: repo.root,
-    });
-    try {
-      await execAsync(command, { cwd, env, timeout: SETUP_TIMEOUT_MS, maxBuffer: MAX_BUFFER, windowsHide: true });
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      throw new Error(`Worktree setup command failed: ${detail}`);
-    }
-  }
-
   private async unmergedPaths(cwd: string): Promise<string[]> {
     const listed = await this.tryGit(cwd, ['diff', '--name-only', '-z', '--diff-filter=U']);
     return [...new Set(listed.stdout.split('\0').filter(Boolean))];
@@ -1438,39 +1298,19 @@ class GitWorktreeIsolation implements IWorktreeIsolation {
   }
 
   private inTurn<T>(fn: () => Promise<T>): Promise<T> {
-    const turn = this.turns.then(fn, fn);
-    this.turns = turn.catch(() => undefined);
-    return turn;
+    return this.locks.inTurn(fn);
   }
 
-  private admin<T>(repoKey: string, fn: () => Promise<T>): Promise<T> {
-    const prior = this.adminChains.get(repoKey) ?? Promise.resolve();
-    const next = prior.then(fn, fn);
-    this.adminChains.set(repoKey, next.catch(() => undefined));
-    return next;
+  private admin<T>(workspaceRoot: string, fn: () => Promise<T>): Promise<T> {
+    return this.locks.admin(workspaceRoot, fn);
   }
 
-  private cleanEnv(): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-    for (const key of INHERITED_GIT_VARS) delete env[key];
-    return env;
+  private tryGit(cwd: string | undefined, args: string[]): Promise<GitResult> {
+    return tryGit(this.gitInvoker, cwd, args);
   }
 
-  private async tryGit(cwd: string | undefined, args: string[]): Promise<GitResult> {
-    try {
-      const env = withPath(this.cleanEnv(), await this.resolvePath());
-      const { stdout, stderr } = await this.execFileImpl('git', args, { cwd, env });
-      return { ok: true, stdout, stderr };
-    } catch (err) {
-      const e = err as { stdout?: unknown; stderr?: unknown; code?: string | number };
-      return { ok: false, stdout: String(e.stdout ?? ''), stderr: String(e.stderr ?? ''), code: e.code };
-    }
-  }
-
-  private async git(cwd: string, args: string[]): Promise<string> {
-    const result = await this.tryGit(cwd, args);
-    if (!result.ok) throw new Error(`git ${args[0]} failed: ${result.stderr.trim() || String(result.code ?? 'unknown error')}`);
-    return result.stdout;
+  private git(cwd: string, args: string[]): Promise<string> {
+    return git(this.gitInvoker, cwd, args);
   }
 }
 
