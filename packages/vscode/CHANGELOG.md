@@ -7,7 +7,10 @@
 - **Stop ends everything a task started.** On Linux and macOS, closing or
   stopping a task used to signal only the runner's own process, so the shells,
   MCP servers, test runs and dev servers it had started kept running. The whole
-  process group is now signalled.
+  process group is now signalled. An interactive (pty-wrapped) task is the
+  exception: its agent runs in a session of its own under `script`, so Stop
+  relies on the pty hangup to end the agent and its foreground children, and a
+  process the agent deliberately detached can outlive Stop.
 - **A runner that fails to start no longer stays running**, and non-ASCII
   output split across two reads no longer turns into `�`.
 

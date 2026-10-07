@@ -139,6 +139,7 @@ export class ApiClient {
   private workspace: string;
   /** A session's open execution stream, so a new one can end it: one run is reported once. */
   private executionStreams = new Map<string, () => void>();
+  private executionStreamEnds = new WeakMap<Promise<'lost' | void>, () => void>();
 
   constructor(port?: number, workspace?: string) {
     this.port = port || DEFAULT_PORT;
@@ -533,8 +534,9 @@ export class ApiClient {
     return socket;
   }
 
-  closeExecutionStream(sessionId: string): void {
-    this.executionStreams.get(sessionId)?.();
+  /** Ends one stream `streamExecution` returned, leaving any newer stream the session has opened since alone. */
+  closeExecutionStream(stream: Promise<'lost' | void>): void {
+    this.executionStreamEnds.get(stream)?.();
   }
 
   streamExecution(
@@ -542,7 +544,8 @@ export class ApiClient {
     onEvent: (event: WsEvent) => void,
     onReady?: (error?: Error) => void,
   ): Promise<'lost' | void> {
-    return new Promise((resolve, reject) => {
+    let endStream: () => void = () => {};
+    const stream = new Promise<'lost' | void>((resolve, reject) => {
       this.executionStreams.get(sessionId)?.();
       const socket = this.openSessionSocket(sessionId);
 
@@ -557,6 +560,7 @@ export class ApiClient {
         resolve();
       };
       this.executionStreams.set(sessionId, end);
+      endStream = end;
 
       socket.on('open', () => {
         opened = true;
@@ -577,8 +581,14 @@ export class ApiClient {
       socket.on('error', (err) => {
         forget();
         if (!opened) onReady?.(err);
-        if (!resolved) {
-          resolved = true;
+        if (resolved) return;
+        resolved = true;
+        // A reset mid-run is the daemon going away, same as a close: the run
+        // may still be going, so the caller reports it lost, not failed.
+        if (opened) {
+          socket.close();
+          resolve('lost');
+        } else {
           reject(err);
         }
       });
@@ -593,6 +603,8 @@ export class ApiClient {
         }
       });
     });
+    this.executionStreamEnds.set(stream, endStream);
+    return stream;
   }
 
   /**

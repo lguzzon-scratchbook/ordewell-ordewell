@@ -504,7 +504,7 @@ describe('execution', () => {
     });
     await runEffect({ type: 'execute', sessionId: 's1' }, h.deps);
 
-    expect(h.api.closeExecutionStream).toHaveBeenCalledWith('s1');
+    expect(h.api.closeExecutionStream).toHaveBeenCalledWith(expect.any(Promise));
     expect(types(h.actions)).not.toContain('executionLost');
   });
 

@@ -679,7 +679,8 @@ async function withExecutionStream(
     await request();
   } catch (err) {
     // Nothing else holds this socket; left open it outlives the failed run.
-    deps.api.closeExecutionStream(sessionId);
+    // Closed by handle: a newer stream on this session is not ours to end.
+    deps.api.closeExecutionStream(stream);
     throw err;
   }
   if (await stream === 'lost') deps.dispatch({ type: 'executionLost', sessionId });

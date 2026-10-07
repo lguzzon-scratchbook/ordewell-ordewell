@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { cleanEnv, git, subcommandOf } from '../gitExec';
+import { cleanEnv, execFileWithTimeout, git, subcommandOf } from '../gitExec';
 
 describe('gitExec', () => {
   const saved = { ...process.env };
@@ -24,5 +24,17 @@ describe('gitExec', () => {
     const env = cleanEnv();
     for (const key of ['GIT_DIR', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_EXEC_PATH']) expect(env[key]).toBeUndefined();
     expect(env.GIT_TERMINAL_PROMPT).toBe('0');
+  });
+
+  describe('a call that never returns', () => {
+    const hang = ['-e', 'setInterval(() => {}, 1000)'];
+
+    it('is ended with SIGTERM so git can release its locks, and reported as a timeout', async () => {
+      const exec = execFileWithTimeout(300);
+      const err = await exec(process.execPath, hang, { env: process.env }).catch((e: unknown) => e);
+
+      expect(err).toMatchObject({ code: 'ETIMEDOUT', killed: true, signal: 'SIGTERM' });
+      expect((err as { stderr: string }).stderr).toMatch(/^timed out after 0\.3 seconds/);
+    });
   });
 });

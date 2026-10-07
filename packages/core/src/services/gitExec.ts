@@ -26,27 +26,37 @@ export const MAX_BUFFER = 64 * 1024 * 1024;
 // landing after it. Generous, since a commit hook may run a whole test suite.
 const GIT_TIMEOUT_MS = 10 * 60 * 1000;
 
-export const defaultExecFile: GitExecFn = async (file, args, opts) => {
-  try {
-    const { stdout, stderr } = await execFileAsync(file, args, {
-      cwd: opts.cwd,
-      env: opts.env,
-      maxBuffer: MAX_BUFFER,
-      timeout: GIT_TIMEOUT_MS,
-      // A hook can trap SIGTERM.
-      killSignal: 'SIGKILL',
-      windowsHide: true,
-    });
-    return { stdout: String(stdout), stderr: String(stderr) };
-  } catch (err) {
-    if (!timedOut(err)) throw err;
-    const stderr = String(err.stderr ?? '').trim();
-    throw Object.assign(err, {
-      code: 'ETIMEDOUT',
-      stderr: [`timed out after ${GIT_TIMEOUT_MS / 60_000} minutes`, stderr].filter(Boolean).join('\n'),
-    });
-  }
-};
+export function execFileWithTimeout(timeoutMs: number): GitExecFn {
+  return async (file, args, opts) => {
+    try {
+      const { stdout, stderr } = await execFileAsync(file, args, {
+        cwd: opts.cwd,
+        env: opts.env,
+        maxBuffer: MAX_BUFFER,
+        timeout: timeoutMs,
+        // The signal reaches git itself, not a hook it runs. SIGTERM lets git
+        // remove index.lock and ref locks on the way out; SIGKILL would leave
+        // them behind and wedge the user's own checkout.
+        killSignal: 'SIGTERM',
+        windowsHide: true,
+      });
+      return { stdout: String(stdout), stderr: String(stderr) };
+    } catch (err) {
+      if (!timedOut(err)) throw err;
+      const stderr = String(err.stderr ?? '').trim();
+      throw Object.assign(err, {
+        code: 'ETIMEDOUT',
+        stderr: [`timed out after ${describeDuration(timeoutMs)}`, stderr].filter(Boolean).join('\n'),
+      });
+    }
+  };
+}
+
+export const defaultExecFile: GitExecFn = execFileWithTimeout(GIT_TIMEOUT_MS);
+
+function describeDuration(ms: number): string {
+  return ms >= 60_000 ? `${ms / 60_000} minutes` : `${ms / 1000} seconds`;
+}
 
 /** Node kills the child itself for a timeout and for an overflowing buffer; only the first is a hang. */
 function timedOut(err: unknown): err is Error & { stderr?: unknown } {

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { PlannerTurnDiscardedError } from '@ordewell/core';
+import { PlannerTurnDiscardedError, PlannerTurnStoppedError } from '@ordewell/core';
 import { reportPlannerError, type PlanManagerDeps } from '../PlanManager';
 
 function harness() {
@@ -24,6 +24,12 @@ describe('reportPlannerError', () => {
   it('stays quiet for a turn discarded because the session it answered was left', () => {
     const { deps, showError } = harness();
     reportPlannerError(new PlannerTurnDiscardedError(), deps);
+    expect(showError).not.toHaveBeenCalled();
+  });
+
+  it('stays quiet for a stop the backend reported as a thrown error', () => {
+    const { deps, showError } = harness();
+    reportPlannerError(new PlannerTurnStoppedError({ cause: new Error('Request was aborted.') }), deps);
     expect(showError).not.toHaveBeenCalled();
   });
 });

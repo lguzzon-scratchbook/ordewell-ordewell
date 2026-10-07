@@ -88,7 +88,7 @@ export { PlanEditError } from './services/PlanEditError';
 export type * from './daemonContract';
 export { SessionNotFoundError, NoPlanError, AlreadyExecutingError } from './services/SessionErrors';
 export type { SessionDeps, SessionRuntimeSettings, SessionPlanner, SaveSession, ConversationFork, ConversationRewind } from './services/createSession';
-export { ConversationEditError, ConversationBusyError, PlannerTurnDiscardedError } from './services/PlannerConversation';
+export { ConversationEditError, ConversationBusyError, PlannerTurnDiscardedError, PlannerTurnStoppedError } from './services/PlannerConversation';
 export type { RewindTarget, ConversationCompaction, PlannerSubmission } from './services/PlannerConversation';
 export {
   SkillsService,

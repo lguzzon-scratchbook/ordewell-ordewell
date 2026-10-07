@@ -30,7 +30,7 @@ export interface KillTreeDeps {
   setTimeoutImpl?: (fn: () => void, ms: number) => { unref?: () => void };
   clearTimeoutImpl?: (handle: unknown) => void;
   /** Signals a pid, or a process group as its negated id. Injected so the group path needs no real processes. */
-  killImpl?: (pid: number, signal: NodeJS.Signals) => void;
+  killImpl?: (pid: number, signal: NodeJS.Signals | 0) => void;
 }
 
 /** Processes {@link spawnInOwnGroup} made group leaders. */
@@ -38,8 +38,10 @@ const groupLeaders = new WeakSet<ChildProcess>();
 /** Leaders already signalled: a group signal leaves `proc.killed` false, so it cannot say. */
 const stopping = new WeakSet<ChildProcess>();
 /**
- * Groups led by a live runner, by id. Dropped when the leader exits: past that
- * point the id is no longer evidence the group is ours.
+ * Groups led by a live runner, by id, for the host's teardown. Dropped when
+ * the leader exits: an id is only known to be ours while its leader is alive,
+ * and the host must not signal one it can no longer vouch for. The one
+ * deliberate exception is the bounded SIGKILL follow-up in {@link killTree}.
  */
 const ownGroups = new Map<number, ChildProcess>();
 let hostTeardownHooked = false;
@@ -143,7 +145,7 @@ export function killTree(proc: ChildProcess | null, deps: KillTreeDeps = {}): vo
     if (stopping.has(proc)) return;
     stopping.add(proc);
     const pgid = proc.pid;
-    const killImpl = deps.killImpl ?? ((pid: number, signal: NodeJS.Signals) => { process.kill(pid, signal); });
+    const killImpl = deps.killImpl ?? ((pid: number, signal: NodeJS.Signals | 0) => { process.kill(pid, signal); });
     const signalGroup = (signal: NodeJS.Signals) => {
       try {
         killImpl(-pgid, signal);
@@ -152,10 +154,20 @@ export function killTree(proc: ChildProcess | null, deps: KillTreeDeps = {}): vo
       }
     };
     signalGroup('SIGTERM');
-    // Not cancelled when the leader exits: what it started can outlive it,
-    // and a process ignoring SIGTERM is exactly the one that does.
+    // Survives the leader's exit: what it started can outlive it, and a
+    // process ignoring SIGTERM is exactly the one that does. A pgid is never
+    // reused while a member lives, so the group is only at risk of being a
+    // stranger's once it is empty — which the probe below detects, cancelling
+    // the follow-up rather than signalling an id that may have been recycled.
     const hardKill = setTimeoutImpl(() => signalGroup('SIGKILL'), HARD_KILL_DELAY_MS);
     hardKill.unref?.();
+    proc.once('exit', () => {
+      try {
+        killImpl(-pgid, 0);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ESRCH') clearTimeoutImpl(hardKill);
+      }
+    });
     return;
   }
 

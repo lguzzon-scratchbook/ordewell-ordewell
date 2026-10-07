@@ -245,7 +245,7 @@ function reduceAction(state: TuiState, action: Action): Step {
       // daemon's own record is the truth once the user reconnects.
       const tasks = state.tasks.map((t) => isTaskRunning(t) ? { ...t, status: 'pending', idleSince: null } : t);
       return step({
-        ...say(state, 'error', 'Lost the connection to the daemon — the run is no longer being followed. Restart the daemon and reload the session to see where it stands.'),
+        ...say(state, 'error', 'Lost the connection to the daemon — this view is no longer following the run, but the daemon may still be running it. /load this session again to see where it stands.'),
         tasks,
         status: 'idle',
         busyLabel: '',

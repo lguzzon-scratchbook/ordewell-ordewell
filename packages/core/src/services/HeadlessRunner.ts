@@ -112,7 +112,7 @@ export class HeadlessSession extends AbstractTerminalSession {
   kill(): void {
     // Tree-wide: on Windows the direct child may be a cmd.exe shim, and killing
     // it would leave the runner itself alive and still editing the workspace.
-    killTree(this.process);
+    killTree(this.process, { platform: this.platform });
     // No child means no 'close' event, so watchers would never settle.
     if (!this.process) this.baseHandleExit(-1);
   }
