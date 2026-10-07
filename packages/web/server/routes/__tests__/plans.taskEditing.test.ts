@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
-import { PlanEditError } from '@ordewell/core';
+import { PlanEditError, SessionNotFoundError } from '@ordewell/core';
 import type { OrchestratorPool } from '../../pool/orchestratorPool';
 
 describe('task editing routes', () => {
@@ -135,7 +135,7 @@ describe('task editing routes', () => {
     });
 
     it('404s when the session is gone', async () => {
-      session.markTaskIncomplete.mockRejectedValue(new Error('Session not found'));
+      session.markTaskIncomplete.mockRejectedValue(new SessionNotFoundError());
 
       const res = await app.request('/api/plans/s1/tasks/t1/uncomplete', { method: 'POST' });
 
@@ -161,7 +161,7 @@ describe('task editing routes', () => {
     // throw here answered with no body at all, which every surface read as the
     // delete having silently done nothing.
     it('404s when the session is gone rather than throwing out of the route', async () => {
-      session.removeTask.mockRejectedValue(new Error('Session not found'));
+      session.removeTask.mockRejectedValue(new SessionNotFoundError());
 
       const res = await app.request('/api/plans/s1/tasks/t1', { method: 'DELETE' });
 

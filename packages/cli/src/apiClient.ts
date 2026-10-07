@@ -2,60 +2,97 @@ import http from 'http';
 import WebSocket from 'ws';
 import { DEFAULT_PORT } from './daemon';
 import { bearerHeaderValue, readDaemonToken, tokenSubprotocols, mintSessionId } from '@ordewell/core';
-import type { ApprovalAnswer, SerializedPlan, DiscoveredModel, SessionMessage, SessionNotice, RewindTarget, IsolationMergeResult, SessionMeta, TaskLogEvent } from '@ordewell/core';
-import type { RawCatalog } from './catalog';
+import type {
+  AdoptSessionResponse,
+  ApprovalAnswer,
+  CancelPlanningResponse,
+  CommandResponse,
+  CommandsResponse,
+  ConversationCompactResponse,
+  ConversationForkResponse,
+  ConversationRewindResponse,
+  DaemonErrorCode,
+  ErrorBody,
+  ExecuteResponse,
+  ForceSendResponse,
+  GeneratePlanResponse,
+  LegacyPlanState,
+  IsolationDiffResponse,
+  IsolationMergeResponse,
+  MergeGateEntry,
+  MergeGateResponse,
+  ModelsResponse,
+  OkResponse,
+  PlanResponse,
+  PlanState,
+  RemoveMessageResponse,
+  ResolveConflictResponse,
+  RewindTarget,
+  RewindTargetsResponse,
+  RunnersResponse,
+  SessionListResponse,
+  SessionMessage,
+  SessionMeta,
+  SessionNotice,
+  SessionResponse,
+  SettingsResponse,
+  SettingsUpdateResponse,
+  StopResponse,
+  TaskLogAttemptsResponse,
+  TaskLogEvent,
+  TaskLogResponse,
+  TaskMessageResponse,
+} from '@ordewell/core';
 
 const DEFAULT_HTTP_TIMEOUT_MS = 15 * 60 * 1000;
 
 export interface PlanResult {
   sessionId: string;
-  plan: SerializedPlan;
-  models?: DiscoveredModel[];
-  modelsByRunner?: Record<string, DiscoveredModel[]>;
+  plan: PlanState;
+  models?: GeneratePlanResponse['models'];
+  modelsByRunner?: GeneratePlanResponse['modelsByRunner'];
 }
 
 /** How a merge of the run into the user's checkout went, and on anything but `merged`, which repo stopped it. */
-export type MergeRunResult = IsolationMergeResult;
+export type MergeRunResult = IsolationMergeResponse;
 
 /** A fork the daemon has already adopted. */
-export interface ConversationForkResult {
-  sessionId: string;
-  goal: string;
-  plan: SerializedPlan;
-}
+export type ConversationForkResult = ConversationForkResponse;
 
 /** A fork made by a rewind, with the full text of the message it was made just before. */
-export interface ConversationRewindResult extends ConversationForkResult {
-  rewoundMessage: string;
-}
+export type ConversationRewindResult = ConversationRewindResponse;
 
-interface ErrorResponse {
-  error?: string;
-  code?: string;
-  workspace?: string;
+/**
+ * A refusal the daemon gave, carrying the status and the stable `code` a caller
+ * switches on. The message is for display only: nothing may branch on its text.
+ */
+export class DaemonError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: DaemonErrorCode) {
+    super(message);
+    this.name = 'DaemonError';
+  }
 }
 
 /** A workspace the daemon rejected for lacking a project marker, distinguished from other 400s so the TUI can offer to initialize it instead of just reporting failure. */
-export class WorkspaceInitNeededError extends Error {
+export class WorkspaceInitNeededError extends DaemonError {
   constructor(message: string, readonly workspace: string) {
-    super(message);
+    super(message, 400, 'workspace_not_a_project');
     this.name = 'WorkspaceInitNeededError';
   }
 }
 
-export interface RunnerState {
-  id: string;
-  name: string;
-  enabled: boolean;
-}
+/**
+ * A plan as a planner or session endpoint answers with it: the phase-tagged
+ * state a saved session is read back in, or the session's plan itself. Which
+ * one depends on the route, so a reader takes either.
+ */
+export type PlanBody = PlanState | LegacyPlanState;
 
-export interface RunnersResponse {
-  runners: RunnerState[];
-  headless: boolean;
-  orchestratorModel: string;
-}
+export type RunnerState = RunnersResponse['runners'][number];
+export type { RunnersResponse };
 
 export type { SessionMeta };
+
 
 export interface TaskStatus {
   id: string;
@@ -87,6 +124,13 @@ export type WsEvent = SessionMessage | SessionNotice;
 /** `/api/plans/<id>/…` and `/api/sessions/<id>/…`: the session a request is about. */
 const SESSION_PATH = /^\/api\/(?:plans|sessions)\/([^/?]+)/;
 
+/** A non-200 answer as an error. The body is not trusted to be JSON: an HTML error page arrives as a string. */
+function daemonError(status: number, data: unknown, fallback: string): DaemonError {
+  const { error, code, workspace } = (typeof data === 'object' && data !== null ? data : {}) as Partial<ErrorBody>;
+  if (code === 'workspace_not_a_project') return new WorkspaceInitNeededError(error || 'Not a project directory', workspace ?? '');
+  return new DaemonError(error || fallback, status, code);
+}
+
 export class ApiClient {
   /** Where a CLI invocation's sessions live, when a client is built without one: `--workspace`, else the cwd. */
   static defaultWorkspace: string | undefined;
@@ -112,7 +156,7 @@ export class ApiClient {
 
   /**
    * A daemon holds only the sessions adopted since it started, so after a
-   * restart every session-scoped call answered "Session not found" until the
+   * restart every session-scoped call answered "session not found" until the
    * user ran `ordewell sessions load`. The saved session is adopted here
    * instead — idempotent for one the daemon still holds — and the call made
    * once more; a 404 means the first attempt never ran, so the retry cannot
@@ -125,10 +169,17 @@ export class ApiClient {
   ): Promise<{ status: number; data: T }> {
     const res = await this.rawRequest<T>(method, urlPath, body);
     const sessionId = urlPath.match(SESSION_PATH)?.[1];
-    const missing = res.status === 404 && (res.data as { error?: unknown } | undefined)?.error === 'Session not found';
+    const missing = res.status === 404 && (res.data as Partial<ErrorBody> | undefined)?.code === 'session_not_found';
     if (!missing || !sessionId || urlPath.split('?')[0].endsWith('/load')) return res;
     const adopted = await this.rawRequest('POST', `/api/sessions/${sessionId}/load?workspace=${encodeURIComponent(this.workspace)}`);
     return adopted.status === 200 ? this.rawRequest<T>(method, urlPath, body) : res;
+  }
+
+  /** One request whose only good answer is a 200: anything else becomes a {@link DaemonError} carrying the daemon's code. */
+  private async call<T>(method: string, urlPath: string, fallback: string, body?: object): Promise<T> {
+    const res = await this.httpRequest<T>(method, urlPath, body);
+    if (res.status !== 200) throw daemonError(res.status, res.data, fallback);
+    return res.data;
   }
 
   private rawRequest<T = unknown>(
@@ -185,15 +236,12 @@ export class ApiClient {
     workspace?: string,
     sessionId: string = mintSessionId(),
   ): Promise<PlanResult> {
-    const res = await this.httpRequest<Partial<PlanResult> & ErrorResponse>('POST', `/api/plans/${sessionId}/generate`, {
+    const { plan, models, modelsByRunner } = await this.call<GeneratePlanResponse>('POST', `/api/plans/${sessionId}/generate`, 'Plan generation failed', {
       goal,
       runners: runners || undefined,
       workspace,
     });
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Plan generation failed');
-    }
-    return { sessionId, plan: res.data.plan as SerializedPlan, models: res.data.models, modelsByRunner: res.data.modelsByRunner };
+    return { sessionId, plan, models, modelsByRunner };
   }
 
   /**
@@ -207,64 +255,36 @@ export class ApiClient {
     runners?: string[],
     workspace?: string,
     allowInit?: boolean,
-  ): Promise<SerializedPlan> {
-    const res = await this.httpRequest<{ plan: SerializedPlan } & ErrorResponse>('POST', `/api/plans/${sessionId}/converse/start`, {
+  ): Promise<PlanResponse['plan']> {
+    const res = await this.call<PlanResponse>('POST', `/api/plans/${sessionId}/converse/start`, 'Planning failed', {
       goal,
       runners: runners || undefined,
       workspace,
       allowInit,
     });
-    if (res.status !== 200) {
-      if (res.data?.code === 'workspace_not_a_project') {
-        throw new WorkspaceInitNeededError(res.data.error || 'Not a project directory', res.data.workspace || workspace || '');
-      }
-      throw new Error(res.data?.error || 'Planning failed');
-    }
-    return res.data.plan;
+    return res.plan;
   }
 
-  async sendConversationMessage(sessionId: string, message: string): Promise<SerializedPlan> {
-    const res = await this.httpRequest<{ plan: SerializedPlan } & ErrorResponse>('POST', `/api/plans/${sessionId}/converse/message`, { message });
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Planner message failed');
-    }
-    return res.data.plan;
+  async sendConversationMessage(sessionId: string, message: string): Promise<PlanResponse['plan']> {
+    const res = await this.call<PlanResponse>('POST', `/api/plans/${sessionId}/converse/message`, 'Planner message failed', { message });
+    return res.plan;
   }
 
-  async getRunners(): Promise<RunnersResponse> {
-    const res = await this.httpRequest<RunnersResponse & ErrorResponse>('GET', '/api/runners');
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Failed to fetch runners');
-    }
-    return res.data;
+  getRunners(): Promise<RunnersResponse> {
+    return this.call('GET', '/api/runners', 'Failed to fetch runners');
   }
 
   /** The full provider catalog the daemon has discovered (used by the TUI model picker). */
-  async getModels(): Promise<RawCatalog> {
-    const res = await this.httpRequest<RawCatalog & ErrorResponse>('GET', '/api/models');
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Failed to fetch models');
-    }
-    return res.data;
+  getModels(): Promise<ModelsResponse> {
+    return this.call('GET', '/api/models', 'Failed to fetch models');
   }
 
-  async setRunnerEnabled(runner: string, enabled: boolean): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('PUT', `/api/runners/${runner}`, { enabled });
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || `Failed to ${enabled ? 'enable' : 'disable'} ${runner}`);
-    }
-    return res.data;
+  setRunnerEnabled(runner: string, enabled: boolean): Promise<OkResponse> {
+    return this.call('PUT', `/api/runners/${runner}`, `Failed to ${enabled ? 'enable' : 'disable'} ${runner}`, { enabled });
   }
 
-  async executePlan(sessionId: string): Promise<{ status: string }> {
-    const res = await this.httpRequest<{ status: string } & ErrorResponse>(
-      'POST',
-      `/api/plans/${sessionId}/execute`,
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Execute failed');
-    }
-    return res.data;
+  executePlan(sessionId: string): Promise<ExecuteResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/execute`, 'Execute failed');
   }
 
   /**
@@ -274,202 +294,102 @@ export class ApiClient {
    * `resetForRun`) before approving, which is right for starting a plan and
    * wrong for releasing one that is already part-way through a review pause.
    */
-  async approveReview(sessionId: string): Promise<{ plan: SerializedPlan }> {
-    const res = await this.httpRequest<{ plan: SerializedPlan } & ErrorResponse>(
-      'POST',
-      `/api/plans/${sessionId}/review/approve`,
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Approve failed');
-    }
-    return res.data;
+  approveReview(sessionId: string): Promise<PlanResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/review/approve`, 'Approve failed');
   }
 
-  async markTaskComplete(sessionId: string, taskId: string): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>(
-      'POST',
-      `/api/plans/${sessionId}/tasks/${taskId}/complete`,
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Mark complete failed');
-    }
-    return res.data;
+  markTaskComplete(sessionId: string, taskId: string): Promise<OkResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/complete`, 'Mark complete failed');
   }
 
-  async markTaskIncomplete(sessionId: string, taskId: string): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>(
-      'POST',
-      `/api/plans/${sessionId}/tasks/${taskId}/uncomplete`,
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Mark not done failed');
-    }
-    return res.data;
+  markTaskIncomplete(sessionId: string, taskId: string): Promise<OkResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/uncomplete`, 'Mark not done failed');
   }
 
   /** run | force-start | retry | cancel — real orchestrator work, not a status patch. */
-  async taskControl(
+  taskControl(
     sessionId: string,
     taskId: string,
     action: 'run' | 'force-start' | 'retry' | 'cancel',
-  ): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>(
-      'POST',
-      `/api/plans/${sessionId}/tasks/${taskId}/${action}`,
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || `${action} failed`);
-    }
-    return res.data;
+  ): Promise<OkResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/${action}`, `${action} failed`);
   }
 
   /** A user message to a structured task: delivered now if it waits for input, else queued behind its turn. */
-  async sendTaskMessage(sessionId: string, taskId: string, text: string): Promise<{ id: string }> {
-    const res = await this.httpRequest<{ id: string } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/messages`, { text });
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Send message failed');
-    }
-    return res.data;
+  sendTaskMessage(sessionId: string, taskId: string, text: string): Promise<TaskMessageResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/messages`, 'Send message failed', { text });
   }
 
   /** Force send: interrupt the task's running turn and deliver `text` next, ahead of anything queued (ADR-0023, F1). */
-  async forceSendTaskMessage(sessionId: string, taskId: string, text: string): Promise<{ id: string }> {
-    const res = await this.httpRequest<{ id: string } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/messages/now`, { text });
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Send now failed');
-    }
-    return res.data;
+  forceSendTaskMessage(sessionId: string, taskId: string, text: string): Promise<TaskMessageResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/messages/now`, 'Send now failed', { text });
   }
 
   /** Force send a message still queued; `sent` is false once the runner already has it. */
-  async forceSendQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<{ sent: boolean }> {
-    const res = await this.httpRequest<{ sent: boolean } & ErrorResponse>(
-      'POST',
-      `/api/plans/${sessionId}/tasks/${taskId}/messages/${encodeURIComponent(messageId)}/now`,
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Send now failed');
-    }
-    return res.data;
+  forceSendQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<ForceSendResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/messages/${encodeURIComponent(messageId)}/now`, 'Send now failed');
   }
 
   /** Continue a finished structured task in its saved session, with `text` as its next turn. */
-  async continueTask(sessionId: string, taskId: string, text: string): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/continue`, { text });
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Continue failed');
-    }
-    return res.data;
+  continueTask(sessionId: string, taskId: string, text: string): Promise<OkResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/continue`, 'Continue failed', { text });
   }
 
   /** `removed` is false once the message was already delivered. */
-  async removeQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<{ removed: boolean }> {
-    const res = await this.httpRequest<{ removed: boolean } & ErrorResponse>(
-      'DELETE',
-      `/api/plans/${sessionId}/tasks/${taskId}/messages/${encodeURIComponent(messageId)}`,
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Remove message failed');
-    }
-    return res.data;
+  removeQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<RemoveMessageResponse> {
+    return this.call('DELETE', `/api/plans/${sessionId}/tasks/${taskId}/messages/${encodeURIComponent(messageId)}`, 'Remove message failed');
   }
 
-  async interruptTask(sessionId: string, taskId: string): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/interrupt`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Interrupt failed');
-    }
-    return res.data;
+  interruptTask(sessionId: string, taskId: string): Promise<OkResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/interrupt`, 'Interrupt failed');
   }
 
   /** Let a task go on from the checkpoint it waits at; refused, with the reason, when none waits. */
-  async approveTaskCheckpoint(sessionId: string, taskId: string): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/checkpoint/approve`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Approve checkpoint failed');
-    }
-    return res.data;
+  approveTaskCheckpoint(sessionId: string, taskId: string): Promise<OkResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/checkpoint/approve`, 'Approve checkpoint failed');
   }
 
   /** Turn a task back at its checkpoint; `reason` is what the agent is told. */
-  async rejectTaskCheckpoint(sessionId: string, taskId: string, reason?: string): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>(
-      'POST',
-      `/api/plans/${sessionId}/tasks/${taskId}/checkpoint/reject`,
-      reason ? { reason } : {},
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Reject checkpoint failed');
-    }
-    return res.data;
+  rejectTaskCheckpoint(sessionId: string, taskId: string, reason?: string): Promise<OkResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks/${taskId}/checkpoint/reject`, 'Reject checkpoint failed', reason ? { reason } : {});
   }
 
-  async addTask(sessionId: string, task: Record<string, unknown>): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks`, task);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Add task failed');
-    }
-    return res.data;
+  addTask(sessionId: string, task: Record<string, unknown>): Promise<OkResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/tasks`, 'Add task failed', task);
   }
 
-  async updateTask(
-    sessionId: string,
-    taskId: string,
-    changes: Record<string, unknown>,
-  ): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('PUT', `/api/plans/${sessionId}/tasks/${taskId}`, changes);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Update task failed');
-    }
-    return res.data;
+  updateTask(sessionId: string, taskId: string, changes: Record<string, unknown>): Promise<OkResponse> {
+    return this.call('PUT', `/api/plans/${sessionId}/tasks/${taskId}`, 'Update task failed', changes);
   }
 
-  async removeTask(sessionId: string, taskId: string): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('DELETE', `/api/plans/${sessionId}/tasks/${taskId}`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Remove task failed');
-    }
-    return res.data;
+  removeTask(sessionId: string, taskId: string): Promise<OkResponse> {
+    return this.call('DELETE', `/api/plans/${sessionId}/tasks/${taskId}`, 'Remove task failed');
   }
 
   /**
    * Make a saved session live on the server. `getSession` only reads the file;
    * until the session is adopted there is no orchestrator behind it, so
-   * execute/retry/cancel answer "Session not found".
+   * execute/retry/cancel answer `session_not_found`.
    */
-  async adoptSession(sessionId: string, workspace?: string): Promise<{ plan: SerializedPlan; goal: string }> {
+  async adoptSession(sessionId: string, workspace?: string): Promise<{ plan: AdoptSessionResponse['plan']; goal: string }> {
     const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
-    const res = await this.httpRequest<{ plan: SerializedPlan; goal?: string } & ErrorResponse>('POST', `/api/sessions/${sessionId}/load${qs}`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Failed to load session');
-    }
-    return { plan: res.data.plan, goal: res.data.goal ?? '' };
+    const res = await this.call<AdoptSessionResponse>('POST', `/api/sessions/${sessionId}/load${qs}`, 'Failed to load session');
+    return { plan: res.plan, goal: res.goal ?? '' };
   }
 
-  async deleteSession(sessionId: string, workspace?: string): Promise<{ ok: boolean }> {
+  deleteSession(sessionId: string, workspace?: string): Promise<OkResponse> {
     const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('DELETE', `/api/sessions/${sessionId}${qs}`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Delete session failed');
-    }
-    return res.data;
+    return this.call('DELETE', `/api/sessions/${sessionId}${qs}`, 'Delete session failed');
   }
 
   /** Copy the conversation and its tasks into a new session the daemon has already adopted. */
-  async forkConversation(sessionId: string): Promise<ConversationForkResult> {
-    const res = await this.httpRequest<ConversationForkResult & ErrorResponse>('POST', `/api/plans/${sessionId}/conversation/fork`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Fork failed');
-    }
-    return { sessionId: res.data.sessionId, goal: res.data.goal, plan: res.data.plan };
+  forkConversation(sessionId: string): Promise<ConversationForkResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/conversation/fork`, 'Fork failed');
   }
 
   async rewindTargets(sessionId: string): Promise<RewindTarget[]> {
-    const res = await this.httpRequest<{ targets: RewindTarget[] } & ErrorResponse>('GET', `/api/plans/${sessionId}/conversation/rewind-targets`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Failed to list rewind targets');
-    }
-    return res.data.targets;
+    const res = await this.call<RewindTargetsResponse>('GET', `/api/plans/${sessionId}/conversation/rewind-targets`, 'Failed to list rewind targets');
+    return res.targets;
   }
 
   /**
@@ -477,56 +397,35 @@ export class ApiClient {
    * transcript position) into a session the daemon has already adopted. The
    * original is left as it was; `rewoundMessage` is that message in full.
    */
-  async rewindConversation(sessionId: string, index: number): Promise<ConversationRewindResult> {
-    const res = await this.httpRequest<ConversationRewindResult & ErrorResponse>('POST', `/api/plans/${sessionId}/conversation/rewind`, { index });
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Rewind failed');
-    }
-    return { sessionId: res.data.sessionId, goal: res.data.goal, plan: res.data.plan, rewoundMessage: res.data.rewoundMessage };
+  rewindConversation(sessionId: string, index: number): Promise<ConversationRewindResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/conversation/rewind`, 'Rewind failed', { index });
   }
 
   /**
    * Condense the conversation into a summary. One planner call, so it can take
    * as long as a reply; a refusal or failure leaves the conversation as it was.
    */
-  async compactConversation(sessionId: string): Promise<{ plan: SerializedPlan; summary: string; keptMessages: number }> {
-    const res = await this.httpRequest<{ plan: SerializedPlan; summary: string; keptMessages: number } & ErrorResponse>('POST', `/api/plans/${sessionId}/conversation/compact`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Compaction failed');
-    }
-    return { plan: res.data.plan, summary: res.data.summary, keptMessages: res.data.keptMessages };
+  compactConversation(sessionId: string): Promise<ConversationCompactResponse> {
+    return this.call('POST', `/api/plans/${sessionId}/conversation/compact`, 'Compaction failed');
   }
 
   /** The dependencies a task waits on at its merge gate (ADR-0020); empty when nothing gates it. */
-  async getMergeGate(sessionId: string, taskId: string): Promise<Array<{ id: string; order: number; title: string }>> {
-    const res = await this.httpRequest<{ mergeGate: Array<{ id: string; order: number; title: string }> } & ErrorResponse>(
-      'GET',
-      `/api/plans/${sessionId}/tasks/${taskId}/merge-gate`,
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Could not read the merge gate');
-    }
-    return res.data.mergeGate ?? [];
+  async getMergeGate(sessionId: string, taskId: string): Promise<MergeGateEntry[]> {
+    const res = await this.call<MergeGateResponse>('GET', `/api/plans/${sessionId}/tasks/${taskId}/merge-gate`, 'Could not read the merge gate');
+    return res.mergeGate ?? [];
   }
 
   async reviewRunDiff(sessionId: string): Promise<string> {
-    const res = await this.httpRequest<{ diff: string } & ErrorResponse>('GET', `/api/plans/${sessionId}/isolation/diff`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Could not read the diff');
-    }
-    return res.data.diff;
+    const res = await this.call<IsolationDiffResponse>('GET', `/api/plans/${sessionId}/isolation/diff`, 'Could not read the diff');
+    return res.diff;
   }
 
   /**
    * A conflict or a block is an outcome, not an error. Passed on whole: which
    * repos blocked the merge, or landed before it stopped, is the answer.
    */
-  async mergeRun(sessionId: string): Promise<MergeRunResult> {
-    const res = await this.httpRequest<MergeRunResult & ErrorResponse>('POST', `/api/plans/${sessionId}/isolation/merge`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Merge failed');
-    }
-    return res.data;
+  mergeRun(sessionId: string): Promise<MergeRunResult> {
+    return this.call('POST', `/api/plans/${sessionId}/isolation/merge`, 'Merge failed');
   }
 
   discardRun(sessionId: string): Promise<void> {
@@ -546,76 +445,59 @@ export class ApiClient {
   }
 
   private async isolationAction(sessionId: string, segment: string, failure: string): Promise<void> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('POST', `/api/plans/${sessionId}/isolation/${segment}`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || failure);
-    }
+    await this.call<OkResponse>('POST', `/api/plans/${sessionId}/isolation/${segment}`, failure);
   }
 
-  async resolveConflictAsTask(sessionId: string, taskId: string): Promise<SerializedPlan> {
-    const res = await this.httpRequest<{ plan: SerializedPlan } & ErrorResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/resolve-conflict`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Could not add a resolver task');
-    }
-    return res.data.plan;
+  async resolveConflictAsTask(sessionId: string, taskId: string): Promise<ResolveConflictResponse['plan']> {
+    const res = await this.call<ResolveConflictResponse>('POST', `/api/plans/${sessionId}/tasks/${taskId}/resolve-conflict`, 'Could not add a resolver task');
+    return res.plan;
   }
 
-  async closeSession(sessionId: string): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean }>('POST', `/api/sessions/${sessionId}/close`);
+  async closeSession(sessionId: string): Promise<OkResponse> {
+    const res = await this.httpRequest<OkResponse>('POST', `/api/sessions/${sessionId}/close`);
     return res.data;
   }
 
-  async stopExecution(sessionId: string): Promise<{ status: string }> {
-    const res = await this.httpRequest<{ status: string }>('POST', `/api/plans/${sessionId}/stop`);
+  async stopExecution(sessionId: string): Promise<StopResponse> {
+    const res = await this.httpRequest<StopResponse>('POST', `/api/plans/${sessionId}/stop`);
     return res.data;
   }
 
   /** Aborts a planning turn in flight. A harmless no-op when the session isn't planning. */
-  async cancelPlanning(sessionId: string): Promise<{ cancelled: boolean }> {
-    const res = await this.httpRequest<{ cancelled: boolean }>('POST', `/api/plans/${sessionId}/planning/stop`);
+  async cancelPlanning(sessionId: string): Promise<CancelPlanningResponse> {
+    const res = await this.httpRequest<CancelPlanningResponse>('POST', `/api/plans/${sessionId}/planning/stop`);
     return res.data;
   }
 
-  async getSessions(workspace?: string): Promise<SessionMeta[]> {
+  async getSessions(workspace?: string): Promise<SessionListResponse> {
     const qs = workspace
       ? `?workspace=${encodeURIComponent(workspace)}`
       : '';
-    const res = await this.httpRequest<SessionMeta[]>('GET', `/api/sessions${qs}`);
+    const res = await this.httpRequest<SessionListResponse>('GET', `/api/sessions${qs}`);
     return res.data || [];
   }
 
-  async getSession(
-    sessionId: string,
-    workspace?: string,
-  ): Promise<{ meta: SessionMeta; plan: SerializedPlan }> {
+  getSession(sessionId: string, workspace?: string): Promise<SessionResponse> {
     const qs = workspace
       ? `?workspace=${encodeURIComponent(workspace)}`
       : '';
-    const res = await this.httpRequest<{ meta: SessionMeta; plan: SerializedPlan } & ErrorResponse>(
-      'GET',
-      `/api/sessions/${sessionId}${qs}`,
-    );
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Session not found');
-    }
-    return res.data;
+    return this.call('GET', `/api/sessions/${sessionId}${qs}`, 'Session not found');
   }
 
   /** The attempts of a structured task that have a saved log, oldest first. */
   async getTaskLogAttempts(sessionId: string, taskId: string, workspace?: string): Promise<number[]> {
     const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
-    const res = await this.httpRequest<{ attempts: number[] } & ErrorResponse>('GET', `/api/sessions/${sessionId}/tasks/${encodeURIComponent(taskId)}/log${qs}`);
-    if (res.status !== 200) throw new Error(res.data?.error || 'Could not read the task log');
-    return res.data.attempts;
+    const res = await this.call<TaskLogAttemptsResponse>('GET', `/api/sessions/${sessionId}/tasks/${encodeURIComponent(taskId)}/log${qs}`, 'Could not read the task log');
+    return res.attempts;
   }
 
   /** One attempt's saved log, for `replayTaskLog`. */
   async getTaskLog(sessionId: string, taskId: string, attempt: number, workspace?: string): Promise<TaskLogEvent[]> {
     const qs = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
-    const res = await this.httpRequest<{ events: TaskLogEvent[] } & ErrorResponse>('GET', `/api/sessions/${sessionId}/tasks/${encodeURIComponent(taskId)}/log/${attempt}${qs}`);
-    if (res.status !== 200) throw new Error(res.data?.error || 'Could not read the task log');
-    return res.data.events;
+    const res = await this.call<TaskLogResponse>('GET', `/api/sessions/${sessionId}/tasks/${encodeURIComponent(taskId)}/log/${attempt}${qs}`, 'Could not read the task log');
+    return res.events;
   }
+
 
   /**
    * The one place a session socket is built, so the token travels on both
@@ -639,7 +521,7 @@ export class ApiClient {
       res.on('end', () => {
         let reason = '';
         try {
-          reason = (JSON.parse(body) as ErrorResponse).error ?? '';
+          reason = (JSON.parse(body) as Partial<ErrorBody>).error ?? '';
         } catch {
           reason = body.trim();
         }
@@ -718,13 +600,13 @@ export class ApiClient {
    * with the whole decision (ADR-0018, A1). The planner's requests arrive over
    * the session socket; a runner's, in its task log.
    */
-  async respondToApproval(sessionId: string, approvalId: string, answer: ApprovalAnswer): Promise<{ ok: boolean }> {
-    const { status, data } = await this.httpRequest<{ ok: boolean }>(
+  async respondToApproval(sessionId: string, approvalId: string, answer: ApprovalAnswer): Promise<OkResponse> {
+    const { status, data } = await this.httpRequest<OkResponse>(
       'POST',
       `/api/approvals/${encodeURIComponent(sessionId)}/${encodeURIComponent(approvalId)}`,
       typeof answer === 'boolean' ? { granted: answer } : answer,
     );
-    if (status !== 200) throw new Error(`Failed to answer approval ${approvalId} (HTTP ${status})`);
+    if (status !== 200) throw new DaemonError(`Failed to answer approval ${approvalId} (HTTP ${status})`, status, (data as Partial<ErrorBody>).code);
     return data;
   }
 
@@ -757,35 +639,20 @@ export class ApiClient {
     return { ready, close: () => socket.close() };
   }
 
-  async getCommands(): Promise<{ commands: { name: string; description: string }[] }> {
-    const res = await this.httpRequest<{ commands: { name: string; description: string }[] } & ErrorResponse>('GET', '/api/commands');
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Failed to fetch commands');
-    }
-    return res.data;
+  getCommands(): Promise<CommandsResponse> {
+    return this.call('GET', '/api/commands', 'Failed to fetch commands');
   }
 
-  async sendCommand(name: string, args: Record<string, string> = {}): Promise<{ ok: boolean; settings?: Record<string, unknown> }> {
-    const res = await this.httpRequest<{ ok: boolean; settings?: Record<string, unknown> } & ErrorResponse>('POST', `/api/commands/${name}`, { args });
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || `Command ${name} failed`);
-    }
-    return res.data;
+  sendCommand(name: string, args: Record<string, string> = {}): Promise<CommandResponse> {
+    return this.call('POST', `/api/commands/${name}`, `Command ${name} failed`, { args });
   }
 
-  async getSettings(): Promise<Record<string, unknown>> {
-    const res = await this.httpRequest<Record<string, unknown> & ErrorResponse>('GET', '/api/settings');
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Failed to fetch settings');
-    }
-    return res.data;
+  getSettings(): Promise<SettingsResponse> {
+    return this.call('GET', '/api/settings', 'Failed to fetch settings');
   }
 
-  async updateSettings(changes: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const res = await this.httpRequest<Record<string, unknown> & ErrorResponse>('PATCH', '/api/settings', changes);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Failed to update settings');
-    }
-    return res.data;
+  updateSettings(changes: Record<string, unknown>): Promise<SettingsUpdateResponse> {
+    return this.call('PATCH', '/api/settings', 'Failed to update settings', changes);
   }
 }
+

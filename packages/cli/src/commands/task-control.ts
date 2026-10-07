@@ -1,8 +1,8 @@
 import { flag, hasFlag, positionals, readLastSession, resolveTaskId } from '../utils';
 import { askYesNo, fail } from './shared';
 import { ensureDaemon, resolvePort } from '../daemon';
-import { ApiClient } from '../apiClient';
-import { pastGateConfirmation, titledTaskRef, type SerializedPlan } from '@ordewell/core';
+import { ApiClient, type PlanBody } from '../apiClient';
+import { pastGateConfirmation, titledTaskRef } from '@ordewell/core';
 
 type Action = 'run' | 'force-start' | 'retry' | 'cancel';
 
@@ -21,7 +21,7 @@ export async function withResolvedTask(
   subArgs: string[],
   usage: string,
   injectedApi: ApiClient | undefined,
-  run: (api: ApiClient, sessionId: string, taskId: string, plan: SerializedPlan) => Promise<void>,
+  run: (api: ApiClient, sessionId: string, taskId: string, plan: PlanBody) => Promise<void>,
 ): Promise<void> {
   const workspace = flag(subArgs, '--workspace') || process.cwd();
   let sessionId = flag(subArgs, '--session-id');
@@ -56,7 +56,7 @@ export async function withResolvedTask(
     process.exit(1);
   }
 
-  await run(api, sessionId, taskId, plan as SerializedPlan);
+  await run(api, sessionId, taskId, plan);
 }
 
 /** Starting a task outside the scheduler, which is what can pass a merge gate. */

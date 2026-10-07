@@ -1,13 +1,24 @@
 import { Hono } from 'hono';
 import { OrchestratorPool, getSessionList, removeSession } from '../pool/orchestratorPool';
-import { listTaskLogAttempts, loadSessionPlanState, readTaskLog, WorkspaceNotFoundError } from '@ordewell/core';
+import {
+  listTaskLogAttempts,
+  loadSessionPlanState,
+  readTaskLog,
+  type AdoptSessionResponse,
+  type OkResponse,
+  type SessionListResponse,
+  type SessionResponse,
+  type TaskLogAttemptsResponse,
+  type TaskLogResponse,
+} from '@ordewell/core';
+import { failure, refuse } from './errors';
 
 export function sessionsRoute(pool: OrchestratorPool) {
   const router = new Hono();
 
   router.get('/', (c) => {
     const ws = c.req.query('workspace') || process.cwd();
-    const sessions = getSessionList(ws);
+    const sessions: SessionListResponse = getSessionList(ws);
     return c.json(sessions);
   });
 
@@ -22,8 +33,8 @@ export function sessionsRoute(pool: OrchestratorPool) {
     const ws = c.req.query('workspace') || process.cwd();
     const id = c.req.param('id');
     const saved = loadSessionPlanState(id, ws);
-    if (!saved) return c.json({ error: 'Session not found' }, 404);
-    return c.json({ meta: saved.meta, plan: pool.getPlanState(id) ?? saved.plan });
+    if (!saved) return refuse(c, 404, 'Session not found', 'session_not_found');
+    return c.json({ meta: saved.meta, plan: pool.getPlanState(id) ?? saved.plan } satisfies SessionResponse);
   });
 
   /**
@@ -36,12 +47,9 @@ export function sessionsRoute(pool: OrchestratorPool) {
     try {
       const id = c.req.param('id');
       const plan = pool.adoptSavedSession(id, ws);
-      return c.json({ ok: true, plan, goal: pool.getGoal(id) });
+      return c.json({ ok: true, plan, goal: pool.getGoal(id) } satisfies AdoptSessionResponse);
     } catch (err: unknown) {
-      if (err instanceof WorkspaceNotFoundError) return c.json({ error: err.message }, 400);
-      const message = err instanceof Error ? err.message : undefined;
-      const status = message === 'Session not found' ? 404 : 500;
-      return c.json({ error: message ?? 'Failed to load session' }, status);
+      return failure(c, err, 'load session', { message: 'Failed to load session' });
     }
   });
 
@@ -52,27 +60,27 @@ export function sessionsRoute(pool: OrchestratorPool) {
    */
   router.get('/:id/tasks/:taskId/log', (c) => {
     const ws = c.req.query('workspace') || process.cwd();
-    return c.json({ attempts: listTaskLogAttempts({ baseDir: ws, sessionId: c.req.param('id') }, c.req.param('taskId')) });
+    return c.json({ attempts: listTaskLogAttempts({ baseDir: ws, sessionId: c.req.param('id') }, c.req.param('taskId')) } satisfies TaskLogAttemptsResponse);
   });
 
   router.get('/:id/tasks/:taskId/log/:attempt', (c) => {
     const ws = c.req.query('workspace') || process.cwd();
     const attempt = Number(c.req.param('attempt'));
-    if (!Number.isInteger(attempt) || attempt < 1) return c.json({ error: 'attempt must be a positive integer' }, 400);
-    return c.json({ attempt, events: readTaskLog({ baseDir: ws, sessionId: c.req.param('id') }, c.req.param('taskId'), attempt) });
+    if (!Number.isInteger(attempt) || attempt < 1) return refuse(c, 400, 'attempt must be a positive integer');
+    return c.json({ attempt, events: readTaskLog({ baseDir: ws, sessionId: c.req.param('id') }, c.req.param('taskId'), attempt) } satisfies TaskLogResponse);
   });
 
   router.delete('/:id', (c) => {
     const ws = c.req.query('workspace') || process.cwd();
     const ok = removeSession(c.req.param('id'), ws);
-    return c.json({ ok });
+    return c.json({ ok } satisfies OkResponse);
   });
 
   // Stops the orchestrator (killing every tmux window it spawned) and drops
   // the in-memory planner conversation. No-op if already closed/unregistered.
   router.post('/:id/close', (c) => {
     pool.destroy(c.req.param('id'));
-    return c.json({ ok: true });
+    return c.json({ ok: true } satisfies OkResponse);
   });
 
   return router;

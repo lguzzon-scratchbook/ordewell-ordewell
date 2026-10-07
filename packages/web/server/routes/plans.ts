@@ -1,51 +1,29 @@
 import { Hono, type Context, type Env } from 'hono';
-import { ConversationBusyError, ConversationEditError, flattenTasks, PlanEditError, TaskControlError, WorkspaceNotFoundError, WorkspaceNotAProjectError } from '@ordewell/core';
+import {
+  flattenTasks,
+  type ConversationCompactResponse,
+  type ConversationForkResponse,
+  type ConversationRewindResponse,
+  type ExecuteResponse,
+  type ForceSendResponse,
+  type GeneratePlanResponse,
+  type IsolationDiffResponse,
+  type IsolationMergeResponse,
+  type MergeGateResponse,
+  type OkResponse,
+  type PlanResponse,
+  type PrdResponse,
+  type RemoveMessageResponse,
+  type ResolveConflictResponse,
+  type RewindTargetsResponse,
+  type StopResponse,
+  type TaskMessageResponse,
+  type CancelPlanningResponse,
+} from '@ordewell/core';
 import { OrchestratorPool } from '../pool/orchestratorPool';
-
-/**
- * A JSON error response from a thrown call: the status is looked up by message,
- * falling back per route. Only a real fault (5xx) is logged; a refusal is the
- * request being wrong and travels to the client as-is.
- */
-function failure(
-  c: Context,
-  err: unknown,
-  statuses: Record<string, number>,
-  fallback: number,
-  label: string,
-  messageFallback = 'Internal error',
-) {
-  const e = err as Error;
-  const status = statuses[e.message] ?? fallback;
-  if (status >= 500) console.error(`[plans] ${label} failed:`, err);
-  return c.json({ error: e.message || messageFallback }, status as Parameters<typeof c.json>[1]);
-}
-
-/**
- * The three answers a task edit can have. A refusal is the request being wrong
- * (400), a missing session is 404, and only a real fault is 500 — collapsing
- * all three into 404/500 gave the TUI and VS Code nothing to show but "Internal
- * error", which reads as the edit having silently done nothing.
- */
-function editFailure(c: Context, err: unknown) {
-  const e = err as Error;
-  if (e instanceof PlanEditError || e instanceof TaskControlError) return c.json({ error: e.message }, 400);
-  return failure(c, err, { 'Session not found': 404 }, 500, 'task edit');
-}
+import { failure, refuse } from './errors';
 
 const NO_CHECKPOINT = 'The task is not waiting at a checkpoint — it was answered already, withdrawn, or has no runner left to hear it.';
-
-/**
- * A refused conversation edit is either the request being wrong (400) or
- * arriving mid-turn (409) — the same call succeeds once the reply lands, and a
- * surface should say "wait", not "invalid".
- */
-function conversationFailure(c: Context, err: unknown) {
-  const e = err as Error;
-  if (e instanceof ConversationBusyError) return c.json({ error: e.message }, 409);
-  if (e instanceof ConversationEditError) return c.json({ error: e.message }, 400);
-  return failure(c, err, { 'Session not found': 404 }, 500, 'conversation edit');
-}
 
 export function plansRoute(pool: OrchestratorPool) {
   const router = new Hono();
@@ -62,33 +40,24 @@ export function plansRoute(pool: OrchestratorPool) {
       const runnerList: string[] = Array.isArray(runners) ? runners : (runners ? [runners] : (queryRunners ? queryRunners.split(',').map(s => s.trim()).filter(Boolean) : pool.getRunnerState().enabledRunners));
       const plan = await pool.generatePlan(c.req.param('sessionId'), goal, runnerList, ws, model, { allowInit });
       const { models, modelsByRunner } = await pool.getProviderModels();
-      return c.json({ plan, models, modelsByRunner });
+      return c.json({ plan, models, modelsByRunner } satisfies GeneratePlanResponse);
     } catch (err) {
-      if (err instanceof WorkspaceNotFoundError) return c.json({ error: err.message }, 400);
-      if (err instanceof WorkspaceNotAProjectError) {
-        return c.json({ error: err.message, code: 'workspace_not_a_project', workspace: err.workspace }, 400);
-      }
-      // Log before returning: the message alone travels to the client, so an
-      // unexpected throw in here (a research tool crashing the whole turn, say)
-      // left no stack anywhere — server.log showed nothing and the CLI showed
-      // one line. Diagnosing that cost far more than this console.error.
-      console.error('[plans] generate failed:', err);
-      return c.json({ error: err instanceof Error ? (err as Error).message : 'Plan generation failed' }, 500);
+      return failure(c, err, 'generate', { message: 'Plan generation failed' });
     }
   });
 
   router.post('/:sessionId/execute', async (c) => {
     try {
       await pool.session(c.req.param('sessionId')).executePlan();
-      return c.json({ status: 'running' });
+      return c.json({ status: 'running' } satisfies ExecuteResponse);
     } catch (err) {
-      return failure(c, err, { 'Session not found': 404, 'No plan to execute': 400, 'Session already executing': 409 }, 500, 'execute');
+      return failure(c, err, 'execute');
     }
   });
 
   router.post('/:sessionId/stop', (c) => {
     if (pool.hasSession(c.req.param('sessionId'))) pool.session(c.req.param('sessionId')).stopExecution();
-    return c.json({ status: 'stopped' });
+    return c.json({ status: 'stopped' } satisfies StopResponse);
   });
 
   // Distinct from the stop route above, which halts *execution* (running
@@ -96,24 +65,24 @@ export function plansRoute(pool: OrchestratorPool) {
   // 404, when the session simply isn't planning right now.
   router.post('/:sessionId/planning/stop', (c) => {
     const cancelled = pool.cancelPlanning(c.req.param('sessionId'));
-    return c.json({ cancelled });
+    return c.json({ cancelled } satisfies CancelPlanningResponse);
   });
 
   router.post('/:sessionId/tasks/:taskId/complete', async (c) => {
     try {
       await pool.session(c.req.param('sessionId')).markTaskComplete(c.req.param('taskId'));
-      return c.json({ ok: true });
+      return c.json({ ok: true } satisfies OkResponse);
     } catch (err) {
-      return failure(c, err, {}, 404, 'mark complete', 'Not found');
+      return failure(c, err, 'mark complete', { fallback: 404, message: 'Not found' });
     }
   });
 
   router.post('/:sessionId/tasks/:taskId/uncomplete', async (c) => {
     try {
       await pool.session(c.req.param('sessionId')).markTaskIncomplete(c.req.param('taskId'));
-      return c.json({ ok: true });
+      return c.json({ ok: true } satisfies OkResponse);
     } catch (err) {
-      return failure(c, err, {}, 404, 'mark incomplete', 'Not found');
+      return failure(c, err, 'mark incomplete', { fallback: 404, message: 'Not found' });
     }
   });
 
@@ -128,9 +97,9 @@ export function plansRoute(pool: OrchestratorPool) {
     router.post(`/:sessionId/tasks/:taskId/${segment}`, async (c) => {
       try {
         await run(pool.session(c.req.param('sessionId')), c.req.param('taskId'));
-        return c.json({ ok: true });
+        return c.json({ ok: true } satisfies OkResponse);
       } catch (err) {
-        return failure(c, err, { 'Session not found': 404 }, 500, segment);
+        return failure(c, err, segment);
       }
     });
   }
@@ -145,9 +114,9 @@ export function plansRoute(pool: OrchestratorPool) {
       const text = typeof body === 'object' && body !== null && 'text' in body ? body.text : undefined;
       if (typeof text !== 'string' || !text.trim()) return c.json({ error: 'text is required' }, 400);
       const id = send(pool.session(c.req.param('sessionId')), c.req.param('taskId'), text);
-      return c.json({ id });
+      return c.json({ id } satisfies TaskMessageResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   };
 
@@ -158,9 +127,9 @@ export function plansRoute(pool: OrchestratorPool) {
   router.post('/:sessionId/tasks/:taskId/messages/:messageId/now', (c) => {
     try {
       const sent = pool.session(c.req.param('sessionId')).forceSendQueuedTaskMessage(c.req.param('taskId'), c.req.param('messageId'));
-      return c.json({ sent });
+      return c.json({ sent } satisfies ForceSendResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
@@ -172,27 +141,27 @@ export function plansRoute(pool: OrchestratorPool) {
       const text = typeof body === 'object' && body !== null && 'text' in body ? body.text : undefined;
       if (typeof text !== 'string' || !text.trim()) return c.json({ error: 'text is required' }, 400);
       await pool.session(c.req.param('sessionId')).continueTask(c.req.param('taskId'), text);
-      return c.json({ ok: true });
+      return c.json({ ok: true } satisfies OkResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
   router.delete('/:sessionId/tasks/:taskId/messages/:messageId', (c) => {
     try {
       const removed = pool.session(c.req.param('sessionId')).removeQueuedTaskMessage(c.req.param('taskId'), c.req.param('messageId'));
-      return c.json({ removed });
+      return c.json({ removed } satisfies RemoveMessageResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
   router.post('/:sessionId/tasks/:taskId/interrupt', async (c) => {
     try {
       await pool.session(c.req.param('sessionId')).interruptTask(c.req.param('taskId'));
-      return c.json({ ok: true });
+      return c.json({ ok: true } satisfies OkResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
@@ -203,11 +172,11 @@ export function plansRoute(pool: OrchestratorPool) {
     try {
       const session = pool.session(c.req.param('sessionId'));
       const taskId = c.req.param('taskId');
-      if (!session.awaitsCheckpoint(taskId)) return c.json({ error: NO_CHECKPOINT }, 409);
+      if (!session.awaitsCheckpoint(taskId)) return refuse(c, 409, NO_CHECKPOINT, 'checkpoint_not_waiting');
       session.approveCheckpoint(taskId);
-      return c.json({ ok: true });
+      return c.json({ ok: true } satisfies OkResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
@@ -217,11 +186,11 @@ export function plansRoute(pool: OrchestratorPool) {
       const reason = typeof body === 'object' && body !== null && 'reason' in body && typeof body.reason === 'string' ? body.reason.trim() : '';
       const session = pool.session(c.req.param('sessionId'));
       const taskId = c.req.param('taskId');
-      if (!session.awaitsCheckpoint(taskId)) return c.json({ error: NO_CHECKPOINT }, 409);
+      if (!session.awaitsCheckpoint(taskId)) return refuse(c, 409, NO_CHECKPOINT, 'checkpoint_not_waiting');
       session.rejectCheckpoint(taskId, reason || undefined);
-      return c.json({ ok: true });
+      return c.json({ ok: true } satisfies OkResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
@@ -235,9 +204,9 @@ export function plansRoute(pool: OrchestratorPool) {
         const dep = tasks.find((t) => t.id === id);
         return { id, order: dep?.order ?? 0, title: dep?.title ?? id };
       });
-      return c.json({ mergeGate });
+      return c.json({ mergeGate } satisfies MergeGateResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
@@ -245,17 +214,17 @@ export function plansRoute(pool: OrchestratorPool) {
   // outcome the surface reports, not a malformed request, so it answers 200.
   router.get('/:sessionId/isolation/diff', async (c) => {
     try {
-      return c.json({ diff: await pool.session(c.req.param('sessionId')).reviewRunDiff() });
+      return c.json({ diff: await pool.session(c.req.param('sessionId')).reviewRunDiff() } satisfies IsolationDiffResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
   router.post('/:sessionId/isolation/merge', async (c) => {
     try {
-      return c.json(await pool.session(c.req.param('sessionId')).mergeRun());
+      return c.json(await pool.session(c.req.param('sessionId')).mergeRun() satisfies IsolationMergeResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
@@ -268,9 +237,9 @@ export function plansRoute(pool: OrchestratorPool) {
     router.post(`/:sessionId/isolation/${segment}`, async (c) => {
       try {
         await run(pool.session(c.req.param('sessionId')));
-        return c.json({ ok: true });
+        return c.json({ ok: true } satisfies OkResponse);
       } catch (err) {
-        return editFailure(c, err);
+        return failure(c, err, 'task edit');
       }
     });
   }
@@ -278,9 +247,9 @@ export function plansRoute(pool: OrchestratorPool) {
   router.post('/:sessionId/tasks/:taskId/resolve-conflict', async (c) => {
     try {
       const plan = await pool.session(c.req.param('sessionId')).resolveConflictAsTask(c.req.param('taskId'));
-      return c.json({ plan });
+      return c.json({ plan } satisfies ResolveConflictResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
@@ -305,27 +274,27 @@ export function plansRoute(pool: OrchestratorPool) {
           result = await session.setTaskDependencies(taskId, dependencies.map(String));
         } catch (err) {
           // A rejected dependency edit is the client's mistake, not a fault.
-          return c.json({ error: (err as Error).message }, 400);
+          return failure(c, err, 'task dependencies', { fallback: 400 });
         }
       }
       // An empty patch still reaches updateTask — that is how a caller asks
       // whether the task exists at all.
       if (Object.keys(rest).length > 0 || (!hasRunner && !hasDeps)) result = await session.updateTask(taskId, rest);
 
-      if (!result) return c.json({ error: 'Task not found' }, 404);
-      return c.json({ ok: true });
+      if (!result) return refuse(c, 404, 'Task not found', 'task_not_found');
+      return c.json({ ok: true } satisfies OkResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
   router.delete('/:sessionId/tasks/:taskId', async (c) => {
     try {
       const result = await pool.session(c.req.param('sessionId')).removeTask(c.req.param('taskId'));
-      if (!result) return c.json({ error: 'Task not found' }, 404);
-      return c.json({ ok: true });
+      if (!result) return refuse(c, 404, 'Task not found', 'task_not_found');
+      return c.json({ ok: true } satisfies OkResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
@@ -333,19 +302,19 @@ export function plansRoute(pool: OrchestratorPool) {
     try {
       const body = await c.req.json();
       const result = await pool.session(c.req.param('sessionId')).addTask(body);
-      if (!result) return c.json({ error: 'Session not found' }, 404);
-      return c.json({ ok: true });
+      if (!result) return refuse(c, 404, 'Session not found', 'session_not_found');
+      return c.json({ ok: true } satisfies OkResponse);
     } catch (err) {
-      return editFailure(c, err);
+      return failure(c, err, 'task edit');
     }
   });
 
   router.post('/:sessionId/review/approve', async (c) => {
     try {
       const plan = await pool.session(c.req.param('sessionId')).approveReview();
-      return c.json({ plan });
+      return c.json({ plan } satisfies PlanResponse);
     } catch (err) {
-      return failure(c, err, { 'Session not found': 404, 'No plan to review': 400 }, 500, 'review approve');
+      return failure(c, err, 'review approve');
     }
   });
 
@@ -356,18 +325,18 @@ export function plansRoute(pool: OrchestratorPool) {
         return c.json({ error: 'taskIds array with at least two ids is required' }, 400);
       }
       const plan = await pool.session(c.req.param('sessionId')).requestMerge(taskIds);
-      return c.json({ plan });
+      return c.json({ plan } satisfies PlanResponse);
     } catch (err) {
-      return failure(c, err, { 'Session not found': 404 }, 400, 'merge');
+      return failure(c, err, 'merge', { fallback: 400 });
     }
   });
 
   router.post('/:sessionId/tasks/:taskId/split', async (c) => {
     try {
       const plan = await pool.session(c.req.param('sessionId')).requestSplit(c.req.param('taskId'));
-      return c.json({ plan });
+      return c.json({ plan } satisfies PlanResponse);
     } catch (err) {
-      return failure(c, err, { 'Session not found': 404 }, 400, 'split');
+      return failure(c, err, 'split', { fallback: 400 });
     }
   });
 
@@ -381,13 +350,9 @@ export function plansRoute(pool: OrchestratorPool) {
       const ws = workspace || c.req.query('workspace') || process.cwd();
       const runnerList: string[] = Array.isArray(runners) ? runners : (runners ? [runners] : pool.getRunnerState().enabledRunners);
       const plan = await pool.startPlanning(c.req.param('sessionId'), goal, runnerList, ws, model, { allowInit });
-      return c.json({ plan });
+      return c.json({ plan } satisfies PlanResponse);
     } catch (err) {
-      if (err instanceof WorkspaceNotFoundError) return c.json({ error: err.message }, 400);
-      if (err instanceof WorkspaceNotAProjectError) {
-        return c.json({ error: err.message, code: 'workspace_not_a_project', workspace: err.workspace }, 400);
-      }
-      return c.json({ error: err instanceof Error ? (err as Error).message : 'Planning failed' }, 500);
+      return failure(c, err, 'converse start', { message: 'Planning failed' });
     }
   });
 
@@ -398,10 +363,9 @@ export function plansRoute(pool: OrchestratorPool) {
       const { message } = await c.req.json();
       if (!message) return c.json({ error: 'message is required' }, 400);
       const plan = await pool.continuePlanning(c.req.param('sessionId'), message);
-      return c.json({ plan });
+      return c.json({ plan } satisfies PlanResponse);
     } catch (err) {
-      if (err instanceof ConversationBusyError) return c.json({ error: err.message }, 409);
-      return failure(c, err, { 'Session not found': 404 }, 500, 'conversation message');
+      return failure(c, err, 'conversation message');
     }
   });
 
@@ -410,17 +374,17 @@ export function plansRoute(pool: OrchestratorPool) {
   // just before a user message; the original session is left as it was.
   router.post('/:sessionId/conversation/fork', (c) => {
     try {
-      return c.json(pool.forkConversation(c.req.param('sessionId')));
+      return c.json(pool.forkConversation(c.req.param('sessionId')) satisfies ConversationForkResponse);
     } catch (err) {
-      return conversationFailure(c, err);
+      return failure(c, err, 'conversation edit');
     }
   });
 
   router.get('/:sessionId/conversation/rewind-targets', (c) => {
     try {
-      return c.json({ targets: pool.session(c.req.param('sessionId')).rewindTargets() });
+      return c.json({ targets: pool.session(c.req.param('sessionId')).rewindTargets() } satisfies RewindTargetsResponse);
     } catch (err) {
-      return conversationFailure(c, err);
+      return failure(c, err, 'conversation edit');
     }
   });
 
@@ -428,9 +392,9 @@ export function plansRoute(pool: OrchestratorPool) {
     try {
       const { index } = await c.req.json();
       if (!Number.isInteger(index) || index < 0) return c.json({ error: 'index must be a non-negative integer' }, 400);
-      return c.json(pool.rewindConversation(c.req.param('sessionId'), index));
+      return c.json(pool.rewindConversation(c.req.param('sessionId'), index) satisfies ConversationRewindResponse);
     } catch (err) {
-      return conversationFailure(c, err);
+      return failure(c, err, 'conversation edit');
     }
   });
 
@@ -438,16 +402,16 @@ export function plansRoute(pool: OrchestratorPool) {
   // fail like one — a failure leaves the conversation exactly as it was.
   router.post('/:sessionId/conversation/compact', async (c) => {
     try {
-      return c.json(await pool.compactConversation(c.req.param('sessionId')));
+      return c.json(await pool.compactConversation(c.req.param('sessionId')) satisfies ConversationCompactResponse);
     } catch (err) {
-      return conversationFailure(c, err);
+      return failure(c, err, 'conversation edit');
     }
   });
 
   router.get('/:sessionId/prd', (c) => {
     const plan = pool.getPlan(c.req.param('sessionId'));
-    if (!plan?.prdMarkdown) return c.json({ error: 'No PRD found' }, 404);
-    return c.json({ prdMarkdown: plan.prdMarkdown });
+    if (!plan?.prdMarkdown) return refuse(c, 404, 'No PRD found');
+    return c.json({ prdMarkdown: plan.prdMarkdown } satisfies PrdResponse);
   });
 
   return router;

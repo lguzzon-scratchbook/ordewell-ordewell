@@ -1,13 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Hono } from 'hono';
-import { TaskControlError } from '@ordewell/core';
+import { TaskControlError, SessionNotFoundError } from '@ordewell/core';
 import type { OrchestratorPool } from '../../pool/orchestratorPool';
 import { plansRoute } from '../plans';
 
 function appFor(session: Record<string, unknown>, known = true) {
   const pool = {
     session: vi.fn(() => {
-      if (!known) throw new Error('Session not found');
+      if (!known) throw new SessionNotFoundError();
       return session;
     }),
   } as unknown as OrchestratorPool;
@@ -97,7 +97,7 @@ describe('talking to a structured task over the daemon (ADR-0018, M1)', () => {
       await request(app, 'POST', '/messages/msg-1/now'),
     ]) {
       expect(res.status).toBe(400);
-      expect(await res.json()).toEqual({ error: refusal.message });
+      expect(await res.json()).toEqual({ error: refusal.message, code: 'refused' });
     }
   });
 
@@ -115,7 +115,7 @@ describe('talking to a structured task over the daemon (ADR-0018, M1)', () => {
       await request(app, 'POST', '/interrupt'),
     ]) {
       expect(res.status).toBe(400);
-      expect(await res.json()).toEqual({ error: refusal.message });
+      expect(await res.json()).toEqual({ error: refusal.message, code: 'refused' });
     }
   });
 
@@ -148,6 +148,6 @@ describe('continuing a finished structured task over the daemon (ADR-0018, K1)',
     const res = await request(appFor({ continueTask: async () => { throw refusal; } }), 'POST', '/continue', { text: 'go on' });
 
     expect(res.status).toBe(400);
-    expect(await res.json()).toEqual({ error: refusal.message });
+    expect(await res.json()).toEqual({ error: refusal.message, code: 'refused' });
   });
 });

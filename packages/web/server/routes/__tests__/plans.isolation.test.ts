@@ -1,13 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Hono } from 'hono';
-import { createTask, PlanEditError } from '@ordewell/core';
+import { createTask, PlanEditError, SessionNotFoundError } from '@ordewell/core';
 import { OrchestratorPool } from '../../pool/orchestratorPool';
 import { plansRoute } from '../plans';
 
 function appFor(session: Record<string, unknown>) {
   const pool = {
     session: vi.fn((id: string) => {
-      if (id !== 's1') throw new Error('Session not found');
+      if (id !== 's1') throw new SessionNotFoundError();
       return session;
     }),
   } as unknown as OrchestratorPool;

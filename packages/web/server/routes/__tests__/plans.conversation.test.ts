@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { Hono } from 'hono';
-import { ConversationBusyError, ConversationEditError, listSessions, loadSession, saveSession, type LegacyPlanState } from '@ordewell/core';
+import { ConversationBusyError, ConversationEditError, listSessions, loadSession, saveSession, type LegacyPlanState, SessionNotFoundError } from '@ordewell/core';
 import { OrchestratorPool } from '../../pool/orchestratorPool';
 import { plansRoute } from '../plans';
 
@@ -24,7 +24,7 @@ function post(app: Hono, path: string, body?: unknown) {
 function poolWith(session: Record<string, unknown>, extra: Record<string, unknown> = {}) {
   return {
     session: vi.fn((id: string) => {
-      if (id !== 's1') throw new Error('Session not found');
+      if (id !== 's1') throw new SessionNotFoundError();
       return session;
     }),
     ...extra,
@@ -54,7 +54,7 @@ describe('POST /:sessionId/conversation/fork', () => {
   });
 
   it('is a 404 for a session the daemon does not hold', async () => {
-    const forkConversation = vi.fn(() => { throw new Error('Session not found'); });
+    const forkConversation = vi.fn(() => { throw new SessionNotFoundError(); });
     const app = appFor(poolWith({}, { forkConversation }));
 
     expect((await post(app, 'conversation/fork')).status).toBe(404);
@@ -118,7 +118,7 @@ describe('POST /:sessionId/conversation/rewind', () => {
   });
 
   it('is a 404 for a session the daemon does not hold', async () => {
-    const app = appFor(poolWith({}, { rewindConversation: () => { throw new Error('Session not found'); } }));
+    const app = appFor(poolWith({}, { rewindConversation: () => { throw new SessionNotFoundError(); } }));
 
     expect((await post(app, 'conversation/rewind', { index: 2 })).status).toBe(404);
   });
@@ -154,7 +154,7 @@ describe('POST /:sessionId/conversation/compact', () => {
   });
 
   it('is a 404 for a session the daemon does not hold', async () => {
-    const compactConversation = vi.fn().mockRejectedValue(new Error('Session not found'));
+    const compactConversation = vi.fn().mockRejectedValue(new SessionNotFoundError());
     const app = appFor(poolWith({}, { compactConversation }));
 
     expect((await post(app, 'conversation/compact')).status).toBe(404);

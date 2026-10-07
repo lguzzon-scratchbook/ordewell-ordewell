@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
-import { isGranted, toApprovalDecision, type ApprovalAnswer } from '@ordewell/core';
+import { isGranted, toApprovalDecision, type ApprovalAnswer, type ApprovalAnswerResponse, type ApprovalsResponse } from '@ordewell/core';
 import type { OrchestratorPool } from '../pool/orchestratorPool';
+import { refuse } from './errors';
 
 /**
  * A body's answer. `{ decision, note? }` carries a runner request's whole
@@ -32,26 +33,26 @@ export function approvalsRoute(pool: OrchestratorPool) {
 
   router.get('/:sessionId', (c) => {
     const sessionId = c.req.param('sessionId');
-    if (!pool.hasSession(sessionId)) return c.json({ error: `Unknown session: ${sessionId}` }, 404);
+    if (!pool.hasSession(sessionId)) return refuse(c, 404, `Unknown session: ${sessionId}`, 'session_not_found');
 
     return c.json({
       pending: pool.outstandingApprovals(sessionId),
       approvedScopes: pool.approvedScopes(sessionId),
-    });
+    } satisfies ApprovalsResponse);
   });
 
   router.post('/:sessionId/:approvalId', async (c) => {
     const sessionId = c.req.param('sessionId');
     const approvalId = c.req.param('approvalId');
-    if (!pool.hasSession(sessionId)) return c.json({ error: `Unknown session: ${sessionId}` }, 404);
+    if (!pool.hasSession(sessionId)) return refuse(c, 404, `Unknown session: ${sessionId}`, 'session_not_found');
 
     const answer = answerOf(await c.req.json().catch(() => null));
 
     if (!pool.resolveApproval(sessionId, approvalId, answer)) {
-      return c.json({ error: 'Approval is no longer outstanding — it timed out or was already answered.' }, 409);
+      return refuse(c, 409, 'Approval is no longer outstanding — it timed out or was already answered.', 'approval_not_outstanding');
     }
     const { decision } = toApprovalDecision(answer);
-    return c.json({ ok: true, granted: isGranted({ decision }), decision });
+    return c.json({ ok: true, granted: isGranted({ decision }), decision } satisfies ApprovalAnswerResponse);
   });
 
   return router;

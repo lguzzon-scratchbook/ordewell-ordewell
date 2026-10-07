@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
-import { WorkspaceNotFoundError, WorkspaceNotAProjectError } from '@ordewell/core';
+import { WorkspaceNotFoundError, WorkspaceNotAProjectError, SessionNotFoundError } from '@ordewell/core';
 
 import type { OrchestratorPool } from '../../pool/orchestratorPool';
 
@@ -143,7 +143,7 @@ describe('task control routes', () => {
 
   it('returns 404 for an unknown session', async () => {
     const pool = fakePool({
-      session: vi.fn().mockImplementation(() => { throw new Error('Session not found'); }),
+      session: vi.fn().mockImplementation(() => { throw new SessionNotFoundError(); }),
     } as never);
     const { plansRoute } = await import('../../routes/plans');
     const app = new Hono();

@@ -48,7 +48,7 @@ describe('ApiClient', () => {
       }
       if (!adopted) {
         res.statusCode = 404;
-        return res.end(JSON.stringify({ error: 'Session not found' }));
+        return res.end(JSON.stringify({ error: 'Session not found', code: 'session_not_found' }));
       }
       res.end(JSON.stringify({ ok: true }));
     });
@@ -69,7 +69,7 @@ describe('ApiClient', () => {
       hits.push(`${req.method} ${req.url}`);
       res.statusCode = 404;
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ error: 'Session not found' }));
+      res.end(JSON.stringify({ error: 'Session not found', code: 'session_not_found' }));
     });
     servers.push(srv);
 
@@ -346,7 +346,7 @@ describe('ApiClient — adopting a saved session', () => {
     const server = await startCustomServer((_req, res) => {
       res.statusCode = 404;
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ error: 'Session not found' }));
+      res.end(JSON.stringify({ error: 'Session not found', code: 'session_not_found' }));
     });
     servers.push(server);
 

@@ -3,7 +3,7 @@ import { Hono } from 'hono';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { loadSessionPlanState, openTaskLog } from '@ordewell/core';
+import { loadSessionPlanState, openTaskLog, SessionNotFoundError } from '@ordewell/core';
 import { sessionsRoute } from '../sessions';
 import type { OrchestratorPool } from '../../pool/orchestratorPool';
 
@@ -117,7 +117,7 @@ describe('POST /api/sessions/:id/load', () => {
 
   it('answers 404 when there is no such session on disk', async () => {
     const missing = fakePool({
-      adoptSavedSession: vi.fn().mockImplementation(() => { throw new Error('Session not found'); }),
+      adoptSavedSession: vi.fn().mockImplementation(() => { throw new SessionNotFoundError(); }),
     });
     const app2 = new Hono();
     app2.route('/api/sessions', sessionsRoute(missing));

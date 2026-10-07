@@ -1631,6 +1631,25 @@ the selection along only as far as keeping it on screen needs.
 calling these "commands" — a **slash command** is what the user types; the
 effects it produces are a separate layer.
 
+**Daemon contract** (`packages/core/src/daemonContract.ts`) — every HTTP body the
+local daemon sends, as types in core: one response type per shape, plus
+`ErrorBody` and its `DaemonErrorCode`. The routes build their bodies against it
+(`satisfies`), `ApiClient` reads them back, and the TUI's `OrdewellApi` and the
+catalog's `RawCatalog` derive from it, so a field changed on one side fails to
+compile on the other. It lives in core because both packages already depend on
+it; the CLI must never import the daemon's runtime. A refusal travels as a stable
+`code`, mapped from core's typed errors (`SessionNotFoundError`, `NoPlanError`,
+`AlreadyExecutingError`, `ConversationBusyError`, …) in one table
+(`routes/errors.ts`) and surfaced to callers as `DaemonError.code`. The REST plan
+is the session's own plan state, not the `SerializedPlan` a socket carries.
+`PATCH /api/settings` also answers `switchRecall` — which model a planner switch
+landed on and why — only when the write changed the planner.
+`daemonContract.test.ts` drives `ApiClient` against the real `createApp` and
+`OrchestratorPool`.
+*Avoid:* branching on a daemon error's message text — the message is for display,
+the `code` is the contract. *Avoid:* a hand-written response type in a client or
+route; add it to the contract.
+
 **Daemon revive** (`EffectDeps.reviveDaemon`) — the TUI's answer to a server
 that went away mid-session. `ensureDaemonOwned` runs once, at launch, but the
 TUI outlives its daemon in every direction: the daemon crashes, another client
