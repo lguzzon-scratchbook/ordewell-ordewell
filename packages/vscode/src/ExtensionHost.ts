@@ -337,10 +337,10 @@ export function createExtension(services: ExtensionServices, vscodeApi: typeof v
     services.context.subscriptions.push(services.config.onDidChange(() => {
       // A raised parallel limit would otherwise wait for the next verdict to
       // be seen; a no-op while nothing runs.
-      void managerDeps.session.reschedule();
+      managerDeps.session.reschedule().catch((err) => log(`Reschedule failed: ${err instanceof Error ? err.message : String(err)}`));
       managerDeps.session.aiServiceInstance.reset();
       services.modelResolver.invalidate();
-      void discovery.refresh();
+      discovery.refresh().catch((err) => log(`Model discovery refresh failed: ${err instanceof Error ? err.message : String(err)}`));
       log('Configuration changed, reset services');
     }));
 

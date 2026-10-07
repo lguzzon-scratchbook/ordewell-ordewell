@@ -32,6 +32,40 @@ describe('closing a session', () => {
   });
 });
 
+describe('re-planning under a live session id', () => {
+  it('destroys the previous session and aborts its turn rather than orphaning it', async () => {
+    const workspace = mkdtempSync(join(tmpdir(), 'ordewell-replan-'));
+    mkdirSync(join(workspace, '.git'));
+    const pool = new OrchestratorPool();
+    const signals: (AbortSignal | undefined)[] = [];
+    const destroySpy = vi.spyOn(Session.prototype, 'destroy');
+    const spy = vi.spyOn(Session.prototype, 'startPlanning').mockImplementation(async (_goal, _runners, options) => {
+      signals.push(options?.signal);
+      return new Promise<LegacyPlanState>(() => {});
+    });
+
+    try {
+      void pool.startPlanning('s1', 'first', ['claude-code'], workspace);
+      await vi.waitFor(() => expect(signals).toHaveLength(1));
+      const first = pool.session('s1');
+
+      void pool.startPlanning('s1', 'second', ['claude-code'], workspace);
+      await vi.waitFor(() => expect(signals).toHaveLength(2));
+
+      expect(signals[0]?.aborted).toBe(true);
+      expect(signals[1]?.aborted).toBe(false);
+      expect(destroySpy.mock.contexts).toContain(first);
+      expect(pool.session('s1')).not.toBe(first);
+      expect(pool.cancelPlanning('s1')).toBe(true);
+    } finally {
+      spy.mockRestore();
+      destroySpy.mockRestore();
+      pool.destroyAll();
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('subscribing to a session', () => {
   it('sends a new socket nothing of the transcript: every client reads the conversation over REST, and a turn opens a socket each time', async () => {
     const workspace = mkdtempSync(join(tmpdir(), 'ordewell-subscribe-'));

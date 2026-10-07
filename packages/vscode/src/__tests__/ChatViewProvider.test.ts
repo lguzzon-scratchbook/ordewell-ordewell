@@ -15,11 +15,13 @@ vi.mock('vscode', () => ({
 
 const executeCommand = vscode.commands.executeCommand as unknown as ReturnType<typeof vi.fn>;
 
-function providerWithCapture(): { provider: ChatViewProvider; posted: { type: string }[]; view: { show: ReturnType<typeof vi.fn> } } {
+function providerWithCapture(): { provider: ChatViewProvider; posted: { type: string }[]; view: { show: ReturnType<typeof vi.fn> }; dispose: () => void } {
+  let onDispose: () => void = () => {};
   const provider = new ChatViewProvider({ toString: () => 'file:///ext' } as unknown as vscode.Uri);
   const posted: { type: string }[] = [];
   const fakeView = {
     show: vi.fn(),
+    onDidDispose: (fn: () => void) => { onDispose = fn; return { dispose() {} }; },
     webview: {
       options: {},
       html: '',
@@ -31,7 +33,7 @@ function providerWithCapture(): { provider: ChatViewProvider; posted: { type: st
   } as unknown as vscode.WebviewView;
   provider.resolveWebviewView(fakeView, {} as never, {} as never);
   posted.length = 0;
-  return { provider, posted, view: fakeView as unknown as { show: ReturnType<typeof vi.fn> } };
+  return { provider, posted, view: fakeView as unknown as { show: ReturnType<typeof vi.fn> }, dispose: () => onDispose() };
 }
 
 describe('ChatViewProvider.reveal', () => {
@@ -50,6 +52,21 @@ describe('ChatViewProvider.reveal', () => {
 
     provider.reveal();
 
+    expect(executeCommand).toHaveBeenCalledWith('ordewellChatView.focus');
+  });
+});
+
+describe('ChatViewProvider after its webview is disposed', () => {
+  it('stops posting to the dead webview and focuses the view again on reveal', () => {
+    const { provider, posted, view, dispose } = providerWithCapture();
+    executeCommand.mockClear();
+
+    dispose();
+    provider.setGoal('late');
+    provider.reveal();
+
+    expect(posted).toEqual([]);
+    expect(view.show).not.toHaveBeenCalled();
     expect(executeCommand).toHaveBeenCalledWith('ordewellChatView.focus');
   });
 });

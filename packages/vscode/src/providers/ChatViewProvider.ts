@@ -12,6 +12,7 @@ type ApiProvider = AiProvider;
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
+  private _viewDisposables: { dispose(): unknown }[] = [];
   private _onMessage = new vscode.EventEmitter<WebviewToHost>();
   readonly onMessage = this._onMessage.event;
   /** The planner conversation as the webview draws it; every planner event and local notice goes through here. */
@@ -20,13 +21,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   constructor(private readonly _extensionUri: vscode.Uri) {}
 
   resolveWebviewView(webviewView: vscode.WebviewView, _context: vscode.WebviewViewResolveContext, _token: vscode.CancellationToken): void {
+    this.releaseView();
     this._view = webviewView;
     webviewView.webview.options = {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this._extensionUri, 'dist', 'webviews')],
     };
-    webviewView.webview.onDidReceiveMessage((msg: WebviewToHost) => this._onMessage.fire(msg));
+    this._viewDisposables.push(
+      webviewView.webview.onDidReceiveMessage((msg: WebviewToHost) => this._onMessage.fire(msg)),
+      // Posting to a disposed webview throws; a later resolve replaces the view
+      // before this fires, so only the current one may clear the slot.
+      webviewView.onDidDispose(() => { if (this._view === webviewView) this.releaseView(); }),
+    );
     this.renderHtml(webviewView);
+  }
+
+  private releaseView(): void {
+    for (const d of this._viewDisposables) d.dispose();
+    this._viewDisposables = [];
+    this._view = undefined;
   }
 
   postMessage(msg: HostToWebview): void { this._view?.webview.postMessage(msg); }
