@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { getEventListeners } from 'events';
 import type { ApprovalDecision } from '../../../interfaces/IApproval';
 import type { AgentEvent, TaskStartOptions } from '../AgentAdapter';
@@ -392,6 +392,32 @@ describe('openEventStream', () => {
     await closeBodiless();
     const closeRefused = await openEventStream(async () => { throw new Error('ECONNREFUSED'); }, () => {});
     await closeRefused();
+  });
+
+  it('stops waiting for a stream that never connects, and still closes it', async () => {
+    vi.useFakeTimers();
+    try {
+      let aborted = false;
+      let opened = false;
+      const open = openEventStream(async (signal) => {
+        opened = true;
+        signal.addEventListener('abort', () => { aborted = true; });
+        return new Promise<Response | null>(() => {});
+      }, () => {});
+      let settled = false;
+      void open.then(() => { settled = true; });
+
+      await vi.advanceTimersByTimeAsync(4999);
+      expect(opened).toBe(true);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+
+      void (await open)();
+      expect(aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('ends the stream on close', async () => {
