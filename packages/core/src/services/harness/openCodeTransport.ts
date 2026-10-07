@@ -365,7 +365,7 @@ export interface TurnLatch {
 }
 
 export function turnLatch(): TurnLatch {
-  let markDone: () => void = () => {};
+  let markDone!: () => void;
   const ended = new Promise<void>((resolve) => { markDone = resolve; });
   const turn: TurnLatch = { live: false, done: false, ended, finish: () => { turn.done = true; markDone(); } };
   return turn;
@@ -424,7 +424,7 @@ export async function openEventStream<F>(
   onActivity?: () => void,
 ): Promise<() => Promise<void>> {
   const streamAbort = new AbortController();
-  let connected: () => void = () => {};
+  let connected!: () => void;
   const ready = new Promise<void>((resolve) => { connected = resolve; });
   const live = streamEvents(connect, streamAbort.signal, onFrame, connected, onActivity);
   await settleWithin(ready, { timeoutMs: STREAM_CONNECT_TIMEOUT_MS, onTimeout: () => undefined });
