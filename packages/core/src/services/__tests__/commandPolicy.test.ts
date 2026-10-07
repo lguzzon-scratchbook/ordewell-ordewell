@@ -1241,3 +1241,137 @@ describe('pathRefs — the directory a path is relative to', () => {
     expect(pathLikeArgs('cd api && cat ../x')).toEqual(['../x']);
   });
 });
+
+// Each of these reached `ask` or `auto` while the shell would run something
+// the refusal tier exists to stop.
+describe('bypasses of the refusal tier', () => {
+  it('refuses the pipeline negation that hid the command after it', () => {
+    expect(classifyCommand('! rm -rf src').tier).toBe('refuse');
+    expect(classifyCommand('git status && ! rm -rf src').tier).toBe('refuse');
+  });
+
+  it('refuses rather than drops substitutions past the bound on how many it reads', () => {
+    const filler = Array.from({ length: 32 }, () => '$(echo)').join(' ');
+    expect(classifyCommand(`echo ${filler} $(rm -rf ~)`).tier).toBe('refuse');
+    expect(classifyCommand(`echo ${filler} $(echo)`).tier).toBe('refuse');
+  });
+
+  it.each([
+    "bash <<< 'rm -rf ~'",
+    'bash <<EOF\nEOF',
+    'sh < x.sh',
+    '< x.sh sh',
+    'sh 0< x.sh',
+    'sh <&3',
+    'python3 < x.py',
+    'env bash <<< x',
+    'nice -n 5 sh < x.sh',
+  ])('refuses an interpreter fed code through stdin: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it('refuses cmd fed commands through stdin too', () => {
+    expect(classifyCommand('cmd < x.bat', { dialect: 'cmd' }).tier).toBe('refuse');
+  });
+
+  it('leaves stdin redirects into non-interpreters alone', () => {
+    expect(classifyCommand('cat <<< hello').tier).toBe('auto');
+    expect(classifyCommand('wc -l < package.json').tier).toBe('auto');
+    expect(classifyCommand('xargs grep foo < list').tier).toBe('ask');
+  });
+
+  it.each([
+    "bash -lc 'rm -rf ~'",
+    "sh -ec 'rm -rf ~'",
+    "zsh -fc 'rm -rf ~'",
+    "python3 -Bc 'import os'",
+    "python3 -c'import os'",
+    "node -p 'process.exit()'",
+    "node --print 'process.exit()'",
+    "node -pe 'process.exit()'",
+    "node --eval='process.exit()'",
+    "bun --print 'process.exit()'",
+    "php -r 'unlink(\"x\");'",
+    "php -B 'unlink(\"x\");'",
+    "php --run 'unlink(\"x\");'",
+    "perl -E 'unlink q(x)'",
+    "perl -lne 'unlink'",
+    "perl -e'unlink q(x)'",
+    "ruby -ne 'File.delete(1)'",
+    'pwsh -EncodedCommand cgBtACAAeAA=',
+    'pwsh -enc cgBtACAAeAA=',
+    'pwsh -ec cgBtACAAeAA=',
+    'pwsh -e cgBtACAAeAA=',
+    'pwsh -ENCODEDC cgBtACAAeAA=',
+    'pwsh -Com "rm x"',
+    'pwsh --command "rm x"',
+    'pwsh -cwa "rm x"',
+    'powershell /Command "rm x"',
+    'pwsh -Command:"rm x"',
+  ])('refuses inline code in a combined or alternate spelling: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it('refuses cmd switches glued to their command', () => {
+    expect(classifyCommand('cmd /cdel x', { dialect: 'cmd' }).tier).toBe('refuse');
+    expect(classifyCommand('cmd /q/c del x', { dialect: 'cmd' }).tier).toBe('refuse');
+  });
+
+  it('still only asks for an interpreter running a script file', () => {
+    expect(classifyCommand('python script.py').tier).toBe('ask');
+    expect(classifyCommand('node script.js').tier).toBe('ask');
+    expect(classifyCommand('pwsh -File x.ps1').tier).toBe('ask');
+  });
+
+  it.each([
+    'echo "$(echo \\); rm -rf ~)"',
+    "echo \"$(echo ')'; rm -rf ~)\"",
+    'echo "$(echo ")"; rm -rf ~)"',
+    'echo "$(echo `echo )`; rm -rf ~)"',
+    'echo `echo \\`rm -rf ~\\``',
+    'echo "`echo \\`rm -rf ~\\``"',
+  ])('finds the end of a substitution the way the shell does: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it.each([
+    'echo "$(echo # )\nrm -rf ~)"',
+    'echo "$(cat <<EOF\n(\nEOF\n)"; rm -rf ~; echo ")"',
+  ])('fails closed on a substitution body it cannot follow: %s', (cmd) => {
+    expect(classifyCommand(cmd).tier).toBe('refuse');
+  });
+
+  it('still reads ordinary substitutions', () => {
+    expect(classifyCommand('echo "$(git rev-parse HEAD)"').tier).toBe('ask');
+    expect(classifyCommand("echo $(echo ')')").tier).toBe('ask');
+    expect(classifyCommand('echo `git rev-parse HEAD`').tier).toBe('ask');
+  });
+
+  it.each(['RM -rf src', 'Rm -rf src', 'GIT push origin main', 'BASH -c "rm x"', 'ENV rm -rf src', 'Find . -delete'])(
+    'refuses a refused binary in any casing: %s', (cmd) => {
+      expect(classifyCommand(cmd).tier).toBe('refuse');
+    },
+  );
+
+  it.each(['DEL x.ts', 'Rd /s /q build', 'CMD /c "del x"', 'Del.EXE x.ts', 'POWERSHELL -Command "rm x"'])(
+    'refuses a refused cmd.exe builtin in any casing: %s', (cmd) => {
+      expect(classifyCommand(cmd, { dialect: 'cmd' }).tier).toBe('refuse');
+    },
+  );
+
+  it('does not let a re-cased name reach the silent tier', () => {
+    expect(classifyCommand('CAT package.json').tier).toBe('ask');
+    expect(classifyCommand('NICE git log').tier).toBe('ask');
+    expect(classifyCommand('nice git log').tier).toBe('auto');
+  });
+
+  it.each(['PATH+=:/tmp rm -rf src', 'FOO+=bar ls', 'env FOO+=bar rm -rf src', 'env A.B=1 rm -rf src'])(
+    'reads an appending assignment as an assignment, not the command: %s', (cmd) => {
+      expect(classifyCommand(cmd).tier).toBe('refuse');
+    },
+  );
+
+  it('names the command behind an appending assignment', () => {
+    expect(classifyCommand('PATH+=:/tmp rm -rf src').reason).toContain('"rm"');
+  });
+});

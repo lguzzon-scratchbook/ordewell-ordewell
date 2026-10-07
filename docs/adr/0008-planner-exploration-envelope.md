@@ -25,7 +25,7 @@ Meanwhile paths were not confined at all. `PoolFileSystem.resolve()` was `path.i
 |---|---|
 | `auto` | read-only inspection — runs with no prompt (the historical allowlist, widened with `rg`, `find`, `jq`, `tail`, …) |
 | `ask` | anything else not obviously destructive — one approval, remembered at `scope` granularity for the session |
-| `refuse` | writes, privilege escalation, output redirection, piping into an interpreter, inline `-c`/`-e` code — never runs, never prompts |
+| `refuse` | writes, privilege escalation, output redirection, piping or redirecting code into an interpreter, inline code in any spelling the interpreter accepts — never runs, never prompts |
 
 `refuse` is deliberately **not promptable**. A planner that can `rm` is a planner that can silently break the workspace it was asked to reason about, and this repo's thesis already puts mutation in the runners.
 
@@ -114,6 +114,30 @@ read is refused, and an argument it cannot see into prompts.
   stage's pipe, so piping into an interpreter was only asked about.
 - **A value glued onto a short flag is confined.** `grep -f/etc/passwd` skipped
   the path check that `grep -f /etc/passwd` gets.
+
+## Reading the line the way the shell does
+
+Each of these reached `ask` or `auto` while the shell ran a refused command.
+The fix in every case fails closed:
+
+- **`!` is a keyword.** `! rm -rf src` negates the pipeline's status and still
+  runs it; it is refused with the other keywords.
+- **Substitution bodies are matched quote- and escape-aware.** A quoted or
+  escaped `)` no longer closes `$(…)`, and `` \` `` inside backticks is a nested
+  substitution. A here-document or comment inside `$(…)` makes the line
+  unbalanced, since only a parser could find its end. Past 32 bodies the line
+  is refused rather than judged on the bodies read so far.
+- **Stdin is a pipe for an interpreter.** `bash <<< '…'`, a here-document, and
+  `sh < x.sh` hand the interpreter code exactly as `… | sh` does.
+- **Inline-code flags are read in every spelling.** Clusters and glued code
+  (`bash -lc`, `perl -lne`, `perl -e'…'`), `node -p`/`--print`, `php -r`,
+  PowerShell's `-EncodedCommand` and any prefix of its code parameters, and
+  `cmd /q/c`.
+- **Refusal reads names case-insensitively.** `DEL`, `Rd`, `CMD /c` and `RM`
+  run on cmd.exe and on case-insensitive filesystems. The permitted tier stays
+  exact-case, so a re-cased name never gains `auto`.
+- **`NAME+=value` is an assignment**, so the command behind it is classified;
+  `env` takes any word holding `=` as one.
 
 ## Command runners, and programs inside filters
 
@@ -278,3 +302,4 @@ resolves rather than as written.
 - 2026-10-04 — `cd` following decided by the lexer; a line that can steer `cd` keeps it asking.
 - 2026-10-04 — a `cd` or shell-moving builtin that asks is granted for its exact line.
 - 2026-10-04 — `builtin` unwrapped; `enable -f` refused.
+- 2026-10-07 — `!`, quote-aware substitution matching, stdin-fed interpreters, inline-code spellings, case-insensitive refusal, `+=` assignments.
