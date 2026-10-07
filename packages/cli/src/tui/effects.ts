@@ -1,70 +1,36 @@
 import { execSync } from 'child_process';
 import {
-  ALL_PROVIDERS, autonomyLevelLabel, clipboardCopyCommand, isCliProvider, markRequestFor, newTaskFields, type AiProvider, type ApprovalAnswer, type HasBinFn, type LegacyPlanState,
-  type PlannerModelRecall, type SerializedPlan, type SessionMeta, type TaskLogEvent,
+  ALL_PROVIDERS, autonomyLevelLabel, clipboardCopyCommand, isCliProvider, markRequestFor, newTaskFields, type AiProvider, type HasBinFn, type LegacyPlanState,
+  type PlannerModelRecall,
 } from '@ordewell/core';
 import { describeConnectionRefused, isConnectionRefused } from '../daemon';
-import { WorkspaceInitNeededError } from '../apiClient';
-import { normalizeCatalog, type RawCatalog } from '../catalog';
-import { describePlannerSwitch } from '../plannerModelSwitch';
+import { DaemonError, WorkspaceInitNeededError, type ApiClient } from '../apiClient';
+import { normalizeCatalog } from '../catalog';
+import { plannerSwitchRecall } from '../plannerModelSwitch';
 import type { Action, Effect } from './reducer';
-import type { RewindTargetView, SessionView } from './state';
-import type { MergeRunResult, WsEvent } from '../apiClient';
+import type { SessionView } from './state';
 import { mergeOutcome } from '../isolation';
 import { inboundFor } from './inbound';
 
-/** The slice of the daemon client the TUI needs; `ApiClient` satisfies it. */
-export interface OrdewellApi {
-  startConversation(sessionId: string, goal: string, runners: string[] | undefined, workspace: string, allowInit?: boolean): Promise<SerializedPlan>;
-  sendConversationMessage(sessionId: string, message: string): Promise<SerializedPlan>;
-  executePlan(sessionId: string): Promise<{ status: string }>;
-  stopExecution(sessionId: string): Promise<{ status: string }>;
-  cancelPlanning(sessionId: string): Promise<{ cancelled: boolean }>;
-  taskControl(sessionId: string, taskId: string, action: 'force-start' | 'retry' | 'cancel'): Promise<{ ok: boolean }>;
-  markTaskComplete(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
-  markTaskIncomplete(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
-  /** A structured task's saved log: which attempts exist, then one attempt's events (ADR-0018, P1). */
-  getTaskLogAttempts(sessionId: string, taskId: string, workspace?: string): Promise<number[]>;
-  getTaskLog(sessionId: string, taskId: string, attempt: number, workspace?: string): Promise<TaskLogEvent[]>;
-  sendTaskMessage(sessionId: string, taskId: string, text: string): Promise<{ id: string }>;
-  removeQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<{ removed: boolean }>;
-  forceSendTaskMessage(sessionId: string, taskId: string, text: string): Promise<{ id: string }>;
-  forceSendQueuedTaskMessage(sessionId: string, taskId: string, messageId: string): Promise<{ sent: boolean }>;
-  interruptTask(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
-  approveTaskCheckpoint(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
-  rejectTaskCheckpoint(sessionId: string, taskId: string, reason?: string): Promise<{ ok: boolean }>;
-  continueTask(sessionId: string, taskId: string, text: string): Promise<{ ok: boolean }>;
-  addTask(sessionId: string, task: Record<string, unknown>): Promise<{ ok: boolean }>;
-  updateTask(sessionId: string, taskId: string, changes: Record<string, unknown>): Promise<{ ok: boolean }>;
-  removeTask(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
-  getSessions(workspace?: string): Promise<SessionMeta[]>;
-  getSession(sessionId: string, workspace?: string): Promise<{ meta: SessionMeta; plan: SerializedPlan }>;
-  adoptSession(sessionId: string, workspace?: string): Promise<{ plan: SerializedPlan; goal: string }>;
-  deleteSession(sessionId: string, workspace?: string): Promise<{ ok: boolean }>;
-  forkConversation(sessionId: string): Promise<{ sessionId: string; goal: string; plan: unknown }>;
-  rewindTargets(sessionId: string): Promise<RewindTargetView[]>;
-  rewindConversation(sessionId: string, index: number): Promise<{ sessionId: string; goal: string; plan: unknown; rewoundMessage: string }>;
-  compactConversation(sessionId: string): Promise<{ plan: unknown; summary: string; keptMessages: number }>;
-  closeSession(sessionId: string): Promise<{ ok: boolean }>;
-  reviewRunDiff(sessionId: string): Promise<string>;
-  mergeRun(sessionId: string): Promise<MergeRunResult>;
-  discardRun(sessionId: string): Promise<void>;
-  cleanupRun(sessionId: string): Promise<void>;
-  continueWithStash(sessionId: string): Promise<void>;
-  continueWithoutIsolation(sessionId: string): Promise<void>;
-  resolveConflictAsTask(sessionId: string, taskId: string): Promise<unknown>;
-  getSettings(): Promise<Record<string, unknown>>;
-  updateSettings(changes: Record<string, unknown>): Promise<Record<string, unknown>>;
-  sendCommand(name: string, args?: Record<string, string>): Promise<{ ok: boolean; settings?: Record<string, unknown> }>;
-  getRunners(): Promise<{ runners: { id: string; name: string; enabled: boolean }[]; orchestratorModel: string }>;
-  setRunnerEnabled(runner: string, enabled: boolean): Promise<{ ok: boolean }>;
-  getModels(): Promise<RawCatalog>;
-  streamPlanning(sessionId: string, onEvent: (event: WsEvent) => void): { ready: Promise<void>; close: () => void };
-  respondToApproval(sessionId: string, approvalId: string, answer: ApprovalAnswer): Promise<{ ok: boolean }>;
-  /** Opens the execution stream. `onReady` runs only once the subscription is live. */
-  streamExecution(sessionId: string, onEvent: (event: WsEvent) => void, onReady?: (error?: Error) => void): Promise<'lost' | void>;
-  closeExecutionStream(sessionId: string): void;
-}
+/**
+ * The slice of the daemon client the TUI needs. Derived from `ApiClient` rather
+ * than restated, so a response type is declared once (the daemon contract) and
+ * a test double is checked against what the client really returns.
+ */
+export type OrdewellApi = Pick<ApiClient,
+  | 'startConversation' | 'sendConversationMessage' | 'executePlan' | 'stopExecution' | 'cancelPlanning'
+  | 'taskControl' | 'markTaskComplete' | 'markTaskIncomplete'
+  | 'getTaskLogAttempts' | 'getTaskLog'
+  | 'sendTaskMessage' | 'removeQueuedTaskMessage' | 'forceSendTaskMessage' | 'forceSendQueuedTaskMessage'
+  | 'interruptTask' | 'approveTaskCheckpoint' | 'rejectTaskCheckpoint' | 'continueTask'
+  | 'addTask' | 'updateTask' | 'removeTask'
+  | 'getSessions' | 'getSession' | 'adoptSession' | 'deleteSession' | 'closeSession'
+  | 'forkConversation' | 'rewindTargets' | 'rewindConversation' | 'compactConversation'
+  | 'reviewRunDiff' | 'mergeRun' | 'discardRun' | 'cleanupRun' | 'continueWithStash' | 'continueWithoutIsolation' | 'resolveConflictAsTask'
+  | 'getSettings' | 'updateSettings' | 'sendCommand'
+  | 'getRunners' | 'setRunnerEnabled' | 'getModels'
+  | 'streamPlanning' | 'respondToApproval' | 'streamExecution' | 'closeExecutionStream'
+>;
 
 export interface EffectDeps {
   api: OrdewellApi;
@@ -116,8 +82,7 @@ export async function runEffect(effect: Effect, deps: EffectDeps): Promise<void>
     await perform(effect, deps);
   } catch (err) {
     if (!isConnectionRefused(err)) {
-      const message = err instanceof Error ? err.message : String(err);
-      deps.dispatch({ type: 'failed', message: explain(message) });
+      deps.dispatch({ type: 'failed', message: explain(err) });
       return;
     }
 
@@ -140,12 +105,11 @@ export async function runEffect(effect: Effect, deps: EffectDeps): Promise<void>
     try {
       await perform(effect, deps);
     } catch (retryErr) {
-      const message = retryErr instanceof Error ? retryErr.message : String(retryErr);
       deps.dispatch({
         type: 'failed',
         // A fresh daemon holds no sessions, so the retry of anything
         // session-scoped legitimately 404s. Say which of the two happened.
-        message: isConnectionRefused(retryErr) ? describeConnectionRefused(deps.port) : explain(message),
+        message: isConnectionRefused(retryErr) ? describeConnectionRefused(deps.port) : explain(retryErr),
       });
     }
   }
@@ -156,11 +120,11 @@ export async function runEffect(effect: Effect, deps: EffectDeps): Promise<void>
  * almost always a restart. Reloading re-adopts it; say so rather than passing
  * the daemon's bare wording through.
  */
-function explain(message: string): string {
-  if (message === 'Session not found') {
+function explain(err: unknown): string {
+  if (err instanceof DaemonError && err.code === 'session_not_found') {
     return 'This server is no longer holding that session — it was probably restarted. Reload it with /sessions.';
   }
-  return message;
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**
@@ -417,11 +381,11 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       // nothing) and this consumes whatever comes back.
       const env: Record<string, string> = { AI_PROVIDER: effect.provider };
       const settings = await api.updateSettings({ env });
-      const recall = describePlannerSwitch(settings, effect.provider as AiProvider);
+      const recall = plannerSwitchRecall(settings);
       persistAfterDaemon(deps, { ...env, ORCHESTRATOR_MODEL: recall.model, ORDEWELL_PLANNER_EFFORT: recall.effort });
       dispatch({
         type: 'settingsLoaded',
-        settings: { aiProvider: effect.provider, orchestratorModel: recall.model, plannerThinkingEffort: recall.effort },
+        settings: { aiProvider: effect.provider as AiProvider, orchestratorModel: recall.model, plannerThinkingEffort: recall.effort },
       });
       dispatch({
         type: 'notice',

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { SessionNotFoundError } from '@ordewell/core';
 import { Hono } from 'hono';
 import type { OrchestratorPool } from '../../pool/orchestratorPool';
 import { plansRoute } from '../plans';
@@ -6,7 +7,7 @@ import { plansRoute } from '../plans';
 function appFor(session: Record<string, unknown>, known = true) {
   const pool = {
     session: vi.fn(() => {
-      if (!known) throw new Error('Session not found');
+      if (!known) throw new SessionNotFoundError();
       return session;
     }),
   } as unknown as OrchestratorPool;
@@ -58,7 +59,7 @@ describe('answering a task checkpoint over the daemon', () => {
 
     for (const res of [await post(app, 'approve'), await post(app, 'reject', { reason: 'no' })]) {
       expect(res.status).toBe(409);
-      expect(await res.json()).toEqual({ error: expect.stringContaining('not waiting at a checkpoint') });
+      expect(await res.json()).toEqual({ error: expect.stringContaining('not waiting at a checkpoint'), code: 'checkpoint_not_waiting' });
     }
     expect(approveCheckpoint).not.toHaveBeenCalled();
     expect(rejectCheckpoint).not.toHaveBeenCalled();

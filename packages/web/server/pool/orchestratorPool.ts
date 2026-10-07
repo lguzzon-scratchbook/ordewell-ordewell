@@ -20,8 +20,11 @@ import {
   migratePlanState,
   type RunnerId,
   type DiscoveredModel,
-  type OrchestratorOption,
-  type RunnerModeInfo,
+  type ModelsResponse,
+  type RunnersResponse,
+  type SettingsResponse,
+  type SettingsUpdateResponse,
+  SessionNotFoundError,
   runnerModesFrom,
   configuredProviders,
   assertWorkspaceExists,
@@ -218,7 +221,7 @@ export class OrchestratorPool {
     this.settingsService.setEnabledRunners(next);
   }
 
-  getSettings() {
+  getSettings(): SettingsResponse {
     const config = new WebConfig({ enabledRunners: this.enabledRunnerOverride() });
     const userSettings = this.settingsService.getAll();
     return {
@@ -259,7 +262,7 @@ export class OrchestratorPool {
     return this.modelResolver.getCachedPickerOptions().map((o) => ({ id: o.id }));
   }
 
-  updateSettings(changes: Record<string, unknown>) {
+  updateSettings(changes: Record<string, unknown>): SettingsUpdateResponse {
     // Read before any of this call's changes land, so a switch is judged
     // against what was actually in effect a moment ago.
     const providerBefore = new WebConfig({
@@ -381,8 +384,9 @@ export class OrchestratorPool {
     // wrote it to `.env` on the strength of this response, and would otherwise
     // reinstate the refusal as the next daemon's startup environment.
     const rejectedEnvKeys = admission?.rejected ?? [];
-    const settings: ReturnType<OrchestratorPool['getSettings']> & { rejectedEnvKeys?: string[] } = this.getSettings();
+    const settings: SettingsUpdateResponse = this.getSettings();
     if (rejectedEnvKeys.length > 0) settings.rejectedEnvKeys = rejectedEnvKeys;
+    if (switchRecall) settings.switchRecall = switchRecall;
     return settings;
   }
 
@@ -391,18 +395,7 @@ export class OrchestratorPool {
     return model;
   }
 
-  async getProviderModels(): Promise<{
-    models: DiscoveredModel[];
-    modelsByRunner: Record<string, DiscoveredModel[]>;
-    /** Each runner's manifest modes, so a surface can offer a per-task mode picker. */
-    modesByRunner: Record<string, RunnerModeInfo[]>;
-    orchestratorModel: string;
-    providers: string[];
-    /** Full cross-provider catalog for the orchestrator (planner) model picker. */
-    orchestratorModels: OrchestratorOption[];
-    /** Per-provider catalog-fetch failures, keyed by provider id. */
-    providerErrors: Record<string, string>;
-  }> {
+  async getProviderModels(): Promise<ModelsResponse> {
     const config = new WebConfig();
 
     const runnerIds = this.registry.list().map((p) => p.manifest.name);
@@ -455,7 +448,7 @@ export class OrchestratorPool {
    * enabled state. Only these should be offered for selection — an uninstalled
    * runner can't be spawned.
    */
-  async getInstalledRunners(): Promise<{ id: string; name: string; enabled: boolean }[]> {
+  async getInstalledRunners(): Promise<RunnersResponse['runners']> {
     const config = new WebConfig({ enabledRunners: this.enabledRunnerOverride() });
     const enabled = new Set(config.enabledRunners);
     const plugins = this.registry.list();
@@ -537,7 +530,7 @@ export class OrchestratorPool {
     if (live?.planState) return live.planState;
 
     const saved = loadSession(sessionId, workspace);
-    if (!saved) throw new Error('Session not found');
+    if (!saved) throw new SessionNotFoundError();
 
     const session = this.createSessionFor(sessionId, workspace);
     // The saved id is adopted too, so later persists rewrite the same file
@@ -576,7 +569,7 @@ export class OrchestratorPool {
    */
   session(sessionId: string): Session {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new Error('Session not found');
+    if (!session) throw new SessionNotFoundError();
     return session;
   }
 

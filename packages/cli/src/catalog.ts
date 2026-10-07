@@ -1,15 +1,8 @@
-import type { DiscoveredModel, OrchestratorOption, RunnerModeInfo } from '@ordewell/core';
+import type { ModelsResponse } from '@ordewell/core';
 import type { ModeView, ModelView } from './tui/state';
 
-/** The raw `/api/models` body, before any surface has looked at it. */
-export interface RawCatalog {
-  models?: DiscoveredModel[];
-  modelsByRunner?: Record<string, DiscoveredModel[]>;
-  modesByRunner?: Record<string, RunnerModeInfo[]>;
-  providers?: string[];
-  orchestratorModels?: OrchestratorOption[];
-  providerErrors?: Record<string, string>;
-}
+/** The raw `/api/models` body, before any surface has looked at it: the daemon's contract with every field optional, as a surface must tolerate an older or partial daemon. */
+export type RawCatalog = Partial<ModelsResponse>;
 
 export interface Catalog {
   /** Every executor model, each tagged with the runners that offered it. */

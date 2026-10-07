@@ -1,4 +1,5 @@
 import { Hono } from 'hono';
+import type { OkResponse, RunnersResponse } from '@ordewell/core';
 import { OrchestratorPool } from '../pool/orchestratorPool';
 
 export function runnersRoute(pool: OrchestratorPool) {
@@ -10,14 +11,14 @@ export function runnersRoute(pool: OrchestratorPool) {
     return c.json({
       runners,
       orchestratorModel: state.orchestratorModel,
-    });
+    } satisfies RunnersResponse);
   });
 
   router.put('/:id', async (c) => {
     const id = c.req.param('id');
     const body = await c.req.json();
     pool.setRunnerEnabled(id, body.enabled);
-    return c.json({ ok: true });
+    return c.json({ ok: true } satisfies OkResponse);
   });
 
   return router;

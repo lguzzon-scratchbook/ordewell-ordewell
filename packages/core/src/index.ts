@@ -85,6 +85,8 @@ export {
 export type { TaskQuery, TaskQueryField, TaskQueryCatalog, LiveOutputLookup } from './services/TaskQuery';
 export { Session, createSession, sessionRuntimeSettings, resolveSkillInvocation } from './services/createSession';
 export { PlanEditError } from './services/PlanEditError';
+export type * from './daemonContract';
+export { SessionNotFoundError, NoPlanError, AlreadyExecutingError } from './services/SessionErrors';
 export type { SessionDeps, SessionRuntimeSettings, SessionPlanner, SaveSession, ConversationFork, ConversationRewind } from './services/createSession';
 export { ConversationEditError, ConversationBusyError, PlannerTurnDiscardedError } from './services/PlannerConversation';
 export type { RewindTarget, ConversationCompaction, PlannerSubmission } from './services/PlannerConversation';

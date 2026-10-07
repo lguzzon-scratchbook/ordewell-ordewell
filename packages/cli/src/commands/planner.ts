@@ -10,7 +10,7 @@ import {
 import type { ApiClient } from '../apiClient';
 import { positionals } from '../utils';
 import { connect, fail, fetchCatalog, persistEnv, writeEnv } from './shared';
-import { describePlannerSwitch } from '../plannerModelSwitch';
+import { plannerSwitchRecall } from '../plannerModelSwitch';
 
 const KNOWN_PROVIDERS = Object.keys(ALL_PROVIDERS);
 
@@ -38,7 +38,7 @@ export async function handlePlanner(subArgs: string[], injectedApi?: ApiClient):
   // last using, its catalog default, or nothing. Only the provider is ours to
   // send — see PlannerModelMemory.
   const settings = await persistEnv(api, { AI_PROVIDER: provider });
-  const recall = describePlannerSwitch(settings, provider as AiProvider);
+  const recall = plannerSwitchRecall(settings);
   writeEnv({ ORCHESTRATOR_MODEL: recall.model, ORDEWELL_PLANNER_EFFORT: recall.effort });
 
   const meta = ALL_PROVIDERS[provider as AiProvider];

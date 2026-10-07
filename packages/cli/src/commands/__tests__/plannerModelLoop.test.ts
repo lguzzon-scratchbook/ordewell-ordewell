@@ -70,7 +70,7 @@ function fakeMemoryDaemon(opts: {
     if (typeof body.orchestratorModel === 'string' || typeof body.plannerThinkingEffort === 'string' || envCarriesModelOrEffort) {
       memory.remember(switchedTo ?? aiProvider, orchestratorModel, plannerThinkingEffort);
     }
-    return currentSettings();
+    return { ...currentSettings(), ...(switchRecall ? { switchRecall } : {}) };
   }
 
   const server = http.createServer((req, res) => {

@@ -1,10 +1,7 @@
 import { Hono } from 'hono';
+import type { CommandDescriptor, CommandResponse, CommandsResponse } from '@ordewell/core';
 import type { OrchestratorPool } from '../pool/orchestratorPool';
-
-interface CommandDescriptor {
-  name: string;
-  description: string;
-}
+import { refuse } from './errors';
 
 const COMMANDS: CommandDescriptor[] = [
   { name: 'tdd', description: 'Toggle Test-Driven Development mode (on|off|status)' },
@@ -19,7 +16,7 @@ export function commandsRoute(pool: OrchestratorPool) {
   const router = new Hono();
 
   router.get('/', (c) => {
-    return c.json({ commands: COMMANDS });
+    return c.json({ commands: COMMANDS } satisfies CommandsResponse);
   });
 
   router.post('/:name', async (c) => {
@@ -29,7 +26,7 @@ export function commandsRoute(pool: OrchestratorPool) {
 
     const command = COMMANDS.find((cmd) => cmd.name === name);
     if (!command) {
-      return c.json({ error: `Unknown command: ${name}` }, 404);
+      return refuse(c, 404, `Unknown command: ${name}`);
     }
 
     const toggle = BOOLEAN_TOGGLES[name];
@@ -40,7 +37,7 @@ export function commandsRoute(pool: OrchestratorPool) {
       } else if (action === 'off') {
         pool.updateSettings({ [toggle]: { enabled: false } });
       }
-      return c.json({ ok: true, settings: pool.getSettings() });
+      return c.json({ ok: true, settings: pool.getSettings() } satisfies CommandResponse);
     }
 
     if (name === 'transport') {
@@ -48,12 +45,12 @@ export function commandsRoute(pool: OrchestratorPool) {
       if (action === 'terminal' || action === 'structured') {
         pool.updateSettings({ runnerTransport: action });
       } else if (action !== 'status') {
-        return c.json({ error: `Unknown transport: ${action} (terminal|structured)` }, 400);
+        return refuse(c, 400, `Unknown transport: ${action} (terminal|structured)`);
       }
-      return c.json({ ok: true, settings: pool.getSettings() });
+      return c.json({ ok: true, settings: pool.getSettings() } satisfies CommandResponse);
     }
 
-    return c.json({ error: `Unknown command: ${name}` }, 404);
+    return refuse(c, 404, `Unknown command: ${name}`);
   });
 
   return router;

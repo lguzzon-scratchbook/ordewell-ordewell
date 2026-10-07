@@ -134,7 +134,7 @@ describe('ordewell planner', () => {
         orchestratorModel: 'sonnet',
         plannerThinkingEffort: 'high',
         aiProvider: 'openrouter',
-        plannerModels: { 'claude-code': { model: 'sonnet', effort: 'high' } },
+        switchRecall: { model: 'sonnet', effort: 'high', source: 'remembered' },
       },
       models: CATALOG,
     });
@@ -152,7 +152,7 @@ describe('ordewell planner', () => {
 
   it('says so and points at `ordewell model set` when the daemon fell back to a catalog default', async () => {
     const d = await fakeDaemon({
-      settings: { orchestratorModel: 'sonnet', aiProvider: 'openrouter', plannerModels: {} },
+      settings: { orchestratorModel: 'sonnet', aiProvider: 'openrouter', switchRecall: { model: 'sonnet', effort: '', source: 'catalog-default' } },
       models: CATALOG,
     });
     const { handlePlanner } = await import('../planner');

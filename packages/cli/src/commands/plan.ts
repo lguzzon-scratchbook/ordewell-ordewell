@@ -4,24 +4,29 @@ import { ensureDaemon, resolvePort } from '../daemon';
 import { ApiClient } from '../apiClient';
 import { createApprovalHandler } from '../approvals';
 import { createStepLog, type LogLine } from './researchLog';
-import type { SerializedPlan, SerializedTask, DiscoveredModel } from '@ordewell/core';
+import type { SerializedTask, DiscoveredModel } from '@ordewell/core';
 import { mintSessionId, taskOrderLabel } from '@ordewell/core';
-import type { WsEvent } from '../apiClient';
+import type { PlanBody, WsEvent } from '../apiClient';
 
 // The one-shot endpoint answers with the stored plan state (`pendingTasks`),
 // the conversation with the wire plan (`tasks`); read as `tasks` alone, a
 // one-shot plan printed as "Plan: 0 tasks" over the tasks it had just made.
-function planTasks(plan: SerializedPlan): SerializedTask[] {
+function planTasks(plan: PlanBody): SerializedTask[] {
   return plan ? allTasksOf(plan as unknown as Record<string, unknown>) as unknown as SerializedTask[] : [];
 }
 
+/** The runners a plan names; a plan still in its planning phase names none, so the request's stand in. */
+function runnersOf(plan: PlanBody, requested: string[]): string[] {
+  return ('runners' in plan && plan.runners) || requested;
+}
+
 /** The planner committed once it has actual tasks; before that it's still talking. */
-function hasCommittedPlan(plan: SerializedPlan): boolean {
+function hasCommittedPlan(plan: PlanBody): boolean {
   return planTasks(plan).length > 0;
 }
 
-function lastPlannerMessage(plan: SerializedPlan): string {
-  const history = plan?.conversationHistory || [];
+function lastPlannerMessage(plan: PlanBody): string {
+  const history = ('conversationHistory' in plan && plan.conversationHistory) || [];
   for (let i = history.length - 1; i >= 0; i--) {
     if (history[i].role === 'assistant') return history[i].content;
   }
@@ -85,7 +90,7 @@ async function withSpinner<T>(label: string, work: () => Promise<T>): Promise<T>
   }
 }
 
-function printPlan(plan: SerializedPlan, sessionId: string, runners: string[], models: DiscoveredModel[]): void {
+function printPlan(plan: PlanBody, sessionId: string, runners: string[], models: DiscoveredModel[]): void {
   const tasks = planTasks(plan);
   const aiCount = tasks.filter((t: SerializedTask) => t.type !== 'user').length;
   const manCount = tasks.filter((t: SerializedTask) => t.type === 'user').length;
@@ -100,7 +105,7 @@ function printPlan(plan: SerializedPlan, sessionId: string, runners: string[], m
       : ` (${task.assignedModel.modelLabel})`;
   };
 
-  console.log(`\nPlan: ${tasks.length} task${tasks.length === 1 ? '' : 's'} (${aiCount} AI, ${manCount} Manual) — ${(plan.runners || runners).join(', ')}`);
+  console.log(`\nPlan: ${tasks.length} task${tasks.length === 1 ? '' : 's'} (${aiCount} AI, ${manCount} Manual) — ${runnersOf(plan, runners).join(', ')}`);
   console.log(`Session: ${sessionId}\n`);
 
   for (const t of tasks) {
@@ -235,7 +240,7 @@ export async function handlePlan(
 
   try {
     await stream.ready;
-    let plan: SerializedPlan | undefined;
+    let plan: PlanBody;
     let models: DiscoveredModel[] = [];
 
     if (oneShot) {
@@ -285,7 +290,7 @@ export async function handlePlan(
     process.stderr.write('\n');
 
     printPlan(plan, sessionId, runners, models);
-    saveLastSession(sessionId, goal, plan.runners || runners, workspace);
+    saveLastSession(sessionId, goal, runnersOf(plan, runners), workspace);
     console.log(`\n  Run 'ordewell run' to execute, 'ordewell status' to inspect, or 'ordewell tui' for the full UI.`);
   } catch (err) {
     reader?.close();

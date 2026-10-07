@@ -5,7 +5,8 @@ import { normalizeCatalog, type Catalog } from '../catalog';
 import { findEnvFile, writeEnvVar } from '../utils/env';
 import { allTasksOf } from '../utils/tasks';
 import type { TaskView } from '../tui/state';
-import type { SerializedPlan, SerializedTask } from '@ordewell/core';
+import type { SerializedPlan, SerializedTask, SettingsUpdateResponse } from '@ordewell/core';
+import type { PlanBody } from '../apiClient';
 
 export async function connect(subArgs: string[], injected?: ApiClient): Promise<ApiClient> {
   return injected ?? new ApiClient(await ensureDaemon(resolvePort(subArgs)));
@@ -52,7 +53,7 @@ export function writeEnv(env: Record<string, string>): void {
  * refused connection would leave it holding a choice neither the daemon nor the
  * user's next command ever saw. The next daemon then starts from that file.
  */
-export async function persistEnv(api: ApiClient, env: Record<string, string>): Promise<Record<string, unknown>> {
+export async function persistEnv(api: ApiClient, env: Record<string, string>): Promise<SettingsUpdateResponse> {
   const settings = await api.updateSettings({ env });
   writeEnv(env);
   return settings;
@@ -93,7 +94,7 @@ export function toTaskView(task: SerializedTask & { status?: string }): TaskView
  * `tasks` on another), and the dependency rules need the *whole* plan: a
  * completed predecessor missing from the list reads as "cannot depend on it".
  */
-export function taskViews(plan: SerializedPlan): TaskView[] {
+export function taskViews(plan: PlanBody | SerializedPlan): TaskView[] {
   const tasks = allTasksOf(plan as unknown as Record<string, unknown>) as unknown as (SerializedTask & { status?: string })[];
   return [...tasks].sort((a, b) => a.order - b.order).map(toTaskView);
 }

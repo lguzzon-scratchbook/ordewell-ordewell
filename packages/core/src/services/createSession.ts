@@ -30,6 +30,7 @@ import { PlannerUsageLedger } from './PlannerUsage';
 import { mintSessionId } from '../utils/sessionId';
 import { savePrdMarkdown, extractPrdBlock } from '../utils/prdStore';
 import { flattenTasks, keepExecutionState, DEFAULT_RUNNERS, type LegacyPlanState, type PlanState, type QueuedMessage, type Task, type TaskSnapshot, type RunnerId } from '../models/Task';
+import { AlreadyExecutingError, NoPlanError } from './SessionErrors';
 import type { AiProvider, IConfig } from '../interfaces/IConfig';
 import type { IFileSystem } from '../interfaces/IFileSystem';
 import type { IWebFetcher } from '../interfaces/IWebFetcher';
@@ -1006,8 +1007,8 @@ export class Session {
   }
 
   async executePlan(): Promise<void> {
-    if (!this.plan || !this.store.planTasks.length) throw new Error('No plan to execute');
-    if (this.orchestrator.hasLiveWork) throw new Error('Session already executing');
+    if (!this.plan || !this.store.planTasks.length) throw new NoPlanError('execute');
+    if (this.orchestrator.hasLiveWork) throw new AlreadyExecutingError();
 
     const plan = this.plan;
     await this.withSave(async () => {
@@ -1029,7 +1030,7 @@ export class Session {
   }
 
   async approveReview(): Promise<LegacyPlanState> {
-    if (!this.plan) throw new Error('No plan to review');
+    if (!this.plan) throw new NoPlanError('review');
     await this.orchestrator.approveReview();
     return this.plan;
   }

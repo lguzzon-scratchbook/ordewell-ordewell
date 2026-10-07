@@ -2,9 +2,22 @@ import { describe, it, expect, vi, type Mock, type Mocked } from 'vitest';
 import { runEffect, type EffectDeps, type OrdewellApi } from '../effects';
 import { initialState, reduce, type Action } from '../reducer';
 import type { Effect } from '../reducer';
-import type { SessionMessage } from '@ordewell/core';
+import type { SessionMessage, SettingsResponse } from '@ordewell/core';
+import { DaemonError } from '../../apiClient';
 import type { TuiState } from '../state';
 import { chatOf, messagesOf } from './chat';
+
+const SETTINGS: SettingsResponse = {
+  orchestratorModel: '',
+  aiProvider: 'claude-code',
+  plannerThinkingEffort: '',
+  maxParallel: 3,
+  tdd: { enabled: true },
+  verification: { enabled: false },
+  modelAllowlist: undefined,
+  plannerModels: undefined,
+  runnerTransport: 'structured',
+};
 
 function harness(api: Partial<OrdewellApi> = {}, over: Partial<EffectDeps> = {}) {
   const actions: Action[] = [];
@@ -819,7 +832,7 @@ describe('planner switch', () => {
       updateSettings: vi.fn().mockResolvedValue({
         orchestratorModel: 'sonnet',
         plannerThinkingEffort: 'high',
-        plannerModels: { 'claude-code': { model: 'sonnet', effort: 'high' } },
+        switchRecall: { model: 'sonnet', effort: 'high', source: 'remembered' },
       }),
     });
 
@@ -835,7 +848,7 @@ describe('planner switch', () => {
     const h = harness({
       updateSettings: vi.fn().mockResolvedValue({
         orchestratorModel: 'sonnet',
-        plannerModels: { 'claude-code': { model: 'sonnet' } },
+        switchRecall: { model: 'sonnet', effort: '', source: 'remembered' },
       }),
     });
 
@@ -847,7 +860,7 @@ describe('planner switch', () => {
 
   it('names the catalog default and points at /model when nothing was remembered', async () => {
     const h = harness({
-      updateSettings: vi.fn().mockResolvedValue({ orchestratorModel: 'sonnet', plannerModels: {} }),
+      updateSettings: vi.fn().mockResolvedValue({ orchestratorModel: 'sonnet', switchRecall: { model: 'sonnet', effort: '', source: 'catalog-default' } }),
     });
 
     await runEffect({ type: 'setPlanner', provider: 'claude-code' }, h.deps);
@@ -858,7 +871,7 @@ describe('planner switch', () => {
   });
 
   it('keeps the "pick a model" guidance when the daemon resolved nothing', async () => {
-    const h = harness({ updateSettings: vi.fn().mockResolvedValue({ orchestratorModel: '' }) });
+    const h = harness({ updateSettings: vi.fn().mockResolvedValue({ orchestratorModel: '', switchRecall: { model: '', effort: '', source: 'none' } }) });
 
     await runEffect({ type: 'setPlanner', provider: 'claude-code' }, h.deps);
 
@@ -878,17 +891,17 @@ describe('skills and settings', () => {
 
   it('sets the runner transport through the daemon and says when it applies', async () => {
     const h = harness();
-    h.api.sendCommand.mockResolvedValueOnce({ ok: true, settings: { runnerTransport: 'structured' } });
+    h.api.sendCommand.mockResolvedValueOnce({ ok: true, settings: { ...SETTINGS, runnerTransport: 'structured' } });
     await runEffect({ type: 'setTransport', transport: 'structured' }, h.deps);
 
     expect(h.api.sendCommand).toHaveBeenCalledWith('transport', { action: 'structured' });
-    expect(h.actions).toContainEqual({ type: 'settingsLoaded', settings: { runnerTransport: 'structured' } });
+    expect(h.actions).toContainEqual({ type: 'settingsLoaded', settings: { ...SETTINGS, runnerTransport: 'structured' } });
     expect(h.actions).toContainEqual({ type: 'notice', message: 'Runner transport is structured — it applies from the next run.' });
   });
 
   it('reports the terminal fallback the same way', async () => {
     const h = harness();
-    h.api.sendCommand.mockResolvedValueOnce({ ok: true, settings: { runnerTransport: 'terminal' } });
+    h.api.sendCommand.mockResolvedValueOnce({ ok: true, settings: { ...SETTINGS, runnerTransport: 'terminal' } });
     await runEffect({ type: 'setTransport', transport: 'terminal' }, h.deps);
 
     expect(h.actions).toContainEqual({ type: 'notice', message: 'Runner transport is terminal — it applies from the next run.' });
@@ -1062,10 +1075,18 @@ describe('catalogs and sessions', () => {
   });
 
   it('reports a session the server cannot adopt', async () => {
-    const h = harness({ adoptSession: vi.fn().mockRejectedValue(new Error('Session not found')) });
+    const h = harness({ adoptSession: vi.fn().mockRejectedValue(new DaemonError('Session not found', 404, 'session_not_found')) });
     await runEffect({ type: 'loadSession', sessionId: 's9' }, h.deps);
 
     expect(types(h.actions)).toContain('failed');
+    expect(messageOf(h.actions, 'failed')).toContain('Reload it with /sessions');
+  });
+
+  it('words a missing session from the daemon\'s code, never from its message', async () => {
+    const h = harness({ adoptSession: vi.fn().mockRejectedValue(new Error('Session not found')) });
+    await runEffect({ type: 'loadSession', sessionId: 's9' }, h.deps);
+
+    expect(messageOf(h.actions, 'failed')).toBe('Session not found');
   });
 
   it('deletes a session and refreshes the list', async () => {
@@ -1098,7 +1119,7 @@ describe('failures', () => {
   // Now that loading adopts the session, this only happens when the daemon has
   // restarted underneath us — so the advice is to reload, not to re-plan.
   it('tells the user to reload a session the daemon no longer holds', async () => {
-    const h = harness({ markTaskComplete: vi.fn().mockRejectedValue(new Error('Session not found')) });
+    const h = harness({ markTaskComplete: vi.fn().mockRejectedValue(new DaemonError('Session not found', 404, 'session_not_found')) });
     await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action: 'complete' }, h.deps);
 
     const failure = h.actions.find((a) => a.type === 'failed') as Extract<Action, { type: 'failed' }>;
@@ -1187,7 +1208,7 @@ describe('a daemon that went away mid-session', () => {
     const h = harness({
       markTaskComplete: vi.fn()
         .mockRejectedValueOnce(refused())
-        .mockRejectedValue(new Error('Session not found')),
+        .mockRejectedValue(new DaemonError('Session not found', 404, 'session_not_found')),
     });
 
     await runEffect({ type: 'taskAction', sessionId: 's1', taskId: 't1', action: 'complete' }, h.deps);
