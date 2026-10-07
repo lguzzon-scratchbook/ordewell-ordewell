@@ -51,7 +51,7 @@ export interface OrchestratorObserver {
   onTaskSettled?(data: { taskId: string }): void;
   onTick?(): void;
   onExecutionComplete?(): void;
-  /** Queued user messages are ready to be processed by the planner. */
+  /** The run is parked behind queued user messages, with nothing live, until they are drained. */
   onQueueReady?(): void;
   onReviewNeeded?(data: { tasks: Task[]; planRunners: RunnerId[] }): void;
   onReviewApproved?(data: { tasks: Task[] }): void;

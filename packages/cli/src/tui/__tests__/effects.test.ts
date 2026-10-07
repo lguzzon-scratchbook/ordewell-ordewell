@@ -18,7 +18,6 @@ function harness(api: Partial<OrdewellApi> = {}, over: Partial<EffectDeps> = {})
       executePlan: vi.fn().mockResolvedValue({ status: 'started' }),
       stopExecution: vi.fn().mockResolvedValue({ status: 'stopped' }),
       cancelPlanning: vi.fn().mockResolvedValue({ cancelled: true }),
-      processQueued: vi.fn().mockResolvedValue({ ok: true }),
       taskControl: vi.fn().mockResolvedValue({ ok: true }),
       markTaskComplete: vi.fn().mockResolvedValue({ ok: true }),
       markTaskIncomplete: vi.fn().mockResolvedValue({ ok: true }),
@@ -414,21 +413,6 @@ describe('execution', () => {
       updates: { a: { status: 'completed', idleSince: null }, b: { status: 'running', idleSince: null } },
       sessionId: 's1',
     });
-  });
-
-  it('drains a queued edit on queue_ready so dependents resume fanning out', async () => {
-    const h = withEvents({ type: 'queue_ready' });
-    await runEffect({ type: 'execute', sessionId: 's1' }, h.deps);
-
-    expect(h.actions).toContainEqual({ type: 'queueReady', sessionId: 's1' });
-  });
-
-  it('the processQueued effect drains the queue over the daemon and refreshes the plan', async () => {
-    const h = harness();
-    await runEffect({ type: 'processQueued', sessionId: 's1' }, h.deps);
-
-    expect(h.api.processQueued).toHaveBeenCalledWith('s1');
-    expect(h.api.getSession).toHaveBeenCalledWith('s1', '/ws');
   });
 
   it('names the task that just started in the status line', async () => {

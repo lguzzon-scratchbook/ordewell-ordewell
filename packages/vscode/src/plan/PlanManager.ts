@@ -533,8 +533,11 @@ export function handleSessionMessage(
       deps.chatProvider.showPlan(plan);
       break;
     }
-    case 'queue_ready':
-      processQueuedBatched(deps);
+    // The Session applies a run's queued edits itself and announces the plan
+    // they made, which carries what is still queued; the strip follows it, so
+    // an applied edit stops showing as waiting.
+    case 'plan_generated':
+      deps.chatProvider.showPendingPlanEdits(msg.plan.queuedMessages ?? []);
       break;
     case 'execution_complete': {
       const plan = deps.getCurrentPlan();
@@ -574,7 +577,6 @@ export function handleSessionMessage(
     case 'planner_liveness':
     case 'research_step':
     case 'research_step_done':
-    case 'plan_generated':
     case 'review_approved':
     case 'task_updated':
     case 'planner_turn_started':
@@ -602,13 +604,4 @@ export function handleSessionMessage(
       return exhaustive;
     }
   }
-}
-
-export async function processQueuedBatched(deps: PlanManagerDeps): Promise<void> {
-  await deps.session.processQueuedMessages();
-  // The batch applied the pending edits, so the webview's strip must empty with it —
-  // otherwise a withdrawn or applied edit lingers as if still waiting.
-  deps.chatProvider.showPendingPlanEdits([]);
-  deps.chatProvider.showPlan(deps.getCurrentPlan());
-  deps.persistState();
 }

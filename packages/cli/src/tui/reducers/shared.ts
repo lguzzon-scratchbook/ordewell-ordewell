@@ -63,7 +63,6 @@ export type Effect =
   | { type: 'execute'; sessionId: string }
   | { type: 'stopExecution'; sessionId: string }
   | { type: 'cancelPlanning'; sessionId: string }
-  | { type: 'processQueued'; sessionId: string }
   /** Schedules the stop-arm expiry; the runtime owns the timer, not the reducer. */
   | { type: 'disarmStop'; afterMs: number; arm: number }
   /** `watch` asks the runtime to hold the execution stream open for this action — see `taskActionEffect`. */
@@ -123,7 +122,6 @@ export type Action =
   | { type: 'handoffDiff'; diff: string; sessionId?: string }
   /** The run and its record are gone; nothing is left to hand off or to mark. */
   | { type: 'runCleared'; sessionId?: string }
-  | { type: 'queueReady'; sessionId?: string }
   /** The scheduled expiry of an armed stop; the arm simply lapses. */
   | { type: 'stopDisarmed'; arm: number }
   | { type: 'executionComplete'; summary?: { total: number; completed: number; failed: number }; stopped?: boolean; sessionId?: string }

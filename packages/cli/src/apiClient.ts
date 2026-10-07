@@ -576,14 +576,6 @@ export class ApiClient {
     return res.data;
   }
 
-  async processQueued(sessionId: string): Promise<{ ok: boolean }> {
-    const res = await this.httpRequest<{ ok: boolean } & ErrorResponse>('POST', `/api/plans/${sessionId}/process-queued`);
-    if (res.status !== 200) {
-      throw new Error(res.data?.error || 'Process queued failed');
-    }
-    return res.data;
-  }
-
   async getSessions(workspace?: string): Promise<SessionMeta[]> {
     const qs = workspace
       ? `?workspace=${encodeURIComponent(workspace)}`

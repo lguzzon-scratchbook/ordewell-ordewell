@@ -20,7 +20,6 @@ export interface OrdewellApi {
   executePlan(sessionId: string): Promise<{ status: string }>;
   stopExecution(sessionId: string): Promise<{ status: string }>;
   cancelPlanning(sessionId: string): Promise<{ cancelled: boolean }>;
-  processQueued(sessionId: string): Promise<{ ok: boolean }>;
   taskControl(sessionId: string, taskId: string, action: 'force-start' | 'retry' | 'cancel'): Promise<{ ok: boolean }>;
   markTaskComplete(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
   markTaskIncomplete(sessionId: string, taskId: string): Promise<{ ok: boolean }>;
@@ -247,11 +246,6 @@ async function perform(effect: Effect, deps: EffectDeps): Promise<void> {
       timer.unref?.();
       return;
     }
-
-    case 'processQueued':
-      await api.processQueued(effect.sessionId);
-      await refreshPlan(deps, effect.sessionId);
-      return;
 
     case 'taskAction': {
       const { sessionId, taskId, action } = effect;

@@ -183,7 +183,6 @@ export type SessionMessage =
   | { type: 'checkpoint'; taskId: string; taskTitle: string; summary: string }
   | { type: 'execution_complete'; summary: { total: number; completed: number; failed: number } }
   | { type: 'execution_stopped' }
-  | { type: 'queue_ready' }
   | { type: 'task_updated'; taskId: string; changes: Record<string, unknown> }
   | { type: 'task_started'; taskId: string; order: number; title: string; runner: RunnerId; modelId?: string }
   | { type: 'task_output'; taskId: string; text: string }

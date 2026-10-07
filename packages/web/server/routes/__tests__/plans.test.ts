@@ -170,31 +170,3 @@ describe('task control routes', () => {
     expect(requestMerge).toHaveBeenCalledWith(['a', 'b']);
   });
 });
-
-describe('POST /:sessionId/process-queued', () => {
-  it('drains queued edits on the session so dependents resume fan-out', async () => {
-    const processQueuedMessages = vi.fn().mockResolvedValue(undefined);
-    const pool = fakePool({ session: vi.fn().mockReturnValue({ processQueuedMessages }) } as never);
-    const { plansRoute } = await import('../../routes/plans');
-    const app = new Hono();
-    app.route('/api/plans', plansRoute(pool));
-
-    const res = await app.request('/api/plans/s1/process-queued', { method: 'POST' });
-
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
-    expect(processQueuedMessages).toHaveBeenCalledTimes(1);
-  });
-
-  it('returns 404 for an unknown session', async () => {
-    const pool = fakePool({
-      session: vi.fn().mockImplementation(() => { throw new Error('Session not found'); }),
-    } as never);
-    const { plansRoute } = await import('../../routes/plans');
-    const app = new Hono();
-    app.route('/api/plans', plansRoute(pool));
-
-    const res = await app.request('/api/plans/nope/process-queued', { method: 'POST' });
-    expect(res.status).toBe(404);
-  });
-});

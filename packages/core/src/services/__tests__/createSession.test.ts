@@ -332,7 +332,7 @@ describe('processQueuedMessages', () => {
     expect(planner.modifyDuringExecution).not.toHaveBeenCalled();
   });
 
-  it('reschedules dependents after draining the queue — fan-out resumes', async () => {
+  it('applies a queued edit and resumes fan-out without any surface asking it to', async () => {
     const sessions: FakeTerminalSession[] = [];
     const runner = {
       spawn: vi.fn().mockImplementation(() => {
@@ -345,21 +345,18 @@ describe('processQueuedMessages', () => {
       activeCount: 0,
     } as unknown as ITerminalRunner;
 
-    const events: { type: string }[] = [];
-    const broadcast = (msg: { type: string }): void => { events.push({ type: msg.type }); };
-
     const t1 = createTask({ id: 't1', order: 1, title: 'First', prompt: 'do first', completionMarker: 'mk-1' });
     const t2 = createTask({ id: 't2', order: 2, title: 'Second', prompt: 'do second', dependencies: ['t1'], completionMarker: 'mk-2' });
     const planner = {
       modifyDuringExecution: vi.fn().mockResolvedValue({
         // The full plan with t1 already completed so the store rebuild keeps
         // t2's dependency satisfied and getReadyTasks re-schedules t2.
-        pendingTasks: [{ ...t1, status: 'completed' }, { ...t2, status: 'approved' }],
+        pendingTasks: [{ ...t1, status: 'completed' }, { ...t2, title: 'Second, edited', status: 'approved' }],
         message: 'ok',
       }),
     };
 
-    const session = makeSession({ runner, planner, broadcast });
+    const session = makeSession({ runner, planner });
 
     const plan: LegacyPlanState = {
       tasks: [t1, t2],
@@ -376,20 +373,18 @@ describe('processQueuedMessages', () => {
     expect(runner.spawn).toHaveBeenCalledTimes(1);
     expect((runner.spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0].taskId).toBe('t1');
 
-    // Queue a structural edit, then complete t1. With the queue non-empty, the
-    // orchestrator must pause fan-out (emit queue_ready) instead of spawning
-    // t2 — but only until the queue is drained.
+    // Queue a structural edit, then complete t1. With the queue non-empty the
+    // scheduler parks instead of spawning t2, and the Session drains the queue
+    // on its own — no surface is wired to do it.
     queue(session, 'an edit');
     sessions[0].emitOutput('Done.\n<<<ORDEWELL_DONE_mk-1>>>');
     sessions[0].emitExit(0);
 
-    await vi.waitFor(() => expect(events.map((e) => e.type)).toContain('queue_ready'));
-    expect(runner.spawn).toHaveBeenCalledTimes(1); // t2 not spawned yet
-
-    await session.processQueuedMessages();
     await vi.waitFor(() => expect(runner.spawn).toHaveBeenCalledTimes(2));
 
+    expect(planner.modifyDuringExecution).toHaveBeenCalledWith(expect.objectContaining({ userMessage: 'an edit' }));
     expect(session.getQueuedMessages().length).toBe(0);
+    expect(taskOf(session, 't2')!.title).toBe('Second, edited');
     expect((runner.spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[1][0].taskId).toBe('t2');
   });
 });

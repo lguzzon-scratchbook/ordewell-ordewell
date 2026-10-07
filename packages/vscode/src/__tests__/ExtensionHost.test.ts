@@ -151,7 +151,6 @@ function fakeSession() {
     getQueuedMessages: vi.fn(() => []),
     setQueuedMessages: vi.fn(),
     removeQueuedMessage: vi.fn(),
-    processQueuedMessages: vi.fn(async () => {}),
     reset: vi.fn(),
     loadPlan: vi.fn(),
     executePlan: vi.fn(async () => {}),

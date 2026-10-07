@@ -197,13 +197,6 @@ function reduceAction(state: TuiState, action: Action): Step {
       return step({ ...next, status, busyLabel: status === 'executing' ? runLabel(tasks, gate) : state.busyLabel });
     }
 
-    case 'queueReady': {
-      if (stale(state, action.sessionId)) return step(state);
-      const sessionId = action.sessionId ?? state.sessionId;
-      if (sessionId === null) return step(state);
-      return step(state, [{ type: 'processQueued', sessionId }]);
-    }
-
     case 'isolationBlocked': {
       if (stale(state, action.sessionId)) return step(state);
       return step(blockedPicker(state, action.message, action.repos));

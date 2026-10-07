@@ -45,9 +45,11 @@ Session constructor only receives them. The deps are the test seam
 reaches into private fields, and none spies on a module export. The Session is
 transport-agnostic. The orchestrator's observer is subscribed once for the
 session's lifetime (not per-operation), killing the double-subscribe class of
-bug — and it is the orchestrator's *only* notification channel: refresh and
-queue-ready signals travel over it and become `status_update`/`queue_ready`
-broadcasts (there is no separate `onRefresh` callback for a surface to wire).
+bug — and it is the orchestrator's *only* notification channel: refresh
+signals travel over it and become `status_update` broadcasts (there is no
+separate `onRefresh` callback for a surface to wire). The queue-ready signal
+is the Session's alone: it drains its own **Pending plan edits** when the
+scheduler parks behind them, so no surface is told or has to act.
 The Session adds to the relay's observer only the saves some events owe, each
 made before the event is announced: a task that settles on its own
 (`onTaskSettled` — completed, failed or awaiting the user) is saved as it
@@ -58,10 +60,16 @@ Mutation is an internal seam — every structural plan mutation *and every
 settled conversation turn* (plan commit, task-ops apply, planner message) runs
 one `mutatePlan` ritual (store op → persist → broadcast), and so does the
 between-batch drain of queued edits. The ritual covers plan
-edits only: scheduler actions (retry, cancel, mark complete) go through
-the orchestrator, persist after it, and reach surfaces as `status_update` over
-the observer, while `generatePlan` and `loadPlan` persist the plan they adopt
-directly. Direct (non-planner) edits go one step further
+edits only. User controls that change task state through the orchestrator
+(execute, stop, retry, cancel, mark complete or not done, force start, run one
+task, continue a task, the two ways past a dirty tree, clean up or discard a
+run, a task message, a checkpoint answer) are saved before any surface hears
+of them too: a synchronous one holds its `status_update` until the save, and
+an asynchronous one (`withSave`) saves before each `status_update` announced
+while it runs, and once more when it ends — a hold across its spawns and git
+work would stall every task's status and let an `execution_complete` it
+causes overtake the update held back. `generatePlan` and `loadPlan` persist
+the plan they adopt directly. Direct (non-planner) edits go one step further
 through `editPlan`, which adds the reschedule they owe an armed scheduler:
 nothing else wakes one after a hand edit, because a direct edit never queues,
 so a task the edit unblocked would sit ready and never start. PlanStore is the single source of truth for task
@@ -263,7 +271,7 @@ the AI service's in-memory tool-use history; `researchLog` remains the
 persisted tool trace. A reloaded session resumes by replaying this transcript
 into a fresh model context; the tool history is gone. Written only by
 **PlannerConversation**: conversation turns, queued mid-run edits
-once `processQueuedMessages` applies them (a `system` entry, so the transcript
+once the Session's drain applies them (a `system` entry, so the transcript
 and the plan do not drift apart), and a **Compaction**, which replaces it with
 a summary and its last two exchanges. A **Rewind** never writes it: the
 shortened copy goes to a new session. Every
@@ -1484,9 +1492,12 @@ entry); *Avoid:* treating unsend as cancel — nothing in flight is stopped; the
 prompt simply never goes; *Avoid:* "queued" for a **Pending plan edit**.
 
 **Pending plan edit** — a structural edit the user sent while a *run* was live:
-the Session's run-time edit queue (`getQueuedMessages`, drained by
-`processQueuedMessages` at the next batch boundary), which VS Code lists above
-the input with a way to withdraw each one. It waits on a run, not on a planner
+the Session's run-time edit queue (`getQueuedMessages`), which VS Code lists
+above the input with a way to withdraw each one. The Session drains it itself
+at the next batch boundary — when the scheduler, parked behind the queue with
+nothing live, signals queue-ready — and announces the plan the edits made
+(`plan_generated`, carrying what is still queued); no surface triggers the
+drain. It waits on a run, not on a planner
 turn, and is applied to the plan rather than sent as a prompt — a different
 concept from a queued prompt, which is why the surfaces name it apart. An edit
 stays queued until the planner's answer is applied, so the run starts nothing
