@@ -505,10 +505,11 @@ const REFUSED_SUBCOMMANDS: Record<string, string[]> = {
  * first token as `seg.binary` with no keyword awareness, so any of these
  * leading a segment hides the command it introduces as an unrecognized
  * argument instead of exposing it to classification. `(`/`)` are absent
- * because the lexer already strips subshell grouping before tokenizing.
+ * because the lexer already strips subshell grouping before tokenizing. `!`
+ * negates a pipeline's status and still runs it.
  */
 const SHELL_KEYWORDS = ['{', '}', 'if', 'then', 'elif', 'else', 'fi', 'for', 'while', 'until',
-  'do', 'done', 'case', 'esac', 'select', 'function', 'time', 'export'];
+  'do', 'done', 'case', 'esac', 'select', 'function', 'time', 'export', '!'];
 
 /**
  * Binaries that execute whatever they are handed — refused when given inline code or fed from a pipe.
@@ -524,11 +525,42 @@ const INTERPRETERS = ['sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'csh', 'tcsh',
  * cmd.exe and PowerShell both accept their switches in any casing, so a
  * case-sensitive list refused `-Command` and waved `-command` through.
  */
-const INLINE_CODE_FLAGS = ['-c', '-e', '--eval', '--command', '-Command', '--exec', '/c', '/k', '/r'];
+const INLINE_CODE_FLAGS = ['-c', '-e', '--eval', '--command', '-Command', '--exec', '/c', '/k', '/r',
+  '--print', '--run', '--process-begin', '--process-code', '--process-end'];
 
-function isInlineCodeFlag(arg: string): boolean {
-  const lower = arg.toLowerCase();
-  return INLINE_CODE_FLAGS.some((f) => f.toLowerCase() === lower);
+/**
+ * Short code flags, per interpreter, matched anywhere in a single-dash token.
+ * Exact matching missed the spellings these binaries actually accept: a cluster
+ * (`bash -lc`, `perl -lne`, `node -pe`) and code glued on (`perl -e'…'`,
+ * `python -c'…'`). A letter that is really part of a glued value (`perl
+ * -MData::Dumper`) refuses too — when unsure, refuse.
+ */
+const INLINE_CODE_LETTERS: Record<string, string> = {
+  sh: 'c', bash: 'c', zsh: 'c', fish: 'c', dash: 'c', ksh: 'c', csh: 'c', tcsh: 'c',
+  python: 'c', python2: 'c', python3: 'c',
+  node: 'ep', bun: 'ep', ruby: 'e', perl: 'e', php: 'rbe',
+};
+
+/**
+ * PowerShell binds any unambiguous prefix of a parameter name, in any casing,
+ * after `-`, `--` or `/` — so `-enc` and `-EncodedC` are `-EncodedCommand`.
+ * Ambiguous prefixes (`-co`) are refused with the rest.
+ */
+const PWSH_CODE_PARAMS = ['command', 'encodedcommand', 'commandwithargs'];
+const PWSH_CODE_ALIASES = ['ec', 'cwa'];
+
+function isInlineCodeFlag(binary: string, arg: string): boolean {
+  const lower = flagLabel(arg).toLowerCase();
+  if (INLINE_CODE_FLAGS.some((f) => f.toLowerCase() === lower)) return true;
+  if (binary === 'pwsh' || binary === 'powershell') {
+    const name = /^(?:--?|\/)([a-z]+)(?::|$)/.exec(arg.toLowerCase())?.[1];
+    return name !== undefined && (PWSH_CODE_ALIASES.includes(name) || PWSH_CODE_PARAMS.some((p) => p.startsWith(name)));
+  }
+  // cmd.exe reads `/c` wherever it sits in a run of switches, and with the
+  // command glued straight on: `cmd /q/c del x`, `cmd /cdel x`.
+  if (binary === 'cmd') return arg.startsWith('/') && /\/[ckr]/i.test(arg);
+  const letters = INLINE_CODE_LETTERS[binary];
+  return letters !== undefined && /^-[^-]/.test(arg) && [...lower.slice(1)].some((ch) => letters.includes(ch));
 }
 
 /** Binaries whose leading arguments name the operation, and so belong in a grant's scope. */
@@ -837,6 +869,12 @@ interface Segment {
   /** True when this segment consumes another command's output (`… | seg`). */
   piped: boolean;
   /**
+   * Stdin comes from a redirect, here-document or here-string. Kept apart from
+   * {@link piped}: an interpreter reads its code from either, but `xargs` is
+   * only refused for a pipe, since its documented use is `xargs … < list`.
+   */
+  stdinRedirected: boolean;
+  /**
    * A token contains a `$var` or a substitution the shell will expand. Tracked
    * at lex time because only the lexer knows a `$` inside single quotes is
    * literal.
@@ -879,6 +917,8 @@ interface Lexed {
   processSubstitution: boolean;
   /** Lexing ran off the end inside a quote or a substitution — nothing here is trustworthy. */
   unbalanced: boolean;
+  /** Substitution bodies were left unlexed when {@link lexAll} hit its bound. */
+  truncated?: boolean;
   /**
    * The line is commands joined only by `&&` and `|`, each with a command
    * name — the one shape {@link followCd} can follow. Decided here, where every
@@ -907,12 +947,51 @@ function isDevNullTarget(target: string): boolean {
   return `/${resolved.join('/')}` === '/dev/null';
 }
 
-/** Index of the `)` closing the `(` at `open`, or -1. */
-function matchParen(s: string, open: number): number {
+/**
+ * Index of the `)` closing the `$(` whose `(` is at `open`, or -1.
+ *
+ * The shell parses the body as a command line of its own, so a quoted or
+ * escaped `)` does not close it. Counting bare parens closed
+ * `"$(echo \); rm -rf ~)"` at the `\)` and left the `rm` inside what the lexer
+ * took for a quoted string. A here-document or a comment can hide a `)` from
+ * any scan short of a parser, so either one answers -1 and the caller refuses.
+ */
+function matchParen(s: string, open: number, dialect: Dialect): number {
   let depth = 0;
+  let quote = '';
   for (let i = open; i < s.length; i++) {
-    if (s[i] === '(') depth++;
-    else if (s[i] === ')' && --depth === 0) return i;
+    const c = s[i];
+    if (quote === "'") { if (c === "'") quote = ''; continue; }
+    if (c === dialect.escape && (quote === '' || dialect.escapeInQuotes)) { i++; continue; }
+    if (c === '$' && s[i + 1] === '(') {
+      const close = matchParen(s, i + 1, dialect);
+      if (close < 0) return -1;
+      i = close; continue;
+    }
+    if (c === '`') {
+      const close = matchBacktick(s, i, dialect);
+      if (close < 0) return -1;
+      i = close; continue;
+    }
+    if (quote === '"') { if (c === '"') quote = ''; continue; }
+    if (dialect.quotes.includes(c)) { quote = c; continue; }
+    if (c === '<' && s.startsWith('<<<', i)) { i += 2; continue; }
+    if (c === '<' && s[i + 1] === '<') return -1;
+    if (c === '#' && (i === open + 1 || /[\s;&|(]/.test(s[i - 1]))) return -1;
+    if (c === '(') depth++;
+    else if (c === ')' && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * Index of the backtick closing the one at `open`, or -1. Quotes do not protect
+ * a backtick here, in the shell either; only an escape does.
+ */
+function matchBacktick(s: string, open: number, dialect: Dialect): number {
+  for (let i = open + 1; i < s.length; i++) {
+    if (s[i] === dialect.escape) i++;
+    else if (s[i] === '`') return i;
   }
   return -1;
 }
@@ -945,6 +1024,7 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
   let current = '';
   let started = false;
   let piped = false;
+  let stdinRedirected = false;
   let quote = '';
 
   // Set while lexing the word after a redirect operator, so that word is
@@ -987,7 +1067,7 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
     if (tokens.length > 0) {
       const seg = toSegment(tokens, piped, dialect);
       if (!seg.binary) { followable = false; bareSegment = true; }
-      segments.push({ ...seg, expandable, inputs, joinedBy });
+      segments.push({ ...seg, expandable, stdinRedirected, inputs, joinedBy });
     } else if (!last || segments.length > 0 || joinedBy !== undefined) {
       // Nothing ran here, or only a redirect did, yet an operator still joined it.
       followable = false;
@@ -996,6 +1076,7 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
     tokens = [];
     inputs = [];
     expandable = false;
+    stdinRedirected = false;
     piped = nextPiped;
     joinedBy = next;
   };
@@ -1025,16 +1106,19 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
     // decided when the shell runs, and dropping it left an empty word — which
     // as a command name took the whole segment out of classification.
     if (c === '$' && command[i + 1] === '(') {
-      const close = matchParen(command, i + 1);
+      const close = matchParen(command, i + 1, dialect);
       if (close < 0) { unbalanced = true; break; }
       nested.push(command.slice(i + 2, close));
       current += command.slice(i, close + 1); started = true; expandable = true;
       i = close + 1; continue;
     }
     if (c === '`') {
-      const close = command.indexOf('`', i + 1);
+      const close = matchBacktick(command, i, dialect);
       if (close < 0) { unbalanced = true; break; }
-      nested.push(command.slice(i + 1, close));
+      // Inside backticks `\`` is a nested substitution, not a literal backtick,
+      // so the body is lexed with the escapes the shell strips already gone.
+      const body = command.slice(i + 1, close);
+      nested.push(dialect.escape === '\\' ? body.replace(/\\([$`\\])/g, '$1') : body);
       current += command.slice(i, close + 1); started = true; expandable = true;
       i = close + 1; continue;
     }
@@ -1072,6 +1156,9 @@ function lex(command: string, nested: string[], dialect: Dialect): Lexed {
       // `<<<` is a here-string; `>>>` is not an operator, and its third `>`
       // opens a second redirect.
       const run = c === '<' && command.startsWith('<<<', i) ? 3 : command[i + 1] === c ? 2 : 1;
+      // Any fd and a duplication count too: telling which one the program reads
+      // its code from is not worth the risk of getting it wrong.
+      if (c === '<') stdinRedirected = true;
 
       // `2>&1` / `>&2` / `<&3`: duplicates a stream, opens no file — safe.
       const dup = /^&([0-9]+|-)(?![0-9])/.exec(command.slice(i + run));
@@ -1147,8 +1234,8 @@ function binaryName(token: string, dialect: Dialect): string {
   return dialect.strippedExtensions.includes(base.slice(dot).toLowerCase()) ? base.slice(0, dot) : base;
 }
 
-/** A `NAME=value` token, in the one position a shell treats as an assignment. */
-const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/** A `NAME=value` or `NAME+=value` token, in the one position a shell treats as an assignment. */
+const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*\+?=/;
 
 /**
  * Whether the shell, not the command line, decides what this word says: it
@@ -1173,6 +1260,7 @@ function toSegment(tokens: string[], piped: boolean, dialect: Dialect): Segment 
     args: rest.slice(1),
     assignments,
     piped,
+    stdinRedirected: false,
     expandable: false,
     inputs: [],
     ...(rest.length > 0 && isComputedWord(rest[0], dialect) ? { computedBinary: rest[0] } : {}),
@@ -1239,7 +1327,8 @@ function scanWrapperArgs(binary: string, spec: WrapperSpec, args: string[]): Wra
       };
     }
 
-    if (spec.acceptsAssignments && ASSIGNMENT.test(token)) { assignments.push(token); i++; continue; }
+    // `env` takes any word holding a `=` as an assignment, not only a shell-valid name.
+    if (spec.acceptsAssignments && token.includes('=')) { assignments.push(token); i++; continue; }
     if (positionals > 0) { positionals--; i++; continue; }
     break;
   }
@@ -1309,7 +1398,7 @@ function unwrapXargs(seg: Segment, dialect: Dialect): { seg: Segment } | { reaso
  * Termination is structural: every peel consumes at least the wrapper's own
  * binary token.
  *
- * `piped` and `expandable` carry through, so piping into a wrapped interpreter
+ * `piped`, `stdinRedirected` and `expandable` carry through, so piping into a wrapped interpreter
  * is still a pipe into an interpreter, and a wrapped command whose arguments
  * are not fully visible still cannot take the silent fast path.
  */
@@ -1325,7 +1414,7 @@ function unwrap(seg: Segment, dialect: Dialect): Unwrapped {
   for (;;) {
     // Once only: `xargs xargs < list` hands the inner one its command from the
     // input, so a second `xargs` is left for XARGS_TARGETS to refuse.
-    if (current.binary === 'xargs' && runner === undefined) {
+    if (current.binary.toLowerCase() === 'xargs' && runner === undefined) {
       const peeled = unwrapXargs(current, dialect);
       if ('reason' in peeled) return { seg: { ...current, assignments }, wrappers, reason: peeled.reason };
       wrappers.push('xargs');
@@ -1335,7 +1424,7 @@ function unwrap(seg: Segment, dialect: Dialect): Unwrapped {
       continue;
     }
 
-    const spec = WRAPPER_FAMILY[current.binary];
+    const spec = WRAPPER_FAMILY[current.binary.toLowerCase()];
     if (!spec) break;
     const scan = scanWrapperArgs(current.binary, spec, current.args);
     if (scan.kind === 'refuse') return { seg: { ...current, assignments }, wrappers, runner, reason: scan.reason };
@@ -1347,7 +1436,7 @@ function unwrap(seg: Segment, dialect: Dialect): Unwrapped {
     wrappers.push(current.binary);
     const inner = toSegment(scan.tokens, current.piped, dialect);
     assignments.push(...inner.assignments);
-    current = { ...inner, assignments: [], expandable: current.expandable };
+    current = { ...inner, assignments: [], expandable: current.expandable, stdinRedirected: current.stdinRedirected };
   }
 
   return { seg: { ...current, assignments }, wrappers, runner };
@@ -1369,6 +1458,8 @@ function lexAll(command: string, dialect: Dialect, cdpathSet = false): Lexed {
     all.processSubstitution ||= inner.processSubstitution;
     all.unbalanced ||= inner.unbalanced;
   }
+  // Whatever is still queued would run unclassified.
+  if (queue.length > 0) all.truncated = true;
   return all;
 }
 
@@ -1781,7 +1872,7 @@ const SCOPE_LEAD_ARGS = 2;
  * the flag tables change.
  */
 function scopeFor(seg: Segment): string {
-  if (!MULTIPLEXERS.includes(seg.binary)) return seg.binary;
+  if (!MULTIPLEXERS.includes(seg.binary.toLowerCase())) return seg.binary;
   const lead: string[] = [];
   for (const arg of seg.args) {
     if (arg.startsWith('-')) break;
@@ -1909,8 +2000,12 @@ function refusalFor(seg: Segment): string | undefined {
     if (seg.piped) {
       return `Piping into "${seg.binary}" would run code this classifier cannot inspect. Run the producing command on its own and read its output.`;
     }
-    if (seg.args.some(isInlineCodeFlag)) {
-      return `Inline code via "${seg.binary} ${seg.args.find(isInlineCodeFlag)}" is not available to the planner. Use the read-only research tools, or describe it as a task.`;
+    if (seg.stdinRedirected) {
+      return `Feeding "${seg.binary}" from a redirect, here-document or here-string would run code this classifier cannot inspect. Read the file instead, or describe it as a task.`;
+    }
+    const inline = seg.args.find((a) => isInlineCodeFlag(seg.binary, a));
+    if (inline !== undefined) {
+      return `Inline code via "${seg.binary} ${inline}" is not available to the planner. Use the read-only research tools, or describe it as a task.`;
     }
   }
   // Checked last, so a segment whose binary or subcommand is refused on its own
@@ -1973,13 +2068,21 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
   if (!trimmed) return { tier: 'refuse', scope: '', reason: 'Empty command.' };
 
   const dialect = dialectFor(opts.dialect);
-  const { segments, unsafeRedirect, processSubstitution, unbalanced } = lexAll(trimmed, dialect, opts.cdpathSet);
+  const { segments, unsafeRedirect, processSubstitution, unbalanced, truncated } = lexAll(trimmed, dialect, opts.cdpathSet);
 
   if (unbalanced) {
     return {
       tier: 'refuse',
       scope: '',
       reason: 'Unterminated quote or command substitution — this classifier cannot tell what would actually run. Rewrite the command with balanced quotes.',
+    };
+  }
+
+  if (truncated) {
+    return {
+      tier: 'refuse',
+      scope: '',
+      reason: 'Too many command substitutions for this classifier to read them all. Run fewer at once.',
     };
   }
 
@@ -2012,7 +2115,9 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
 
   for (const { seg, wrappers, runner, reason: wrapperReason } of unwrapped) {
     if (wrapperReason) return { tier: 'refuse', scope: '', reason: wrapperReason };
-    const reason = refusalFor(seg);
+    // Matched case-insensitively: cmd.exe builtins and the default macOS and
+    // Windows filesystems all take `RM` or `Del` for the refused name.
+    const reason = refusalFor({ ...seg, binary: seg.binary.toLowerCase() });
     if (reason) return { tier: 'refuse', scope: '', reason: withWrapperNote(reason, wrappers) };
     if (runner && !XARGS_TARGETS.includes(seg.binary)) {
       return {
@@ -2025,7 +2130,12 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
 
   // A runner is never auto: the arguments it appends are the ones the flag
   // allowlist and path confinement would have had to check.
-  const nonAuto = unwrapped.filter((u) => u.runner !== undefined || !isAuto(u.seg, opts));
+  // The permitted tier stays exact-case, and a re-cased wrapper (`NICE git log`)
+  // is not let through to it either: refusal reads names case-insensitively so
+  // that it can only grow, and the silent tier must not grow with it.
+  const nonAuto = unwrapped.filter((u) => u.runner !== undefined
+    || u.wrappers.some((w) => w !== w.toLowerCase())
+    || !isAuto(u.seg, opts));
   if (nonAuto.length === 0) return { tier: 'auto', scope: '' };
 
   // A `cd` that asks, or a builtin that can move the shell, is one confinement
@@ -2034,7 +2144,10 @@ export function classifyCommand(command: string, opts: CommandPolicyOptions = {}
   // approving `cd "$HOME"` once would wave through `cd "$HOME" && cat
   // .ssh/id_rsa` later. Its grant is the line the human read. `command` is
   // left out: `command cd` is unwrapped to `cd`, so what remains is a lookup.
-  if (nonAuto.some((u) => u.seg.binary === 'cd' || (u.seg.binary !== 'command' && SHELL_STATE_COMMANDS.has(u.seg.binary)))) {
+  if (nonAuto.some((u) => {
+    const name = u.seg.binary.toLowerCase();
+    return name === 'cd' || (name !== 'command' && SHELL_STATE_COMMANDS.has(name));
+  })) {
     return { tier: 'ask', scope: trimmed };
   }
 
