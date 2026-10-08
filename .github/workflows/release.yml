@@ -77,6 +77,19 @@ jobs:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: npx vsce publish --packagePath packages/vscode/*.vsix
 
+      # Same .vsix as the Marketplace, so Open VSX (Cursor, VSCodium, Windsurf) never
+      # lags a release. --skip-duplicate keeps a re-pushed tag, or a version already
+      # published by hand, from failing the job.
+      - name: Publish to Open VSX
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: |
+          if [ -z "$OVSX_PAT" ]; then
+            echo "::error::OVSX_PAT secret is not set; Open VSX would be stranded at the previous version"
+            exit 1
+          fi
+          npx --yes ovsx@1.1.1 publish --packagePath packages/vscode/*.vsix --skip-duplicate
+
   github-release:
     runs-on: ubuntu-latest
     needs: [npm-publish, vscode-publish]
