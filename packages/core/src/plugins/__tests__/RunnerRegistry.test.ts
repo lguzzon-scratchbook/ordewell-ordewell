@@ -17,13 +17,14 @@ describe('RunnerRegistry', () => {
     expect(list.find((p) => p.manifest.name === 'claude-code')).toBeDefined();
     expect(list.find((p) => p.manifest.name === 'codex')).toBeDefined();
     expect(list.find((p) => p.manifest.name === 'opencode')).toBeDefined();
+    expect(list.find((p) => p.manifest.name === 'kilo')).toBeDefined();
     expect(list.every((p) => p.source === 'builtin')).toBe(true);
   });
 
-  it('lists built-ins in picker order: Claude Code, Codex, OpenCode', () => {
+  it('lists built-ins in picker order: Claude Code, Codex, OpenCode, Kilo', () => {
     const reg = new RunnerRegistry(store);
     const builtinNames = reg.list().filter((p) => p.source === 'builtin').map((p) => p.manifest.name);
-    expect(builtinNames).toEqual(['claude-code', 'codex', 'opencode']);
+    expect(builtinNames).toEqual(['claude-code', 'codex', 'opencode', 'kilo']);
   });
 
   it('loads user plugins from store', () => {

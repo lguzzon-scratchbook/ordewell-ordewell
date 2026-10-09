@@ -203,6 +203,93 @@ describe('buildRunnerInvocation — opencode', () => {
   });
 });
 
+describe('buildRunnerInvocation — kilo', () => {
+  it('interactive code mode launches the TUI: no run subcommand, --auto, --prompt', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'do', mode: 'code', registry });
+    expect(inv.command).toBe('kilo');
+    expect(inv.promptInArgs).toBe(true);
+    expect(inv.args).toEqual(['--agent', 'code', '--auto', '--prompt', 'do']);
+  });
+
+  it('needs a submit key only in the interactive shape, never headless', () => {
+    const interactive = buildRunnerInvocation({ runner: 'kilo', prompt: 'do', mode: 'code', registry });
+    expect(interactive.submitPromptKey).toBe(true);
+
+    const headless = buildRunnerInvocation({ runner: 'kilo', prompt: 'do', mode: 'code', headless: true, registry });
+    expect(headless.submitPromptKey).toBe(false);
+  });
+
+  it('interactive plan mode emits --agent plan without --auto', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'do', mode: 'plan', registry });
+    expect(inv.args).toEqual(['--agent', 'plan', '--prompt', 'do']);
+  });
+
+  it('headless code mode uses the run subcommand with positional prompt', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'do', mode: 'code', headless: true, registry });
+    expect(inv.args).toEqual(['run', '--agent', 'code', '--auto', 'do']);
+  });
+
+  it('headless plan mode keeps run subcommand but drops --auto', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'do', mode: 'plan', headless: true, registry });
+    expect(inv.args).toEqual(['run', '--agent', 'plan', 'do']);
+  });
+
+  it('passes --model when modelId provided', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'P', modelId: 'provider/model-x', mode: 'code', headless: true, registry });
+    expect(inv.args.slice(0, 3)).toEqual(['run', '--model', 'provider/model-x']);
+  });
+
+  it('passes --variant in headless mode when thinkingEffort provided (run accepts it)', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'P', thinkingEffort: 'high', modelId: 'm', mode: 'code', headless: true, registry });
+    expect(inv.args).toContain('--variant');
+    expect(inv.args).toContain('high');
+    expect(inv.env.KILO_CONFIG_CONTENT).toBeUndefined();
+  });
+
+  it('omits --variant in interactive mode even with thinkingEffort (TUI rejects it)', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'P', thinkingEffort: 'high', modelId: 'p/m', mode: 'code', registry });
+    expect(inv.args).not.toContain('--variant');
+    expect(inv.args).toEqual(['--model', 'p/m', '--agent', 'code', '--auto', '--prompt', 'P']);
+  });
+
+  it('interactive variant is delivered via KILO_CONFIG_CONTENT with other variants disabled', () => {
+    const inv = buildRunnerInvocation({
+      runner: 'kilo', prompt: 'P', modelId: 'p/m', thinkingEffort: 'max',
+      modelVariants: ['low', 'high', 'max'], mode: 'code', registry,
+    });
+    expect(JSON.parse(inv.env.KILO_CONFIG_CONTENT)).toEqual({
+      agent: { code: { model: 'p/m', variant: 'max' } },
+      provider: { p: { models: { m: { variants: { low: { disabled: true }, high: { disabled: true } } } } } },
+    });
+  });
+
+  it('interactive variant config scopes to the plan agent in plan mode', () => {
+    const inv = buildRunnerInvocation({
+      runner: 'kilo', prompt: 'P', modelId: 'p/m', thinkingEffort: 'high',
+      modelVariants: ['high'], mode: 'plan', registry,
+    });
+    expect(JSON.parse(inv.env.KILO_CONFIG_CONTENT)).toEqual({
+      agent: { plan: { model: 'p/m', variant: 'high' } },
+    });
+  });
+
+  it('omits KILO_CONFIG_CONTENT when no thinkingEffort is selected', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'P', modelId: 'p/m', mode: 'code', registry });
+    expect(inv.env.KILO_CONFIG_CONTENT).toBeUndefined();
+  });
+
+  it('omits KILO_CONFIG_CONTENT for an unprefixed modelId (cannot be pinned per provider)', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'P', modelId: 'bare', thinkingEffort: 'high', modelVariants: ['high', 'max'], mode: 'code', registry });
+    expect(inv.env.KILO_CONFIG_CONTENT).toBeUndefined();
+  });
+
+  it('headless prompt is the trailing positional argument (kilo run takes message as positional)', () => {
+    const inv = buildRunnerInvocation({ runner: 'kilo', prompt: 'do', mode: 'code', headless: true, registry });
+    expect(inv.args).not.toContain('--prompt');
+    expect(inv.args[inv.args.length - 1]).toBe('do');
+  });
+});
+
 /**
  * OpenCode 2.x, recorded at v2.0.22: its TUI takes no `--model`/`--agent`, its
  * `run` has no `--variant`, and both attach to a background service unless

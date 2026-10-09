@@ -8,6 +8,7 @@ import { FsPluginStore } from './FsPluginStore';
 import { CLAUDE_CODE_MANIFEST } from './builtin/claude-code.manifest';
 import { CODEX_MANIFEST } from './builtin/codex.manifest';
 import { OPENCODE_MANIFEST } from './builtin/opencode.manifest';
+import { KILO_MANIFEST } from './builtin/kilo.manifest';
 import { assertPlainPluginName, isPlainPluginName, resolvePluginInstallDir } from './pluginNames';
 import { assertInstallablePluginUrl } from './pluginSource';
 import type { IConfig } from '../interfaces/IConfig';
@@ -17,6 +18,7 @@ const BUILTIN_MANIFESTS: RunnerPluginManifest[] = [
   CLAUDE_CODE_MANIFEST,
   CODEX_MANIFEST,
   OPENCODE_MANIFEST,
+  KILO_MANIFEST,
 ];
 
 const RESERVED_RUNNER_NAMES = new Set(BUILTIN_MANIFESTS.map((m) => m.name.toLowerCase()));
