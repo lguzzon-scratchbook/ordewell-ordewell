@@ -440,7 +440,10 @@ describe('OrchestratorPool run notices', () => {
 
   it('sends a run\'s isolation notice to the session\'s subscribers as a notice frame', async () => {
     const runner = { spawn: vi.fn().mockRejectedValue(new Error('no runner in a test')), stop: vi.fn(), stopAll: vi.fn(), activeCount: 0 };
-    const pool = new OrchestratorPool({ runner });
+    // The plan runs opencode on the structured transport; inject a fake there
+    // too, or a host with opencode installed spawns it for real and hangs.
+    const structuredRunner = { spawn: vi.fn().mockRejectedValue(new Error('no runner in a test')), stop: vi.fn(), stopAll: vi.fn(), activeCount: 0 };
+    const pool = new OrchestratorPool({ runner, structuredRunner });
     const meta = saveSession(savedPlan(), 'Rate limiting', workspace, 'session-notice');
     pool.adoptSavedSession(meta.id, workspace);
     const sent: string[] = [];

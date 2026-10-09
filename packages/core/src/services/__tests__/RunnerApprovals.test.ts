@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, type Mock } from 'vitest';
 import { RunnerApprovals } from '../RunnerApprovals';
 import { PendingApprovals } from '../PendingApprovals';
 import type { SessionMessage } from '../SessionMessage';
@@ -23,8 +23,10 @@ const spawnOpts = { taskId: 't1', runner: 'claude-code', prompt: 'Do it', cwd: '
 const WRITE = { file_path: '/repo/a.txt', content: 'a' };
 const SUGGESTIONS = [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }];
 
-function handing(session: ITerminalSession): ITerminalRunner & { stop: ReturnType<typeof vi.fn>; stopAll: ReturnType<typeof vi.fn> } {
-  return { spawn: vi.fn(async () => session), stop: vi.fn(), stopAll: vi.fn(), activeCount: 0 };
+type MockRunner = ITerminalRunner & { stop: Mock<(sessionId: string) => void>; stopAll: Mock<() => void> };
+
+function handing(session: ITerminalSession): MockRunner {
+  return { spawn: vi.fn(async () => session), stop: vi.fn<(sessionId: string) => void>(), stopAll: vi.fn<() => void>(), activeCount: 0 };
 }
 
 describe('RunnerApprovals', () => {
@@ -152,14 +154,14 @@ describe('a session\'s runner approvals', () => {
 
   async function running() {
     const sessions: FakeStructuredSession[] = [];
-    const runner: ITerminalRunner & { stop: ReturnType<typeof vi.fn>; stopAll: ReturnType<typeof vi.fn> } = {
+    const runner: MockRunner = {
       spawn: vi.fn(async (opts: RunnerSpawnOptions) => {
         const session = new FakeStructuredSession(`s${sessions.length + 1}`, opts.taskId);
         sessions.push(session);
         return session;
       }),
-      stop: vi.fn(),
-      stopAll: vi.fn(),
+      stop: vi.fn<(sessionId: string) => void>(),
+      stopAll: vi.fn<() => void>(),
       activeCount: 0,
     };
     const sent: SessionMessage[] = [];

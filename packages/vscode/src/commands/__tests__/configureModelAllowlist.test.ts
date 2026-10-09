@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, type Mock } from 'vitest';
 import { configureModelAllowlist } from '../configureModelAllowlist';
 import { RunnerRegistry, ModelResolver, SettingsService } from '@ordewell/core';
 
@@ -7,9 +7,9 @@ describe('configureModelAllowlist', () => {
   let modelResolver: ModelResolver;
   let settingsService: SettingsService;
   let mockWin: {
-    showQuickPick: ReturnType<typeof vi.fn>;
-    withProgress: ReturnType<typeof vi.fn>;
-    showWarningMessage: ReturnType<typeof vi.fn>;
+    showQuickPick: Mock;
+    withProgress: Mock;
+    showWarningMessage: Mock;
   };
 
   beforeEach(() => {
@@ -29,7 +29,7 @@ describe('configureModelAllowlist', () => {
   it('shows a QuickPick with all runners from the registry', async () => {
     mockWin.showQuickPick.mockResolvedValue(undefined);
 
-    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin);
+    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin as unknown as Parameters<typeof configureModelAllowlist>[3]);
 
     expect(mockWin.showQuickPick).toHaveBeenCalledTimes(1);
     const [items, options] = mockWin.showQuickPick.mock.calls[0];
@@ -47,7 +47,7 @@ describe('configureModelAllowlist', () => {
     mockWin.withProgress.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => fn());
     (modelResolver.modelsForRunners as import('vitest').Mock).mockResolvedValue({});
 
-    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin);
+    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin as unknown as Parameters<typeof configureModelAllowlist>[3]);
 
     expect(mockWin.withProgress).toHaveBeenCalledTimes(1);
     const [progressOpts] = mockWin.withProgress.mock.calls[0];
@@ -62,7 +62,7 @@ describe('configureModelAllowlist', () => {
     mockWin.withProgress.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => fn());
     (modelResolver.modelsForRunners as import('vitest').Mock).mockResolvedValue({ [runnerName]: [] });
 
-    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin);
+    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin as unknown as Parameters<typeof configureModelAllowlist>[3]);
 
     expect(mockWin.showWarningMessage).toHaveBeenCalledWith(
       `No models discovered for ${runnerDisplay}. Is it installed and configured?`,
@@ -86,7 +86,7 @@ describe('configureModelAllowlist', () => {
     (modelResolver.modelsForRunners as import('vitest').Mock).mockResolvedValue({ [runnerName]: discoveredModels });
     (settingsService.getModelAllowlist as import('vitest').Mock).mockReturnValue(allowlist);
 
-    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin);
+    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin as unknown as Parameters<typeof configureModelAllowlist>[3]);
 
     expect(mockWin.showQuickPick).toHaveBeenCalledTimes(2);
     const [modelItems, modelOpts] = mockWin.showQuickPick.mock.calls[1];
@@ -118,7 +118,7 @@ describe('configureModelAllowlist', () => {
     mockWin.withProgress.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => fn());
     (modelResolver.modelsForRunners as import('vitest').Mock).mockResolvedValue({ [runnerName]: discoveredModels });
 
-    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin);
+    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin as unknown as Parameters<typeof configureModelAllowlist>[3]);
 
     expect(settingsService.setModelAllowlist).toHaveBeenCalledWith(runnerName, ['model-a', 'model-b']);
   });
@@ -136,7 +136,7 @@ describe('configureModelAllowlist', () => {
     mockWin.withProgress.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => fn());
     (modelResolver.modelsForRunners as import('vitest').Mock).mockResolvedValue({ [runnerName]: discoveredModels });
 
-    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin);
+    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin as unknown as Parameters<typeof configureModelAllowlist>[3]);
 
     expect(settingsService.setModelAllowlist).toHaveBeenCalledWith(runnerName, []);
   });
@@ -154,7 +154,7 @@ describe('configureModelAllowlist', () => {
     mockWin.withProgress.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => fn());
     (modelResolver.modelsForRunners as import('vitest').Mock).mockResolvedValue({ [runnerName]: discoveredModels });
 
-    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin);
+    await configureModelAllowlist(registry, modelResolver, settingsService, mockWin as unknown as Parameters<typeof configureModelAllowlist>[3]);
 
     expect(settingsService.setModelAllowlist).not.toHaveBeenCalled();
   });

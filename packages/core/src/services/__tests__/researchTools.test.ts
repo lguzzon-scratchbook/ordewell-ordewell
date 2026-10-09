@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SchemaType } from '@google/generative-ai';
+import { SchemaType, type ArraySchema } from '@google/generative-ai';
 import { RESEARCH_TOOLS, toOpenAiTools, toGeminiToolDeclarations, subagentToolSpecs, SPAWN_RESEARCH_AGENT } from '../researchTools';
 
 describe('researchTools', () => {
@@ -42,7 +42,8 @@ describe('researchTools', () => {
     const readFiles = toGeminiToolDeclarations().find((t) => t.name === 'read_files')!;
     const params = readFiles.parameters!;
     expect(params.type).toBe(SchemaType.OBJECT);
-    expect(params.properties!.paths.type).toBe(SchemaType.ARRAY);
-    expect(params.properties!.paths.items!.type).toBe(SchemaType.STRING);
+    const paths = params.properties!.paths as ArraySchema;
+    expect(paths.type).toBe(SchemaType.ARRAY);
+    expect(paths.items!.type).toBe(SchemaType.STRING);
   });
 });

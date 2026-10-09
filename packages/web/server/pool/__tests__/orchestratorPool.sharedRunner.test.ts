@@ -6,7 +6,7 @@ import { RunnerRegistry, saveSession, TransportRouter, type ITerminalRunner, typ
 
 const poolAwareRunnerCtor = vi.fn();
 vi.mock('../../adapters/PoolAwareRunner', () => ({
-  PoolAwareRunner: vi.fn().mockImplementation((...args: unknown[]) => {
+  PoolAwareRunner: vi.fn().mockImplementation(function (...args: unknown[]) {
     poolAwareRunnerCtor(...args);
     return { activeCount: 0, spawn: vi.fn(), stop: vi.fn(), stopAll: vi.fn() };
   }),
