@@ -27,8 +27,8 @@
     "watch": "npm run watch -w packages/core",
     "lint": "eslint . --ext .ts,.tsx",
     "package": "npm run package -w packages/vscode",
-    "typecheck": "npm run typecheck -ws --if-present",
-    "test": "npm run test -ws --if-present",
+    "typecheck": "npm run typecheck --ws --if-present",
+    "test": "npm run test --ws --if-present",
     "test:coverage": "npm run test:coverage -ws --if-present",
     "build:web": "npm run build -w packages/web",
     "start": "node packages/cli/dist/main.js tui"
