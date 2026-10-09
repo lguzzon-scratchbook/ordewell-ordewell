@@ -51,11 +51,11 @@
   "dependencies": {
     "@ordewell/core": "^0.7.2",
     "@ordewell/web": "^0.7.2",
-    "string-width": "^7.2.0",
-    "ws": "^8.18.0"
+    "string-width": "^8.3.0",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
-    "tsup": "^8.3.0",
+    "tsup": "^8.5.1",
     "typescript": "^5.9.3"
   }
 }
