@@ -1,6 +1,6 @@
 // Test-only stub for the `vscode` module. The real module is supplied by the
 // VS Code extension host at runtime; in unit tests we alias `vscode` to this
-// file (see vitest.config.ts) so config getters can be exercised in isolation.
+// file (see vitest.config.mts) so config getters can be exercised in isolation.
 
 import { vi } from 'vitest';
 

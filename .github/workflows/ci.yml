@@ -97,7 +97,7 @@ jobs:
       # Coverage is report-only for the codebase as a whole: no overall
       # threshold, so a percentage never fails the build. The one exception is
       # a per-file floor on the modules the seam refactors introduced (see
-      # `thresholds` in packages/core/vitest.config.ts), set at each file's
+      # `thresholds` in packages/core/vitest.config.mts), set at each file's
       # measured value so those seams cannot quietly lose their tests.
       - name: Test with coverage
         shell: bash
