@@ -150,7 +150,7 @@ function withSpawn(): ResearchToolSpec[] {
   return [...RESEARCH_TOOLS, SPAWN_RESEARCH_AGENT_SPEC];
 }
 
-function projectOpenAi(specs: ResearchToolSpec[]): OpenAI.Chat.Completions.ChatCompletionTool[] {
+function projectOpenAi(specs: ResearchToolSpec[]): OpenAI.Chat.Completions.ChatCompletionFunctionTool[] {
   return specs.map((t) => ({
     type: 'function',
     function: {
@@ -171,33 +171,46 @@ function projectOpenAi(specs: ResearchToolSpec[]): OpenAI.Chat.Completions.ChatC
 }
 
 /** Project the canonical tools into OpenAI's chat-completions tool format. */
-export function toOpenAiTools(): OpenAI.Chat.Completions.ChatCompletionTool[] {
+export function toOpenAiTools(): OpenAI.Chat.Completions.ChatCompletionFunctionTool[] {
   return projectOpenAi(withSpawn());
 }
 
 /** The subagent's own tool list in OpenAI format. */
-export function toOpenAiSubagentTools(): OpenAI.Chat.Completions.ChatCompletionTool[] {
+export function toOpenAiSubagentTools(): OpenAI.Chat.Completions.ChatCompletionFunctionTool[] {
   return projectOpenAi(subagentToolSpecs());
 }
 
-const SCHEMA_TYPE: Record<ParamType, SchemaType> = {
-  string: SchemaType.STRING,
-  number: SchemaType.NUMBER,
-  array: SchemaType.ARRAY,
-  boolean: SchemaType.BOOLEAN,
-};
+// One parameter's schema in the variant its shape needs: the SDK types the
+// union by variant, so a single spread-built literal never narrows to one.
+function toSchema(param: ResearchToolParam): Schema {
+  if (param.enum !== undefined) {
+    return { type: SchemaType.STRING, description: param.description, format: 'enum' as const, enum: param.enum };
+  }
+  if (param.type === 'array') {
+    const item = param.items?.type ?? 'string';
+    const items =
+      item === 'number'
+        ? { type: SchemaType.NUMBER as const }
+        : item === 'boolean'
+          ? { type: SchemaType.BOOLEAN as const }
+          : { type: SchemaType.STRING as const };
+    return { type: SchemaType.ARRAY, description: param.description, items };
+  }
+  if (param.type === 'number') {
+    return { type: SchemaType.NUMBER, description: param.description };
+  }
+  if (param.type === 'boolean') {
+    return { type: SchemaType.BOOLEAN, description: param.description };
+  }
+  return { type: SchemaType.STRING, description: param.description };
+}
 
 /** Project the canonical tools into Gemini's function-declaration format. */
 export function toGeminiToolDeclarations(): FunctionDeclaration[] {
   return withSpawn().map((t) => {
     const properties: Record<string, Schema> = {};
     for (const [key, param] of Object.entries(t.properties)) {
-      properties[key] = {
-        type: SCHEMA_TYPE[param.type],
-        description: param.description,
-        ...(param.items ? { items: { type: SCHEMA_TYPE[param.items.type] } } : {}),
-        ...(param.enum ? { format: 'enum', enum: param.enum } : {}),
-      };
+      properties[key] = toSchema(param);
     }
     return {
       name: t.name,
